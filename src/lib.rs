@@ -24,19 +24,30 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod bset;
 pub mod field;
+pub mod gm;
 pub mod kbucket;
+pub mod lobject;
+pub mod lset;
 pub mod monomial;
 pub mod ordering;
+pub mod pair;
 pub mod poly;
 pub mod ring;
+pub mod sbasis;
 
+pub use bset::BSet;
 pub use field::{Coeff, Field};
 pub use kbucket::KBucket;
+pub use lobject::LObject;
+pub use lset::LSet;
 pub use monomial::Monomial;
 pub use ordering::MonoOrder;
+pub use pair::{Pair, PairKey};
 pub use poly::Poly;
 pub use ring::Ring;
+pub use sbasis::SBasis;
 
 // Compile-time Send + Sync check on the key public types.
 const _: fn() = || {
@@ -45,10 +56,16 @@ const _: fn() = || {
     assert_send_sync::<Field>();
     assert_send_sync::<Monomial>();
     assert_send_sync::<Poly>();
+    assert_send_sync::<Pair>();
+    assert_send_sync::<SBasis>();
+    assert_send_sync::<LSet>();
+    assert_send_sync::<BSet>();
 };
 
-// KBucket is Send but deliberately not Sync (per-thread ownership).
+// KBucket and LObject are Send but deliberately not Sync
+// (per-thread ownership).
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<KBucket>();
+    assert_send::<LObject>();
 };
