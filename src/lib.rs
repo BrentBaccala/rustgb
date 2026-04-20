@@ -2,12 +2,12 @@
 //!
 //! Polynomial layer for the Singular Groebner-basis port.
 //!
-//! This crate is the first milestone of the port described in
+//! This crate is an early milestone of the port described in
 //! `~/project/docs/rust-bba-port-plan.md`. It supplies the ring,
-//! field, monomial, and polynomial primitives that a later `bba`
-//! driver will build on. There is deliberately **no** S/T/L,
-//! **no** S-pair queue, **no** kBucket reducer, **no** FFI, and
-//! **no** parallelism in this crate yet.
+//! field, monomial, polynomial, and geobucket primitives that a
+//! later `bba` driver will build on. There is deliberately **no**
+//! S/T/L, **no** S-pair queue, **no** FFI, and **no** parallelism
+//! in this crate yet.
 //!
 //! ## Current scope
 //!
@@ -25,12 +25,14 @@
 #![warn(missing_docs)]
 
 pub mod field;
+pub mod kbucket;
 pub mod monomial;
 pub mod ordering;
 pub mod poly;
 pub mod ring;
 
 pub use field::{Coeff, Field};
+pub use kbucket::KBucket;
 pub use monomial::Monomial;
 pub use ordering::MonoOrder;
 pub use poly::Poly;
@@ -43,4 +45,10 @@ const _: fn() = || {
     assert_send_sync::<Field>();
     assert_send_sync::<Monomial>();
     assert_send_sync::<Poly>();
+};
+
+// KBucket is Send but deliberately not Sync (per-thread ownership).
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<KBucket>();
 };
