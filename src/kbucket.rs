@@ -339,7 +339,7 @@ impl KBucket {
             // rescan.
             for i in matching {
                 let p = self.slots[i].take().unwrap();
-                let rest = drop_leading(&self.ring, &p);
+                let rest = p.drop_leading();
                 if !rest.is_zero() {
                     self.slots[i] = Some(rest);
                 }
@@ -396,7 +396,7 @@ impl KBucket {
             let (_, mi) = p.leading().unwrap();
             if mi.cmp(&m, &self.ring).is_eq() {
                 let p_owned = self.slots[i].take().unwrap();
-                let rest = drop_leading(&self.ring, &p_owned);
+                let rest = p_owned.drop_leading();
                 if !rest.is_zero() {
                     self.slots[i] = Some(rest);
                 }
@@ -474,25 +474,6 @@ impl KBucket {
             );
         }
     }
-}
-
-/// Drop the leading term of `p`. Returns a new polynomial.
-///
-/// `Poly` doesn't yet expose a "drop leading term" primitive, so we
-/// rebuild from the tail slice. `from_terms` re-sorts, which is
-/// O(|p| log |p|) — noted as a possible follow-up in the report.
-fn drop_leading(ring: &Ring, p: &Poly) -> Poly {
-    if p.is_zero() || p.len() == 1 {
-        return Poly::zero();
-    }
-    let tail: Vec<(Coeff, Monomial)> = p
-        .coeffs()
-        .iter()
-        .zip(p.terms().iter())
-        .skip(1)
-        .map(|(&c, m)| (c, m.clone()))
-        .collect();
-    Poly::from_terms(ring, tail)
 }
 
 /// Build `-c * m * p` as a standalone polynomial. Term ordering is

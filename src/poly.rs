@@ -196,6 +196,27 @@ impl Poly {
         &self.terms
     }
 
+    /// Return a new polynomial with the leading term removed. If `self`
+    /// is zero or a single term, returns the zero polynomial.
+    ///
+    /// The tail of a canonical polynomial is itself canonical (terms are
+    /// strictly descending and coefficients all nonzero), so this skips
+    /// the sort+dedup pass that `from_terms` would do.
+    pub fn drop_leading(&self) -> Poly {
+        if self.terms.len() <= 1 {
+            return Self::zero();
+        }
+        let mut out = Self {
+            coeffs: self.coeffs[1..].to_vec(),
+            terms: self.terms[1..].to_vec(),
+            lm_sev: 0,
+            lm_coeff: 0,
+            lm_deg: 0,
+        };
+        out.refresh_cache();
+        out
+    }
+
     // ----- Arithmetic -----
 
     /// In-place: `self = self + other`. Linear merge by monomial order.
@@ -629,5 +650,68 @@ mod tests {
         assert_eq!(p.lm_sev(), m.sev());
         assert_eq!(p.lm_coeff(), 3);
         assert_eq!(p.lm_deg(), 2);
+    }
+
+    #[test]
+    fn drop_leading_basic() {
+        let r = mk_ring(3, 13);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[2, 1, 0])),
+                (7, mono(&r, &[1, 0, 1])),
+                (1, mono(&r, &[0, 0, 2])),
+            ],
+        );
+        let tail = p.drop_leading();
+        tail.assert_canonical(&r);
+        assert_eq!(tail.len(), 2);
+        // New leading is the old second term.
+        let (c, m) = tail.leading().unwrap();
+        assert_eq!(c, 7);
+        assert_eq!(m, &mono(&r, &[1, 0, 1]));
+        // Cache fields agree.
+        assert_eq!(tail.lm_coeff(), 7);
+        assert_eq!(tail.lm_sev(), m.sev());
+        assert_eq!(tail.lm_deg(), m.total_deg());
+    }
+
+    #[test]
+    fn drop_leading_edge_cases() {
+        let r = mk_ring(2, 7);
+        // Zero in, zero out.
+        let z = Poly::zero();
+        let z_tail = z.drop_leading();
+        assert!(z_tail.is_zero());
+        z_tail.assert_canonical(&r);
+        // Single term in, zero out.
+        let single = Poly::monomial(&r, 3, mono(&r, &[1, 0]));
+        let single_tail = single.drop_leading();
+        assert!(single_tail.is_zero());
+        single_tail.assert_canonical(&r);
+    }
+
+    #[test]
+    fn drop_leading_matches_from_terms_tail() {
+        // The optimised drop_leading should match what from_terms
+        // would produce for the same tail, just without re-sorting.
+        let r = mk_ring(4, 32003);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[3, 0, 0, 0])),
+                (2, mono(&r, &[2, 1, 0, 0])),
+                (9, mono(&r, &[1, 0, 1, 0])),
+                (4, mono(&r, &[0, 0, 0, 2])),
+            ],
+        );
+        let fast = p.drop_leading();
+        let slow_tail: Vec<(Coeff, Monomial)> = p.coeffs()[1..]
+            .iter()
+            .zip(p.terms()[1..].iter())
+            .map(|(&c, m)| (c, m.clone()))
+            .collect();
+        let slow = Poly::from_terms(&r, slow_tail);
+        assert_eq!(fast, slow);
     }
 }
