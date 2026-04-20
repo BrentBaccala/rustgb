@@ -1,0 +1,15 @@
+[package]
+name = "rustgb"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Groebner basis engine for Singular (polynomial layer only -- see ~/project/docs/rust-bba-port-plan.md)"
+
+[dependencies]
+# stdlib only for now; add as needed.
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+debug = true   # keep symbols for profiling
