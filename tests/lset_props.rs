@@ -37,12 +37,19 @@ enum Op {
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        (0u32..5u32, 0u32..5u32, 0u32..10u32).prop_filter_map(
-            "need i != j",
-            |(i, j, s)| if i == j { None } else { Some(Op::Insert { i, j, sugar: s }) },
-        ),
+        (0u32..5u32, 0u32..5u32, 0u32..10u32).prop_filter_map("need i != j", |(i, j, s)| {
+            if i == j {
+                None
+            } else {
+                Some(Op::Insert { i, j, sugar: s })
+            }
+        },),
         (0u32..5u32, 0u32..5u32).prop_filter_map("need i != j", |(i, j)| {
-            if i == j { None } else { Some(Op::DeleteByIndices { i, j }) }
+            if i == j {
+                None
+            } else {
+                Some(Op::DeleteByIndices { i, j })
+            }
         }),
         Just(Op::Pop),
     ]

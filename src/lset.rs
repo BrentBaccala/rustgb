@@ -146,11 +146,7 @@ impl LSet {
             self.live -= 1;
             return Some(entry.pair);
         }
-        debug_assert_eq!(
-            self.live, 0,
-            "LSet live count {} but heap empty",
-            self.live
-        );
+        debug_assert_eq!(self.live, 0, "LSet live count {} but heap empty", self.live);
         None
     }
 

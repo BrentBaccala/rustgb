@@ -397,8 +397,7 @@ mod tests {
 
         // After the criterion, B has two survivors and (2, 3) is
         // gone.
-        let surviving: Vec<(u32, u32)> =
-            b.pairs().iter().map(|p| (p.i, p.j)).collect();
+        let surviving: Vec<(u32, u32)> = b.pairs().iter().map(|p| (p.i, p.j)).collect();
         assert!(surviving.contains(&(0, 3)), "(0, 3) must survive");
         assert!(surviving.contains(&(1, 3)), "(1, 3) must survive");
         assert!(!surviving.contains(&(2, 3)), "(2, 3) must be pruned");
@@ -465,10 +464,7 @@ mod tests {
         );
         let f_2 = Poly::from_terms(
             &r,
-            vec![
-                (1, mono(&r, &[1, 1, 1])),
-                (32002, mono(&r, &[0, 0, 0])),
-            ],
+            vec![(1, mono(&r, &[1, 1, 1])), (32002, mono(&r, &[0, 0, 0]))],
         );
 
         let h0_idx = enter_s(&r, &mut s, f_0.clone()) as u32;

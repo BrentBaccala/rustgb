@@ -91,11 +91,7 @@ impl Field {
     #[inline]
     pub fn sub(&self, a: Coeff, b: Coeff) -> Coeff {
         debug_assert!(a < self.p && b < self.p);
-        if a >= b {
-            a - b
-        } else {
-            a + self.p - b
-        }
+        if a >= b { a - b } else { a + self.p - b }
     }
 
     /// Negation in Z/pZ. Input must be reduced.
@@ -117,7 +113,11 @@ impl Field {
         let r = prod.wrapping_sub(q.wrapping_mul(self.p as u64));
         // At most one correction step because barrett_mu under-
         // approximates 2^62 / p by strictly less than 1.
-        let r = if r >= self.p as u64 { r - self.p as u64 } else { r };
+        let r = if r >= self.p as u64 {
+            r - self.p as u64
+        } else {
+            r
+        };
         debug_assert!(r < self.p as u64);
         r as u32
     }
@@ -164,15 +164,30 @@ mod tests {
     #[test]
     fn barrett_matches_naive_sweep() {
         // A spread of small, medium, and large primes under 2^31.
-        for &p in &[2u32, 3, 5, 7, 11, 13, 101, 32003, 100_003, 1_000_003, 2_147_483_647]
-        {
+        for &p in &[
+            2u32,
+            3,
+            5,
+            7,
+            11,
+            13,
+            101,
+            32003,
+            100_003,
+            1_000_003,
+            2_147_483_647,
+        ] {
             let f = Field::new(p).unwrap();
             // A deterministic but "spread-out" generator.
             let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
             for _ in 0..10_000 {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let a = ((x >> 32) as u32) % p;
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let b = ((x >> 32) as u32) % p;
                 let got = f.mul(a, b);
                 let want = ((a as u64 * b as u64) % p as u64) as u32;

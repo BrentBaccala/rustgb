@@ -264,10 +264,7 @@ impl KBucket {
         let neg_cmp = match build_neg_cmp(&self.ring, c, m, p) {
             Some(v) => v,
             None => {
-                debug_assert!(
-                    false,
-                    "monomial product overflowed 8-bit exponent budget"
-                );
+                debug_assert!(false, "monomial product overflowed 8-bit exponent budget");
                 return;
             }
         };
@@ -556,10 +553,7 @@ mod tests {
         let r = mk_ring(3, 13);
         let q = Poly::from_terms(
             &r,
-            vec![
-                (4, mono(&r, &[1, 1, 0])),
-                (5, mono(&r, &[0, 0, 1])),
-            ],
+            vec![(4, mono(&r, &[1, 1, 0])), (5, mono(&r, &[0, 0, 1]))],
         );
         let m = mono(&r, &[1, 0, 0]);
         let c: Coeff = 2;
@@ -580,10 +574,7 @@ mod tests {
         let r = mk_ring(3, 13);
         let q = Poly::from_terms(
             &r,
-            vec![
-                (4, mono(&r, &[1, 1, 0])),
-                (5, mono(&r, &[0, 0, 1])),
-            ],
+            vec![(4, mono(&r, &[1, 1, 0])), (5, mono(&r, &[0, 0, 1]))],
         );
         let m = mono(&r, &[1, 0, 0]);
         let c: Coeff = 2;
@@ -603,13 +594,7 @@ mod tests {
     #[test]
     fn leading_cache_is_used_when_not_dirty() {
         let r = mk_ring(2, 7);
-        let p = Poly::from_terms(
-            &r,
-            vec![
-                (3, mono(&r, &[2, 0])),
-                (4, mono(&r, &[1, 1])),
-            ],
-        );
+        let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
         let mut b = KBucket::from_poly(Arc::clone(&r), p);
         // First call computes.
         let (c1, m1) = {
@@ -662,10 +647,7 @@ mod tests {
         let remainder = b.into_poly();
         let expected = Poly::from_terms(
             &r,
-            vec![
-                (5, mono(&r, &[1, 0, 0])),
-                (1, mono(&r, &[0, 0, 1])),
-            ],
+            vec![(5, mono(&r, &[1, 0, 0])), (1, mono(&r, &[0, 0, 1]))],
         );
         assert_eq!(remainder, expected);
     }
@@ -718,13 +700,7 @@ mod tests {
         // monomial.
         let r = mk_ring(2, 11);
         let mut b = KBucket::new(Arc::clone(&r));
-        let p1 = Poly::from_terms(
-            &r,
-            vec![
-                (3, mono(&r, &[2, 0])),
-                (1, mono(&r, &[0, 1])),
-            ],
-        );
+        let p1 = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (1, mono(&r, &[0, 1]))]);
         let p2 = Poly::from_terms(
             &r,
             vec![

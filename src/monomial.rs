@@ -480,7 +480,13 @@ mod tests {
         let sequence = [&xy2, &y3, &xyz, &y2z, &xz2, &yz2, &z3];
         for w in sequence.windows(2) {
             let ord = w[0].cmp(w[1], &r);
-            assert_eq!(ord, Ordering::Greater, "{:?} should be > {:?}", w[0].exponents(&r), w[1].exponents(&r));
+            assert_eq!(
+                ord,
+                Ordering::Greater,
+                "{:?} should be > {:?}",
+                w[0].exponents(&r),
+                w[1].exponents(&r)
+            );
         }
     }
 }

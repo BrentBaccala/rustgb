@@ -24,6 +24,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod bba;
 pub mod bset;
 pub mod field;
 pub mod gm;
@@ -37,6 +38,7 @@ pub mod poly;
 pub mod ring;
 pub mod sbasis;
 
+pub use bba::compute_gb;
 pub use bset::BSet;
 pub use field::{Coeff, Field};
 pub use kbucket::KBucket;

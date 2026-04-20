@@ -150,10 +150,7 @@ impl Poly {
 
     /// Iterate over `(coeff, monomial)` pairs in descending order.
     pub fn iter(&self) -> impl Iterator<Item = (Coeff, &Monomial)> + '_ {
-        self.coeffs
-            .iter()
-            .copied()
-            .zip(self.terms.iter())
+        self.coeffs.iter().copied().zip(self.terms.iter())
     }
 
     /// Leading term `(coeff, &monomial)`, or `None` if zero.
@@ -320,8 +317,7 @@ impl Poly {
             return Some(Self::zero());
         }
         let f = ring.field();
-        let mut acc: Vec<(Coeff, Monomial)> =
-            Vec::with_capacity(self.len() * other.len());
+        let mut acc: Vec<(Coeff, Monomial)> = Vec::with_capacity(self.len() * other.len());
         for (ca, ma) in self.iter() {
             for (cb, mb) in other.iter() {
                 let m = ma.mul(mb, ring)?;
@@ -484,7 +480,11 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
                 i += 1;
             }
             std::cmp::Ordering::Less => {
-                let c = if subtract { f.neg(b.coeffs[j]) } else { b.coeffs[j] };
+                let c = if subtract {
+                    f.neg(b.coeffs[j])
+                } else {
+                    b.coeffs[j]
+                };
                 if c != 0 {
                     out_c.push(c);
                     out_m.push(b.terms[j].clone());
@@ -492,7 +492,11 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                let bc = if subtract { f.neg(b.coeffs[j]) } else { b.coeffs[j] };
+                let bc = if subtract {
+                    f.neg(b.coeffs[j])
+                } else {
+                    b.coeffs[j]
+                };
                 let s = f.add(a.coeffs[i], bc);
                 if s != 0 {
                     out_c.push(s);
@@ -509,7 +513,11 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
         i += 1;
     }
     while j < b.len() {
-        let c = if subtract { f.neg(b.coeffs[j]) } else { b.coeffs[j] };
+        let c = if subtract {
+            f.neg(b.coeffs[j])
+        } else {
+            b.coeffs[j]
+        };
         if c != 0 {
             out_c.push(c);
             out_m.push(b.terms[j].clone());
@@ -600,10 +608,7 @@ mod tests {
         );
         let q = Poly::from_terms(
             &r,
-            vec![
-                (4, mono(&r, &[1, 1, 0])),
-                (5, mono(&r, &[0, 0, 1])),
-            ],
+            vec![(4, mono(&r, &[1, 1, 0])), (5, mono(&r, &[0, 0, 1]))],
         );
         let m = mono(&r, &[1, 0, 0]);
         let c: Coeff = 2;
@@ -637,13 +642,7 @@ mod tests {
     #[test]
     fn leading_invariants() {
         let r = mk_ring(2, 7);
-        let p = Poly::from_terms(
-            &r,
-            vec![
-                (3, mono(&r, &[2, 0])),
-                (4, mono(&r, &[1, 1])),
-            ],
-        );
+        let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
         let (c, m) = p.leading().unwrap();
         assert_eq!(c, 3);
         assert_eq!(m.total_deg(), 2);

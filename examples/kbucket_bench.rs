@@ -44,12 +44,7 @@ fn build_ring() -> Arc<Ring> {
     Arc::new(Ring::new(8, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap())
 }
 
-fn random_poly(
-    ring: &Ring,
-    rng: &mut Lcg,
-    nterms: usize,
-    max_exp: u32,
-) -> Poly {
+fn random_poly(ring: &Ring, rng: &mut Lcg, nterms: usize, max_exp: u32) -> Poly {
     let n = ring.nvars() as usize;
     let p = ring.field().p();
     let mut pairs = Vec::with_capacity(nterms);
@@ -105,9 +100,7 @@ fn main() {
             }
         }
         if overflowed {
-            eprintln!(
-                "warning: workload overflows 8-bit budget; adjust max_exp in the benchmark"
-            );
+            eprintln!("warning: workload overflows 8-bit budget; adjust max_exp in the benchmark");
             std::process::exit(1);
         }
         println!(
@@ -121,9 +114,7 @@ fn main() {
     let t0 = Instant::now();
     let mut slow_acc = seed.clone();
     for (m, c, q) in &reducers {
-        slow_acc = slow_acc
-            .sub_mul_term(*c, m, q, &ring)
-            .expect("no overflow");
+        slow_acc = slow_acc.sub_mul_term(*c, m, q, &ring).expect("no overflow");
     }
     let slow_elapsed = t0.elapsed();
     let slow_terms = slow_acc.len();

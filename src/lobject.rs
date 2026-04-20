@@ -167,6 +167,15 @@ impl LObject {
         self.sugar
     }
 
+    /// Overwrite the cached sugar degree. Used by the bba driver's
+    /// reducer loop to propagate
+    /// `max(sugar(lobj), sugar(s) + deg(m))` after each reduction by
+    /// `s_basis[idx]` with multiplier `m`.
+    #[inline]
+    pub fn set_sugar(&mut self, sugar: u32) {
+        self.sugar = sugar;
+    }
+
     /// Mutable access to the underlying bucket for reduction steps.
     #[inline]
     pub fn bucket_mut(&mut self) -> &mut KBucket {
@@ -228,10 +237,7 @@ mod tests {
         let r = mk_ring(3, 13);
         let p = Poly::from_terms(
             &r,
-            vec![
-                (3, mono(&r, &[2, 1, 0])),
-                (7, mono(&r, &[1, 0, 1])),
-            ],
+            vec![(3, mono(&r, &[2, 1, 0])), (7, mono(&r, &[1, 0, 1]))],
         );
         let p_sev = p.lm_sev();
         let o = LObject::from_poly(Arc::clone(&r), p);

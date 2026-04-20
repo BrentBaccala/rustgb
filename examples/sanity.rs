@@ -18,7 +18,9 @@ fn random_poly(ring: &Ring, nterms: usize, seed: u64) -> Poly {
     let n = ring.nvars() as usize;
     let mut s = seed;
     let mut next = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         s
     };
     let mut pairs = Vec::with_capacity(nterms);

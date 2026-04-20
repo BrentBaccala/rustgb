@@ -63,7 +63,11 @@ impl Ring {
         match ordering {
             MonoOrder::DegRevLex => {}
         }
-        Some(Self { nvars, ordering, field })
+        Some(Self {
+            nvars,
+            ordering,
+            field,
+        })
     }
 
     /// Number of variables.
@@ -87,9 +91,7 @@ impl Ring {
 
 impl PartialEq for Ring {
     fn eq(&self, other: &Self) -> bool {
-        self.nvars == other.nvars
-            && self.ordering == other.ordering
-            && self.field == other.field
+        self.nvars == other.nvars && self.ordering == other.ordering && self.field == other.field
     }
 }
 impl Eq for Ring {}

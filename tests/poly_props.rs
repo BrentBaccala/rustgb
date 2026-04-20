@@ -16,24 +16,25 @@ fn ring_strategy(max_nvars: u32) -> impl Strategy<Value = Ring> {
     })
 }
 
-fn poly_strategy(ring: Ring, max_terms: usize, max_exp: u32) -> impl Strategy<Value = (Ring, Poly)> {
+fn poly_strategy(
+    ring: Ring,
+    max_terms: usize,
+    max_exp: u32,
+) -> impl Strategy<Value = (Ring, Poly)> {
     let n = ring.nvars() as usize;
     let p = ring.field().p();
     prop::collection::vec(
-        (
-            1u32..p,
-            prop::collection::vec(0u32..max_exp, n),
-        ),
+        (1u32..p, prop::collection::vec(0u32..max_exp, n)),
         0..=max_terms,
     )
-        .prop_map(move |terms| {
-            let converted: Vec<(Coeff, Monomial)> = terms
-                .into_iter()
-                .map(|(c, e)| (c, Monomial::from_exponents(&ring, &e).unwrap()))
-                .collect();
-            let p = Poly::from_terms(&ring, converted);
-            (ring.clone(), p)
-        })
+    .prop_map(move |terms| {
+        let converted: Vec<(Coeff, Monomial)> = terms
+            .into_iter()
+            .map(|(c, e)| (c, Monomial::from_exponents(&ring, &e).unwrap()))
+            .collect();
+        let p = Poly::from_terms(&ring, converted);
+        (ring.clone(), p)
+    })
 }
 
 /// Ring + three polys. Small caps so products stay within the 8-bit
@@ -217,22 +218,25 @@ fn cyclic3_polynomials_are_canonical() {
     let r = Ring::new(3, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap();
     let mono = |e: &[u32]| Monomial::from_exponents(&r, e).unwrap();
     // f1 = x + y + z
-    let f1 = Poly::from_terms(&r, vec![
-        (1, mono(&[1, 0, 0])),
-        (1, mono(&[0, 1, 0])),
-        (1, mono(&[0, 0, 1])),
-    ]);
+    let f1 = Poly::from_terms(
+        &r,
+        vec![
+            (1, mono(&[1, 0, 0])),
+            (1, mono(&[0, 1, 0])),
+            (1, mono(&[0, 0, 1])),
+        ],
+    );
     // f2 = x*y + y*z + x*z
-    let f2 = Poly::from_terms(&r, vec![
-        (1, mono(&[1, 1, 0])),
-        (1, mono(&[0, 1, 1])),
-        (1, mono(&[1, 0, 1])),
-    ]);
+    let f2 = Poly::from_terms(
+        &r,
+        vec![
+            (1, mono(&[1, 1, 0])),
+            (1, mono(&[0, 1, 1])),
+            (1, mono(&[1, 0, 1])),
+        ],
+    );
     // f3 = x*y*z - 1
-    let f3 = Poly::from_terms(&r, vec![
-        (1, mono(&[1, 1, 1])),
-        (32002, mono(&[0, 0, 0])),
-    ]);
+    let f3 = Poly::from_terms(&r, vec![(1, mono(&[1, 1, 1])), (32002, mono(&[0, 0, 0]))]);
     f1.assert_canonical(&r);
     f2.assert_canonical(&r);
     f3.assert_canonical(&r);

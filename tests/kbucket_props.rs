@@ -20,28 +20,24 @@ const MAX_VARS: u32 = 5;
 const MAX_EXP: u32 = 6;
 
 fn ring_strategy() -> impl Strategy<Value = Arc<Ring>> {
-    (1u32..=MAX_VARS).prop_map(|n| {
-        Arc::new(Ring::new(n, MonoOrder::DegRevLex, Field::new(P).unwrap()).unwrap())
-    })
+    (1u32..=MAX_VARS)
+        .prop_map(|n| Arc::new(Ring::new(n, MonoOrder::DegRevLex, Field::new(P).unwrap()).unwrap()))
 }
 
 fn poly_strategy(ring: Arc<Ring>, max_terms: usize) -> impl Strategy<Value = Poly> {
     let n = ring.nvars() as usize;
     let p = ring.field().p();
     prop::collection::vec(
-        (
-            1u32..p,
-            prop::collection::vec(0u32..=MAX_EXP, n),
-        ),
+        (1u32..p, prop::collection::vec(0u32..=MAX_EXP, n)),
         0..=max_terms,
     )
-        .prop_map(move |terms| {
-            let converted: Vec<(Coeff, Monomial)> = terms
-                .into_iter()
-                .map(|(c, e)| (c, Monomial::from_exponents(&ring, &e).unwrap()))
-                .collect();
-            Poly::from_terms(&ring, converted)
-        })
+    .prop_map(move |terms| {
+        let converted: Vec<(Coeff, Monomial)> = terms
+            .into_iter()
+            .map(|(c, e)| (c, Monomial::from_exponents(&ring, &e).unwrap()))
+            .collect();
+        Poly::from_terms(&ring, converted)
+    })
 }
 
 fn mono_strategy(ring: Arc<Ring>, max_exp: u32) -> impl Strategy<Value = Monomial> {
@@ -52,8 +48,7 @@ fn mono_strategy(ring: Arc<Ring>, max_exp: u32) -> impl Strategy<Value = Monomia
 
 /// A seed polynomial plus a list of reducers `(m_i, c_i, q_i)`.
 fn bucket_workload_strategy()
-    -> impl Strategy<Value = (Arc<Ring>, Poly, Vec<(Monomial, Coeff, Poly)>)>
-{
+-> impl Strategy<Value = (Arc<Ring>, Poly, Vec<(Monomial, Coeff, Poly)>)> {
     ring_strategy().prop_flat_map(|r| {
         let p = r.field().p();
         // Cap monomial exponents at 3 and poly-term exponents at 3 so
@@ -75,11 +70,7 @@ fn bucket_workload_strategy()
 /// `p ← p - c*m*q` via `Poly::sub_mul_term`. Skip reducers whose
 /// product overflows the 8-bit budget (those are infeasible for both
 /// paths).
-fn slow_fold(
-    ring: &Ring,
-    seed: Poly,
-    ops: &[(Monomial, Coeff, Poly)],
-) -> Option<Poly> {
+fn slow_fold(ring: &Ring, seed: Poly, ops: &[(Monomial, Coeff, Poly)]) -> Option<Poly> {
     let mut acc = seed;
     for (m, c, q) in ops {
         acc = acc.sub_mul_term(*c, m, q, ring)?;
@@ -88,11 +79,7 @@ fn slow_fold(
 }
 
 /// Bucket-path fold.
-fn bucket_fold(
-    ring: Arc<Ring>,
-    seed: Poly,
-    ops: &[(Monomial, Coeff, Poly)],
-) -> Poly {
+fn bucket_fold(ring: Arc<Ring>, seed: Poly, ops: &[(Monomial, Coeff, Poly)]) -> Poly {
     let mut b = KBucket::from_poly(Arc::clone(&ring), seed);
     for (m, c, q) in ops {
         b.minus_m_mult_p(m, *c, q);
@@ -241,35 +228,41 @@ fn mono(r: &Ring, e: &[u32]) -> Monomial {
 #[test]
 fn small_bba_like_workload_matches() {
     let r = mk_ring(4, 32003);
-    let seed = Poly::from_terms(&r, vec![
-        (5, mono(&r, &[3, 1, 0, 0])),
-        (7, mono(&r, &[2, 1, 1, 0])),
-        (11, mono(&r, &[1, 2, 0, 1])),
-        (13, mono(&r, &[0, 3, 1, 0])),
-        (17, mono(&r, &[2, 0, 2, 0])),
-        (19, mono(&r, &[1, 1, 1, 1])),
-        (23, mono(&r, &[0, 2, 0, 2])),
-        (29, mono(&r, &[0, 0, 3, 1])),
-        (31, mono(&r, &[1, 0, 1, 2])),
-        (37, mono(&r, &[0, 1, 0, 3])),
-    ]);
+    let seed = Poly::from_terms(
+        &r,
+        vec![
+            (5, mono(&r, &[3, 1, 0, 0])),
+            (7, mono(&r, &[2, 1, 1, 0])),
+            (11, mono(&r, &[1, 2, 0, 1])),
+            (13, mono(&r, &[0, 3, 1, 0])),
+            (17, mono(&r, &[2, 0, 2, 0])),
+            (19, mono(&r, &[1, 1, 1, 1])),
+            (23, mono(&r, &[0, 2, 0, 2])),
+            (29, mono(&r, &[0, 0, 3, 1])),
+            (31, mono(&r, &[1, 0, 1, 2])),
+            (37, mono(&r, &[0, 1, 0, 3])),
+        ],
+    );
     let ops: Vec<(Monomial, Coeff, Poly)> = vec![
         (
             mono(&r, &[1, 0, 0, 0]),
             3,
-            Poly::from_terms(&r, vec![
-                (1, mono(&r, &[1, 0, 0, 0])),
-                (2, mono(&r, &[0, 1, 0, 0])),
-                (4, mono(&r, &[0, 0, 1, 0])),
-            ]),
+            Poly::from_terms(
+                &r,
+                vec![
+                    (1, mono(&r, &[1, 0, 0, 0])),
+                    (2, mono(&r, &[0, 1, 0, 0])),
+                    (4, mono(&r, &[0, 0, 1, 0])),
+                ],
+            ),
         ),
         (
             mono(&r, &[0, 1, 0, 0]),
             5,
-            Poly::from_terms(&r, vec![
-                (1, mono(&r, &[0, 0, 1, 0])),
-                (6, mono(&r, &[0, 0, 0, 1])),
-            ]),
+            Poly::from_terms(
+                &r,
+                vec![(1, mono(&r, &[0, 0, 1, 0])), (6, mono(&r, &[0, 0, 0, 1]))],
+            ),
         ),
         (
             mono(&r, &[0, 0, 1, 0]),
