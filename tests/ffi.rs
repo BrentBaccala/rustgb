@@ -34,11 +34,18 @@ fn read_version() -> String {
 type TermSpec<'a> = (u32, &'a [i32]);
 type PolySpec<'a> = &'a [TermSpec<'a>];
 
+/// One basis polynomial as read out of the FFI: a list of
+/// `(coeff, exponent_vector)` pairs, terms in descending order.
+type FfiPoly = Vec<(u32, Vec<i32>)>;
+
+/// The full basis read out via the FFI.
+type FfiBasis = Vec<FfiPoly>;
+
 fn compute_via_ffi(
     nvars: u32,
     prime: u32,
     polys: &[PolySpec<'_>],
-) -> (Vec<Vec<(u32, Vec<i32>)>>, Vec<Poly>) {
+) -> (FfiBasis, Vec<Poly>) {
     // --- FFI path ---
     let ring = unsafe { rustgb_ring_create(nvars, prime) };
     assert!(!ring.is_null(), "ring create failed: {}", last_error_string());
@@ -64,10 +71,10 @@ fn compute_via_ffi(
 
     // Read out the basis.
     let npoly = unsafe { rustgb_basis_poly_count(basis) };
-    let mut ffi_out: Vec<Vec<(u32, Vec<i32>)>> = Vec::with_capacity(npoly);
+    let mut ffi_out: FfiBasis = Vec::with_capacity(npoly);
     for pi in 0..npoly {
         let nt = unsafe { rustgb_basis_term_count(basis, pi) };
-        let mut terms: Vec<(u32, Vec<i32>)> = Vec::with_capacity(nt);
+        let mut terms: FfiPoly = Vec::with_capacity(nt);
         for ti in 0..nt {
             let mut exps = vec![0i32; nvars as usize];
             let mut coeff: u32 = 0;
@@ -104,11 +111,7 @@ fn compute_via_ffi(
     (ffi_out, rust_out)
 }
 
-fn polys_match(
-    ffi_out: &[Vec<(u32, Vec<i32>)>],
-    rust_out: &[Poly],
-    ring: &Ring,
-) -> bool {
+fn polys_match(ffi_out: &[FfiPoly], rust_out: &[Poly], ring: &Ring) -> bool {
     if ffi_out.len() != rust_out.len() {
         return false;
     }
