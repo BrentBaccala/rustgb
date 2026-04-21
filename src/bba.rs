@@ -259,15 +259,19 @@ fn reduce_lobject(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
         let Some(idx) = divisor else { return };
 
         // Perform the reduction step `lobj -= (lm_coeff / s_lc) * m * s`.
+        // Every basis element was `monic()`-normalised at insert time,
+        // so `s_lc == 1` and `inv_s_lc == 1`; we can skip the Fermat
+        // inversion entirely. `c` is just the LObject's leading
+        // coefficient.
         let s = s_basis.poly(idx);
         let (s_lc, s_lm_ref) = s.leading().expect("non-redundant basis is nonzero");
+        debug_assert_eq!(s_lc, 1, "basis element should be monic");
+        let _ = s_lc;
         let m = lm
             .div(s_lm_ref, ring)
             .expect("divisibility already checked");
         let m_deg = m.total_deg();
-        let f = ring.field();
-        let inv_s_lc = f.inv(s_lc).expect("nonzero lc is invertible");
-        let c = f.mul(lm_coeff, inv_s_lc);
+        let c = lm_coeff;
 
         lobj.bucket_mut().minus_m_mult_p(&m, c, s);
         lobj.refresh();
@@ -403,45 +407,42 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
             }
             Some(idx) => {
                 // Reduce: bucket -= (c / s_lc) * (m / s_lm) * s.
-                // This cancels the leading c*m and blends in the
-                // tail of (c/s_lc) * (m/s_lm) * s.
+                // Basis elements are monic (`s_lc == 1`), so
+                // `(c / s_lc) == c` and we skip the Fermat inversion.
                 let s = s_basis.poly(idx);
                 let (s_lc, s_lm_ref) = s.leading().expect("non-redundant");
+                debug_assert_eq!(s_lc, 1, "basis element should be monic");
+                let _ = s_lc;
                 let mult = m.div(s_lm_ref, ring).expect("divisibility checked");
-                let f = ring.field();
-                let inv_s_lc = f.inv(s_lc).expect("nonzero lc is invertible");
-                let coeff = f.mul(c, inv_s_lc);
-                bucket.minus_m_mult_p(&mult, coeff, s);
+                bucket.minus_m_mult_p(&mult, c, s);
             }
         }
     }
 
-    // `done` holds the normal-form terms in descending order; build
-    // the poly. Using `from_terms` would re-sort (wasteful) — we rely
-    // on the descending order and construct a canonical poly.
+    // `done` holds the normal-form terms in strictly descending order
+    // (each term came from `bucket.extract_leading`, which always
+    // yields the current maximum). Use the descending-terms fast path
+    // to skip the re-sort in `Poly::from_terms`.
     if done.is_empty() {
         Poly::zero()
     } else {
-        // `from_terms` accepts any order and will stable-sort. The
-        // input here is already descending, so the sort is O(n). We
-        // could micro-optimise with a direct constructor, but this is
-        // a post-loop one-shot and correctness is more important.
-        Poly::from_terms(ring, done)
+        Poly::from_descending_terms_unchecked(ring, done)
     }
 }
 
 /// Build a polynomial with leading term `(lc, lm)` followed by the
-/// terms of `tail`. Precondition: every term in `tail` has monomial
-/// strictly less than `lm` under the ring's ordering; the function
-/// does not verify this, but `Poly::from_terms` will sort-and-dedup
-/// as a safety net.
+/// terms of `tail`. Precondition: `tail` is a canonical polynomial
+/// whose every term has a monomial strictly less than `lm` under the
+/// ring's ordering. `(lc, lm)` is prepended and the resulting vector
+/// is already in strictly-descending order with no duplicates, so we
+/// take the fast path and skip the sort.
 fn prepend_leading(lc: Coeff, lm: &crate::monomial::Monomial, tail: Poly, ring: &Ring) -> Poly {
     let mut terms: Vec<(Coeff, crate::monomial::Monomial)> = Vec::with_capacity(tail.len() + 1);
     terms.push((lc, lm.clone()));
     for (c, m) in tail.iter() {
         terms.push((c, m.clone()));
     }
-    Poly::from_terms(ring, terms)
+    Poly::from_descending_terms_unchecked(ring, terms)
 }
 
 #[cfg(test)]

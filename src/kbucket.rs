@@ -297,77 +297,79 @@ impl KBucket {
         // leading term; merge any slot whose leader matches into it
         // by summing coefficients; if the sum cancels, peel those
         // leaders off and repeat.
+        //
+        // Combined scan: a single pass tracks `best` (slot with the
+        // current running maximum), `total_c` (summed coeff for all
+        // slots matching `best`), and `matching` (slot indices whose
+        // leaders equal the running maximum). On encountering a new
+        // strictly-larger leader we reset total_c and matching.
         loop {
-            let best = self.find_max_leader();
-            let Some(best_slot) = best else {
-                self.dirty = 0;
-                self.lm_cache = None;
-                return None;
-            };
-
-            // Gather the leading monomial and sum all matching leader
-            // coefficients across slots.
-            let lead_m = {
-                let p = self.slots[best_slot].as_ref().unwrap();
-                p.leading().unwrap().1.clone()
-            };
+            let mut best: Option<usize> = None;
             let mut total_c: Coeff = 0;
-            let mut matching: Vec<usize> = Vec::new();
+            let mut matching_mask: u32 = 0;
             for (i, slot) in self.slots.iter().enumerate() {
                 let Some(p) = slot else { continue };
                 if p.is_zero() {
                     continue;
                 }
                 let (c_i, m_i) = p.leading().unwrap();
-                if m_i.cmp(&lead_m, &self.ring).is_eq() {
-                    total_c = self.ring.field().add(total_c, c_i);
-                    matching.push(i);
+                match best {
+                    None => {
+                        best = Some(i);
+                        total_c = c_i;
+                        matching_mask = 1u32 << i;
+                    }
+                    Some(j) => {
+                        let (_, mj) = self.slots[j].as_ref().unwrap().leading().unwrap();
+                        match m_i.cmp(mj, &self.ring) {
+                            std::cmp::Ordering::Greater => {
+                                best = Some(i);
+                                total_c = c_i;
+                                matching_mask = 1u32 << i;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                total_c = self.ring.field().add(total_c, c_i);
+                                matching_mask |= 1u32 << i;
+                            }
+                            std::cmp::Ordering::Less => {}
+                        }
+                    }
                 }
             }
+            let Some(best_slot) = best else {
+                self.dirty = 0;
+                self.lm_cache = None;
+                return None;
+            };
 
             if total_c != 0 {
                 self.dirty = 0;
+                // Clone the leader monomial only now (once), for the
+                // cache. The single clone avoids the earlier
+                // scan/rescan pattern that cloned up front.
+                let lead_m = self.slots[best_slot].as_ref().unwrap()
+                    .leading().unwrap().1.clone();
                 self.lm_cache = Some((total_c, lead_m, best_slot));
                 let (c, m, _) = self.lm_cache.as_ref().unwrap();
                 return Some((*c, m));
             }
 
             // Cancellation: peel leaders off every matching slot and
-            // rescan.
-            for i in matching {
-                let p = self.slots[i].take().unwrap();
-                let rest = p.drop_leading();
-                if !rest.is_zero() {
-                    self.slots[i] = Some(rest);
+            // rescan. Use the in-place variant to avoid cloning the
+            // tail.
+            for i in 0..NUM_SLOTS {
+                if matching_mask & (1u32 << i) == 0 {
+                    continue;
+                }
+                let p = self.slots[i].as_mut().unwrap();
+                p.drop_leading_in_place();
+                if p.is_zero() {
+                    self.slots[i] = None;
                 }
             }
             self.lm_cache = None;
             // fall through to repeat the scan
         }
-    }
-
-    /// Find the slot index with the maximum leading monomial among
-    /// all non-empty non-zero slots, or `None` if every slot is
-    /// empty/zero.
-    fn find_max_leader(&self) -> Option<usize> {
-        let mut best: Option<usize> = None;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let Some(p) = slot else { continue };
-            if p.is_zero() {
-                continue;
-            }
-            match best {
-                None => best = Some(i),
-                Some(j) => {
-                    let (_, mi) = p.leading().unwrap();
-                    let (_, mj) = self.slots[j].as_ref().unwrap().leading().unwrap();
-                    if mi.cmp(mj, &self.ring).is_gt() {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        best
     }
 
     /// Pop the leading term of the bucket sum.
@@ -385,17 +387,18 @@ impl KBucket {
         // the *sum* of those slots' leading coefficients, peeling
         // them all off removes exactly `c * m` from the bucket.
         for i in 0..NUM_SLOTS {
-            let Some(ref p) = self.slots[i] else { continue };
+            let Some(p) = self.slots[i].as_mut() else {
+                continue;
+            };
             if p.is_zero() {
                 self.slots[i] = None;
                 continue;
             }
             let (_, mi) = p.leading().unwrap();
             if mi.cmp(&m, &self.ring).is_eq() {
-                let p_owned = self.slots[i].take().unwrap();
-                let rest = p_owned.drop_leading();
-                if !rest.is_zero() {
-                    self.slots[i] = Some(rest);
+                p.drop_leading_in_place();
+                if p.is_zero() {
+                    self.slots[i] = None;
                 }
             }
         }
@@ -476,9 +479,10 @@ impl KBucket {
 /// Build `-c * m * p` as a standalone polynomial. Term ordering is
 /// preserved by monomial multiplication being monotone under
 /// `DegRevLex`, so the resulting coefficient/term parallel vectors
-/// are already descending. We still hand them to `Poly::from_terms`
-/// for canonicalisation (cheap because inputs are already sorted and
-/// have no duplicates).
+/// are already strictly descending. `c != 0` and `pc != 0` in a
+/// canonical `Poly`, so with `c*pc mod p` potentially zero we filter
+/// it; no duplicates can appear. We therefore take the descending-
+/// parallel fast path in `Poly` and skip the sort.
 ///
 /// Returns `None` if any `m * q_terms[j]` overflows the 8-bit
 /// exponent budget.
@@ -489,7 +493,8 @@ fn build_neg_cmp(ring: &Ring, c: Coeff, m: &Monomial, p: &Poly) -> Option<Poly> 
         return Some(Poly::zero());
     }
     let f = ring.field();
-    let mut terms: Vec<(Coeff, Monomial)> = Vec::with_capacity(p.len());
+    let mut coeffs: Vec<Coeff> = Vec::with_capacity(p.len());
+    let mut mons: Vec<Monomial> = Vec::with_capacity(p.len());
     for (pc, pm) in p.iter() {
         let prod_c = f.mul(c, pc);
         let prod_c = f.neg(prod_c);
@@ -497,9 +502,10 @@ fn build_neg_cmp(ring: &Ring, c: Coeff, m: &Monomial, p: &Poly) -> Option<Poly> 
             continue;
         }
         let prod_m = pm.mul(m, ring)?;
-        terms.push((prod_c, prod_m));
+        coeffs.push(prod_c);
+        mons.push(prod_m);
     }
-    Some(Poly::from_terms(ring, terms))
+    Some(Poly::from_descending_parallel_unchecked(ring, coeffs, mons))
 }
 
 #[cfg(test)]

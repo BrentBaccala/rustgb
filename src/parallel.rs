@@ -321,15 +321,16 @@ pub fn reduce_lobject_parallel(lobj: &mut LObject, comp: &Computation) {
 
         let Some((s, s_sugar)) = divisor else { return };
 
-        // Perform the reduction step.
+        // Perform the reduction step. Basis elements are monic, so
+        // `s_lc == 1` and `inv_s_lc == 1`.
         let (s_lc, s_lm_ref) = s.leading().expect("nonzero");
+        debug_assert_eq!(s_lc, 1, "basis element should be monic");
+        let _ = s_lc;
         let m = lm
             .div(s_lm_ref, &comp.ring)
             .expect("divisibility already checked");
         let m_deg = m.total_deg();
-        let f = comp.ring.field();
-        let inv_s_lc = f.inv(s_lc).expect("nonzero lc is invertible");
-        let c = f.mul(lm_coeff, inv_s_lc);
+        let c = lm_coeff;
 
         lobj.bucket_mut().minus_m_mult_p(&m, c, &s);
         lobj.refresh();
@@ -792,13 +793,14 @@ fn reduce_tail(tail: Poly, polys: &[Poly], redundant: &[bool], ring: &Arc<Ring>)
                 done.push((pc, pm));
             }
             Some(idx) => {
+                // Basis elements are monic: `s_lc == 1`, so we skip
+                // the Fermat inversion.
                 let s = &polys[idx];
                 let (s_lc, s_lm_ref) = s.leading().expect("non-redundant");
+                debug_assert_eq!(s_lc, 1, "basis element should be monic");
+                let _ = s_lc;
                 let mult = m.div(s_lm_ref, ring).expect("divisibility checked");
-                let f = ring.field();
-                let inv_s_lc = f.inv(s_lc).expect("nonzero lc is invertible");
-                let coeff = f.mul(c, inv_s_lc);
-                bucket.minus_m_mult_p(&mult, coeff, s);
+                bucket.minus_m_mult_p(&mult, c, s);
             }
         }
     }

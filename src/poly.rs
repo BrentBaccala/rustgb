@@ -67,6 +67,97 @@ impl Poly {
         }
     }
 
+    /// Build a polynomial from a sequence of `(coeff, monomial)` pairs
+    /// that is already in strictly-descending monomial order with no
+    /// duplicates and no zero coefficients.
+    ///
+    /// This is the zero-overhead fast path used by hot loops that
+    /// already know they produced descending, deduped, nonzero terms:
+    /// `kbucket::build_neg_cmp` (monomial multiplication by a fixed m
+    /// preserves descending order in degrevlex), and `bba::reduce_tail`
+    /// (whose `done` vector accumulates in descending order by
+    /// construction from the bucket's `extract_leading`).
+    ///
+    /// Preconditions (checked only in debug):
+    /// * `terms` is strictly descending under the ring's ordering.
+    /// * No monomial appears twice.
+    /// * Every coefficient is in `(0, p)`.
+    pub fn from_descending_terms_unchecked(
+        ring: &Ring,
+        terms: Vec<(Coeff, Monomial)>,
+    ) -> Self {
+        if terms.is_empty() {
+            return Self::zero();
+        }
+        let p = ring.field().p();
+        let mut coeffs: Vec<Coeff> = Vec::with_capacity(terms.len());
+        let mut mons: Vec<Monomial> = Vec::with_capacity(terms.len());
+        for (c, m) in terms {
+            debug_assert!(c != 0, "from_descending_terms_unchecked: zero coeff");
+            debug_assert!(c < p, "from_descending_terms_unchecked: unreduced coeff");
+            let _ = p;
+            if cfg!(debug_assertions)
+                && let Some(prev) = mons.last()
+            {
+                debug_assert!(
+                    prev.cmp(&m, ring).is_gt(),
+                    "from_descending_terms_unchecked: not strictly descending"
+                );
+            }
+            coeffs.push(c);
+            mons.push(m);
+        }
+        let mut out = Self {
+            coeffs,
+            terms: mons,
+            lm_sev: 0,
+            lm_coeff: 0,
+            lm_deg: 0,
+        };
+        out.refresh_cache();
+        out
+    }
+
+    /// Build a polynomial directly from pre-built parallel vectors of
+    /// coefficients and monomials. Same preconditions as
+    /// [`from_descending_terms_unchecked`] but skips the tuple
+    /// unpacking: the vectors are moved in place. Used by the hot
+    /// `kbucket::build_neg_cmp` loop where building parallel vectors
+    /// is cheaper than pushing `(Coeff, Monomial)` tuples one at a
+    /// time into a single vec (tuple pushes move 48 bytes each; the
+    /// parallel vec writes move 4 bytes + 48 bytes to separate cache
+    /// lines and vectorise more cleanly).
+    pub fn from_descending_parallel_unchecked(
+        ring: &Ring,
+        coeffs: Vec<Coeff>,
+        terms: Vec<Monomial>,
+    ) -> Self {
+        debug_assert_eq!(coeffs.len(), terms.len());
+        if terms.is_empty() {
+            return Self::zero();
+        }
+        #[cfg(debug_assertions)]
+        {
+            let p = ring.field().p();
+            for &c in &coeffs {
+                debug_assert!(c != 0 && c < p);
+            }
+            for w in terms.windows(2) {
+                debug_assert!(w[0].cmp(&w[1], ring).is_gt());
+            }
+        }
+        let _ = ring;
+        let mut out = Self {
+            coeffs,
+            terms,
+            lm_sev: 0,
+            lm_coeff: 0,
+            lm_deg: 0,
+        };
+        out.refresh_cache();
+        out
+    }
+
     /// Build a polynomial from an unsorted sequence of `(coeff, monomial)`
     /// pairs. Duplicates are summed, zeros are dropped, the result is
     /// sorted into descending order. Primarily for tests and round-trip
@@ -212,6 +303,25 @@ impl Poly {
         };
         out.refresh_cache();
         out
+    }
+
+    /// In-place variant of [`drop_leading`](Self::drop_leading). Shifts
+    /// the tail down by one, keeping the same `Vec` allocation. Leaves
+    /// `self` as the zero polynomial if it was a single term. O(n) due
+    /// to the shift, but avoids the clone + allocation that
+    /// `drop_leading` does for the tail.
+    ///
+    /// Used by the geobucket's cancellation-peel path in
+    /// `KBucket::leading` / `extract_leading`, where the poly is taken
+    /// out of its slot, the leader removed, and the result put back in
+    /// the same slot (no caller holds a reference to the old value).
+    pub fn drop_leading_in_place(&mut self) {
+        if self.terms.is_empty() {
+            return;
+        }
+        self.coeffs.remove(0);
+        self.terms.remove(0);
+        self.refresh_cache();
     }
 
     // ----- Arithmetic -----

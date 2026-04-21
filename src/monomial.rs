@@ -176,39 +176,167 @@ impl Monomial {
 
     /// Multiply two monomials. Returns `None` if any resulting exponent
     /// exceeds 255.
+    ///
+    /// Fast path: operate directly on the packed u64 words, skipping
+    /// the unpack-to-`Vec<u32>`-then-repack round trip. Each variable
+    /// byte stores `255 - e`; the product byte wants
+    /// `c_new = 255 - (e_a + e_b) = c_a + c_b - 255`. Overflow
+    /// (`e_a + e_b > 255`) is equivalent to `c_a + c_b < 255`.
     pub fn mul(&self, other: &Self, ring: &Ring) -> Option<Self> {
         let n = ring.nvars() as usize;
-        let mut exps = vec![0u32; n];
-        for (i, slot) in exps.iter_mut().enumerate() {
-            let sum = self.exponent_raw(n, i) + other.exponent_raw(n, i);
-            if sum > u8::MAX as u32 {
-                return None;
+        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
+        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
+        let mut packed = [0u64; WORDS_PER_MONO];
+        #[allow(clippy::needless_range_loop)]
+        for word in 0..WORDS_PER_MONO {
+            let word_low_byte = word * 8;
+            let word_high_byte = word_low_byte + 7;
+            let lo = first_var_byte.max(word_low_byte);
+            let hi = last_var_byte.min(word_high_byte);
+            if lo > hi {
+                continue;
             }
-            *slot = sum;
+            let low_byte = (lo - word_low_byte) as u32;
+            let high_byte = (hi - word_low_byte) as u32;
+            let a = self.packed[word];
+            let b = other.packed[word];
+            let mut new_word: u64 = 0;
+            for b_idx in low_byte..=high_byte {
+                let shift = b_idx * 8;
+                let ca = (a >> shift) & 0xFF;
+                let cb = (b >> shift) & 0xFF;
+                // ca = 255 - e_a, cb = 255 - e_b. Overflow iff
+                // e_a + e_b > 255 iff ca + cb < 255.
+                if ca + cb < 0xFF {
+                    return None;
+                }
+                let cnew = ca + cb - 0xFF;
+                new_word |= cnew << shift;
+            }
+            packed[word] |= new_word;
         }
-        Self::from_exponents(ring, &exps)
+        // Total degree update (uncapped).
+        let total = self.total_deg as u64 + other.total_deg as u64;
+        if total > u32::MAX as u64 {
+            return None;
+        }
+        let capped = total.min(u8::MAX as u64);
+        packed[WORDS_PER_MONO - 1] |= capped << 56;
+        // SEV update: e_new > 0 iff e_a > 0 OR e_b > 0; so OR the sevs.
+        let sev = self.sev | other.sev;
+        let _ = ring;
+        Some(Self {
+            packed,
+            sev,
+            total_deg: total as u32,
+            component: 0,
+        })
     }
 
     /// `true` iff `self | other` (each `e_i(self) ≤ e_i(other)`).
+    ///
+    /// Fast path: in packed complement-byte form, `e_a ≤ e_b` ↔
+    /// `(255 - e_a) ≥ (255 - e_b)` ↔ `c_a ≥ c_b`. We compute this
+    /// per-byte directly on the packed u64 words.
     pub fn divides(&self, other: &Self, ring: &Ring) -> bool {
         let n = ring.nvars() as usize;
-        (0..n).all(|i| self.exponent_raw(n, i) <= other.exponent_raw(n, i))
+        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
+        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
+        #[allow(clippy::needless_range_loop)]
+        for word in 0..WORDS_PER_MONO {
+            let word_low_byte = word * 8;
+            let word_high_byte = word_low_byte + 7;
+            let lo = first_var_byte.max(word_low_byte);
+            let hi = last_var_byte.min(word_high_byte);
+            if lo > hi {
+                continue;
+            }
+            let low_byte = (lo - word_low_byte) as u32;
+            let high_byte = (hi - word_low_byte) as u32;
+            let a = self.packed[word];
+            let b = other.packed[word];
+            for b_idx in low_byte..=high_byte {
+                let shift = b_idx * 8;
+                let ca = (a >> shift) & 0xFF;
+                let cb = (b >> shift) & 0xFF;
+                // self | other iff e_self[i] ≤ e_other[i] iff
+                // (255 - e_self) ≥ (255 - e_other) iff c_self ≥ c_other.
+                if ca < cb {
+                    return false;
+                }
+            }
+        }
+        let _ = ring; // retained for API stability
+        true
     }
 
     /// Divide. Precondition `other.divides(self)`; returns `None`
     /// otherwise.
+    ///
+    /// Fast path: operate on packed complement-bytes directly.
+    /// `e_new = e_self - e_other`, so complement-byte
+    /// `c_new = 255 - (e_self - e_other) = (255 - e_self) + e_other
+    ///        = c_self + (255 - c_other)
+    ///        = c_self + 0xFF - c_other`.
+    ///
+    /// `other | self` requires `e_other ≤ e_self`, which in complement
+    /// form is `c_other ≥ c_self`. So we reject when `c_other < c_self`
+    /// (that means `e_other > e_self`).
     pub fn div(&self, other: &Self, ring: &Ring) -> Option<Self> {
         let n = ring.nvars() as usize;
-        let mut exps = vec![0u32; n];
-        for (i, slot) in exps.iter_mut().enumerate() {
-            let a = self.exponent_raw(n, i);
-            let b = other.exponent_raw(n, i);
-            if a < b {
-                return None;
+        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
+        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
+        let mut packed = [0u64; WORDS_PER_MONO];
+        let mut sev: u64 = 0;
+        #[allow(clippy::needless_range_loop)]
+        for word in 0..WORDS_PER_MONO {
+            let word_low_byte = word * 8;
+            let word_high_byte = word_low_byte + 7;
+            let lo = first_var_byte.max(word_low_byte);
+            let hi = last_var_byte.min(word_high_byte);
+            if lo > hi {
+                continue;
             }
-            *slot = a - b;
+            let low_byte = (lo - word_low_byte) as u32;
+            let high_byte = (hi - word_low_byte) as u32;
+            let a = self.packed[word];
+            let b = other.packed[word];
+            let mut new_word: u64 = 0;
+            for b_idx in low_byte..=high_byte {
+                let shift = b_idx * 8;
+                let ca = (a >> shift) & 0xFF;
+                let cb = (b >> shift) & 0xFF;
+                // e_other > e_self (doesn't divide) iff c_other < c_self.
+                if cb < ca {
+                    return None;
+                }
+                let cnew = ca + 0xFF - cb;
+                // c_new = 255 - e_new; if e_new > 0, c_new < 255.
+                if cnew < 0xFF {
+                    // Recover variable index from byte position:
+                    // var i has byte index i + 31 - n, so i = byte - 31 + n.
+                    let abs_byte = word_low_byte + b_idx as usize;
+                    let var_i = abs_byte + n - (WORDS_PER_MONO * 8 - 1);
+                    sev |= 1u64 << (var_i % 64);
+                }
+                new_word |= cnew << shift;
+            }
+            packed[word] |= new_word;
         }
-        Self::from_exponents(ring, &exps)
+        // Total degree: self.total_deg - other.total_deg.
+        if other.total_deg > self.total_deg {
+            return None;
+        }
+        let total = self.total_deg - other.total_deg;
+        let capped = (total as u64).min(u8::MAX as u64);
+        packed[WORDS_PER_MONO - 1] |= capped << 56;
+        let _ = ring;
+        Some(Self {
+            packed,
+            sev,
+            total_deg: total,
+            component: 0,
+        })
     }
 
     /// Componentwise maximum (least common multiple of monomials).
