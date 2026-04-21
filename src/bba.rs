@@ -43,8 +43,46 @@ use crate::sbasis::SBasis;
 ///   output a deterministic function of the ideal, independent of
 ///   the order in which generators appear in `input`.
 ///
-/// The algorithm is sequential. See the module docs for scope.
+/// Thread count: controlled by the `RUSTGB_THREADS` environment
+/// variable. Default 1 (serial path). Values `>= 2` dispatch to
+/// [`crate::parallel::compute_gb_parallel`], which runs a
+/// continuous-cursor sweep with worker-side drain.
+///
+/// At `T == 1` this runs the serial path, which is deterministic
+/// bit-for-bit (matches pre-parallel behaviour). At `T > 1` the
+/// output is still the reduced Gröbner basis — unique up to
+/// permutation — and the canonical sort removes the permutation
+/// ambiguity, so the output is still a function of the ideal.
 pub fn compute_gb(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
+    let num_threads = rustgb_threads();
+    if num_threads == 1 {
+        compute_gb_serial(ring, input)
+    } else {
+        // Cancellation at the env-var-level dispatch surface has no
+        // handle caller — we `expect` the computation to complete.
+        // For cancellation via an external signal, callers should
+        // use `parallel::compute_gb_parallel` directly with their
+        // own `Computation` instance (forthcoming work once the FFI
+        // cancel hook lands).
+        crate::parallel::compute_gb_parallel(ring, input, num_threads)
+            .expect("compute_gb cancelled with no external cancel source")
+    }
+}
+
+/// Parse `RUSTGB_THREADS` from the environment. Default 1. Any
+/// non-numeric or negative value parses to 1. Cap at 256 so a user
+/// typo (`RUSTGB_THREADS=1000000`) doesn't explode the thread pool.
+fn rustgb_threads() -> usize {
+    match std::env::var("RUSTGB_THREADS") {
+        Ok(v) => v.parse::<usize>().unwrap_or(1).clamp(1, 256),
+        Err(_) => 1,
+    }
+}
+
+/// The serial implementation of `compute_gb`. Exposed so the
+/// env-var dispatch can pick between serial and parallel without
+/// changing the public API.
+pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     let mut s_basis = SBasis::new();
     let mut l_set = LSet::new();
     let mut next_arrival: u64 = 0;

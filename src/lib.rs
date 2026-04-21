@@ -26,6 +26,7 @@
 
 pub mod bba;
 pub mod bset;
+pub mod computation;
 pub mod ffi;
 pub mod field;
 pub mod gm;
@@ -35,11 +36,14 @@ pub mod lset;
 pub mod monomial;
 pub mod ordering;
 pub mod pair;
+pub mod parallel;
 pub mod poly;
 pub mod ring;
 pub mod sbasis;
 
 pub use bba::compute_gb;
+pub use computation::{Computation, SharedLSet, SharedSBasis};
+pub use parallel::{CancelHandle, Cancelled, compute_gb_parallel};
 pub use bset::BSet;
 pub use field::{Coeff, Field};
 pub use kbucket::KBucket;

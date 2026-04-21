@@ -17,5 +17,8 @@ crate-type = ["cdylib", "rlib"]
 [dev-dependencies]
 proptest = "1"
 
+# Sanitisers are available only with `-Z sanitizer=thread` on nightly.
+# No build configuration needed in Cargo.toml.
+
 [profile.release]
 debug = true   # keep symbols for profiling

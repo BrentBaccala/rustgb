@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use rustgb::compute_gb;
+use rustgb::compute_gb_parallel;
 use rustgb::field::Field;
 use rustgb::monomial::Monomial;
 use rustgb::ordering::MonoOrder;
@@ -261,5 +262,101 @@ fn cyclic3_order_permutations_all_agree() {
         let input = p.iter().map(|&i| fs[i].clone()).collect::<Vec<_>>();
         let gb = compute_gb(Arc::clone(&r), input);
         assert_eq!(gb, base, "permutation {:?} gave different GB", p);
+    }
+}
+
+// ===== Parallel-driver property tests =====
+//
+// The parallel driver must:
+//   1. Produce the reduced GB at T>1 — bit-equal to the T=1 serial
+//      output after canonical sort.
+//   2. Be stable under re-execution: compute_gb_parallel(…, T=4) twice
+//      must produce bit-equal output.
+//   3. Match the serial path across every ideal in the random set
+//      used by determinism_small_ideals.
+
+#[test]
+fn parallel_matches_serial_small_ideals() {
+    let r = mk_ring(3, 32003);
+    let mut rng = Prng::new(0x5A5A_A5A5_1111_2222);
+    for iter in 0..30 {
+        let ngens = rng.in_range(1, 4);
+        let gens: Vec<Poly> = (0..ngens)
+            .map(|_| random_poly(&mut rng, &r, 4, 2))
+            .collect();
+        let gb_serial = compute_gb(Arc::clone(&r), gens.clone());
+        let gb_par = compute_gb_parallel(Arc::clone(&r), gens.clone(), 4).unwrap();
+        assert_eq!(
+            gb_serial, gb_par,
+            "iter {}: serial vs parallel mismatch on input {:?}",
+            iter, gens
+        );
+    }
+}
+
+#[test]
+fn parallel_reduced_gb_invariant() {
+    // Same input twice at T=4 — outputs must be bitwise equal.
+    let r = mk_ring(3, 32003);
+    let mut rng = Prng::new(0xDEAD_D00D);
+    for _ in 0..20 {
+        let ngens = rng.in_range(2, 4);
+        let gens: Vec<Poly> = (0..ngens)
+            .map(|_| random_poly(&mut rng, &r, 4, 2))
+            .collect();
+        let gb_a = compute_gb_parallel(Arc::clone(&r), gens.clone(), 4).unwrap();
+        let gb_b = compute_gb_parallel(Arc::clone(&r), gens.clone(), 4).unwrap();
+        assert_eq!(gb_a, gb_b, "parallel outputs not equal across runs");
+    }
+}
+
+#[test]
+fn parallel_idempotence_t4() {
+    let r = mk_ring(3, 32003);
+    let mut rng = Prng::new(0x1234_BEEF_BABE);
+    for _ in 0..15 {
+        let ngens = rng.in_range(1, 3);
+        let gens: Vec<Poly> = (0..ngens)
+            .map(|_| random_poly(&mut rng, &r, 3, 2))
+            .collect();
+        let gb_once = compute_gb_parallel(Arc::clone(&r), gens, 4).unwrap();
+        let gb_twice =
+            compute_gb_parallel(Arc::clone(&r), gb_once.clone(), 4).unwrap();
+        assert_eq!(gb_once, gb_twice, "parallel idempotence violated at T=4");
+    }
+}
+
+#[test]
+fn parallel_every_input_reduces_to_zero_t4() {
+    let r = mk_ring(3, 32003);
+    let mut rng = Prng::new(0xF00F_B00F);
+    for _ in 0..15 {
+        let ngens = rng.in_range(1, 4);
+        let gens: Vec<Poly> = (0..ngens)
+            .map(|_| random_poly(&mut rng, &r, 3, 2))
+            .collect();
+        let gb = compute_gb_parallel(Arc::clone(&r), gens.clone(), 4).unwrap();
+        for g in &gens {
+            let nf = normal_form(g, &gb, &r);
+            assert!(nf.is_zero(), "input {:?} did not reduce to zero", g);
+        }
+    }
+}
+
+#[test]
+fn parallel_stable_across_thread_counts() {
+    // T=2, T=4, T=8 must all produce the same reduced GB.
+    let r = mk_ring(3, 32003);
+    let mut rng = Prng::new(0xA1B2_C3D4);
+    for _ in 0..10 {
+        let ngens = rng.in_range(2, 4);
+        let gens: Vec<Poly> = (0..ngens)
+            .map(|_| random_poly(&mut rng, &r, 4, 2))
+            .collect();
+        let gb2 = compute_gb_parallel(Arc::clone(&r), gens.clone(), 2).unwrap();
+        let gb4 = compute_gb_parallel(Arc::clone(&r), gens.clone(), 4).unwrap();
+        let gb8 = compute_gb_parallel(Arc::clone(&r), gens.clone(), 8).unwrap();
+        assert_eq!(gb2, gb4, "T=2 != T=4");
+        assert_eq!(gb4, gb8, "T=4 != T=8");
     }
 }
