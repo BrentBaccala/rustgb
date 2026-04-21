@@ -5,6 +5,12 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Groebner basis engine for Singular (polynomial layer only -- see ~/project/docs/rust-bba-port-plan.md)"
 
+[lib]
+# `cdylib` produces librustgb.so for the Singular dyn_module to
+# dlopen / link against; `rlib` keeps the crate usable as a normal
+# Rust dependency for tests and examples.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # stdlib only for now; add as needed.
 

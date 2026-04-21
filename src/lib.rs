@@ -26,6 +26,7 @@
 
 pub mod bba;
 pub mod bset;
+pub mod ffi;
 pub mod field;
 pub mod gm;
 pub mod kbucket;
