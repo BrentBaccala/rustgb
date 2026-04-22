@@ -1219,6 +1219,55 @@ workloads, putting staging-5101449 at roughly 60-80 s
 (from v5's 115 s). This would close maybe a third of the
 gap to the C++ next-opt target (~5 s on samsung).
 
+**Measured (post-implementation, v6 profile, samsung, 2026-04-22):**
+
+The actual win exceeded the prediction by 2×.
+
+| Test | v5 (geobucket, AVX2) | v6 (heap, AVX2) | Wall reduction |
+|---|---|---|---|
+| staging-5101449 | 115 s | **38 s** | **−67 %** |
+| staging-5104053 | 186 s | **52 s** | **−72 %** |
+| staging-5106746 | 225 s | **58 s** | **−74 %** |
+
+All three staging tests pass with exact fixture matches.
+
+**Cumulative wall on staging-5101449 across the optimisation
+series (un-profiled, AVX2 build, low contention):**
+
+| Profile | Wall | Cumulative speedup |
+|---|---|---|
+| v1 (raw memmove) | ~870 s | 1.0× |
+| v2 (ADR-001 head cursor) | ~225 s | 3.9× |
+| v3 (ADR-005 direct exp) | ~204 s | 4.3× |
+| v4 (ADR-006 FLINT merge) | ~140 s | 6.2× |
+| v5 (ADR-007 SIMD sev) | 115 s | 7.6× |
+| **v6 (ADR-008 heap reducer)** | **38 s** | **23×** |
+
+vs C++ next-opt baseline (~5-7 s on samsung): rustgb went from
+~17-25× slower (v5) to ~5-8× slower (v6). The heap reducer alone
+closed roughly two-thirds of the remaining gap.
+
+**v6 profile cost shape** (~/project/docs/profile-rustgb-v6-staging-5101449.md):
+
+| Function | v5 % | v6 % | Notes |
+|---|---|---|---|
+| `bba::reduce_lobject` (geo path, self+inlined) | 23.5 | gone | replaced by heap path |
+| `poly::merge` | 20.1 | **gone** | matches prediction |
+| `KBucket::minus_m_mult_p` | 16.1 | **gone** | matches prediction |
+| `KBucket::leading` | 15.3 | **gone** | matches prediction |
+| `ReducerHeap::reduce_to_normal_form` | — | 19.8 | new; mostly find_divisor |
+| `gm::chain_crit_normal` | 3.2 | **19.8** | **6× share growth** |
+| `ReducerHeap::pop_with_cancellation` | — | 11.2 | new |
+| `BinaryHeap::pop` | — | 10.5 | new (std-lib heap log factor) |
+| Hashing (gm pair-criterion) | <1 | ~7 | new visibility |
+| libc allocator (combined) | 5.3 | ~3 | matches prediction |
+
+The huge surprise: `gm::chain_crit_normal` jumped from 3.2 % to
+19.8 % share — the same Amdahl's law effect Singular saw when
+they reduced the reducer cost. The pair criterion is now the
+plurality-share concentrated function (tied with reducer's outer
+loop). The natural next ADR target.
+
 **Risks**:
 - **Sugar regression**: the heap-based design's sugar bookkeeping
   is structurally simpler but easy to get wrong. Validation gate:
