@@ -1011,6 +1011,286 @@ Listed as a possible follow-up; not adopted now.
 
 ---
 
+## ADR-008: Heap-based Monagan-Pearce reducer (supersedes ADR-002, ADR-003)
+
+**Status:** Accepted. Implementation in progress (multi-phase plan
+landing across several commits). Phase 1 (this commit) lands the
+ADR + scaffold; ADR-002's geobucket reducer remains the active
+runtime path until Phase 5 plumbs the heap reducer in behind a
+feature flag, and is fully retired in Phase 7 if heap-based
+validation succeeds.
+
+**Date:** 2026-04-22
+
+### Context
+
+The v5 profile (`~/project/docs/profile-rustgb-v5-staging-5101449.md`)
+showed the four largest concentrated functions to be:
+
+| Function | v5 % of total |
+|---|---|
+| `bba::reduce_lobject` (self + inlined) | 23.5 |
+| `poly::merge` | 20.1 |
+| `KBucket::minus_m_mult_p` | 16.1 |
+| `KBucket::leading` | 15.3 |
+| libc allocator (combined) | 5.3 |
+| `Monomial::cmp` (combined under merge + leading) | ~7 |
+
+Of those, `poly::merge` (20.1 %), `KBucket::minus_m_mult_p`
+(16.1 %), `KBucket::leading` (15.3 %), and a large share of
+the allocator cost (~5 %) are **all costs imposed by the geobucket
+reducer architecture chosen in ADR-002**. They exist because the
+geobucket maintains the partial reduction as a materialised set of
+polynomial slots that must be merged, scanned, and absorbed step
+by step. About **57 % of v5's total cycles** live in functions
+either eliminated or replaced by an alternative reducer
+architecture.
+
+The cost shape that's *not* a function of the geobucket — basis
+sweep (~7 %), `Monomial::div` for multiplier construction (~7 %),
+sugar bookkeeping, and the various cmp/divides primitives — is
+unchanged regardless of which reducer architecture we pick.
+
+ADR-003 listed the heap-based Monagan-Pearce reducer as a deferred
+candidate; the v5 profile evidence has now made the case strong
+enough to adopt it. This ADR promotes ADR-003 from "deferred" to
+"accepted" and supersedes ADR-002.
+
+### Singular's approach
+
+Singular has **both** reducer architectures available. The default
+bba path (`~/Singular-rustgb/kernel/GBEngine/kstd2.cc:bba()`)
+uses the geobucket via `kBucket_pt`; a separate path
+(`kStratHeap`-style strategies in `kstd1.cc`) uses a heap reducer
+for situations where the geobucket's slot-management overhead is
+known to lose. The choice was made decades ago when typical
+workloads were larger than today's helium examples; for our scale
+the geobucket's O(slot_count) leader scan cost amortises poorly
+because the slot scan happens on *every* reducer step, not per
+emitted term.
+
+Singular's heap reducer machinery (when used) carries its own
+`max_exp` cache per source poly and pushes new heap nodes as
+divisors are added — structurally identical to the design adopted
+here.
+
+### FLINT's approach
+
+FLINT uses **only** the heap-based Monagan-Pearce reducer for its
+mpoly division (`~/flint/src/nmod_mpoly/divrem_monagan_pearce.c`,
+726 lines, plus a similar `divides_monagan_pearce.c` for the
+"is-it-divisible" specialisation). There is no geobucket reducer
+in FLINT (the geobucket data structure exists but is used only as
+a sum buffer with no `extract_leading` operation — see ADR-002).
+
+FLINT's heap-node design is the closest reference. Each node
+carries a chain of `(i, j)` indices: `i` identifies a source
+polynomial (the input being divided, plus each pending divisor
+times its multiplier), and `j` is the current term index in that
+source. Pop the max, accumulate same-monomial chain entries, sum
+coefficients, emit-or-cancel. When a quotient term is produced,
+the corresponding divisor's tail terms get pushed onto the heap
+(scaled by the quotient term).
+
+The relevant detail FLINT documents but is easy to miss: each
+source contributes **at most one heap node at a time**. When you
+pop term j from source i, you push term j+1 from the same source,
+keeping the heap size bounded by `1 + number_of_active_reducers`.
+This is what keeps the heap log factor manageable.
+
+### Mathicgb's approach
+
+Mathicgb (the reference for ADR-001's polynomial layout) ships
+**both** reducer architectures as runtime-selectable strategies
+via the `Reducer::Type` enum (`~/mathicgb/src/mathicgb/Reducer.hpp`).
+Implementations: `ReducerHeap.cpp`, `ReducerHashTable.cpp`,
+`ReducerNoDedupHashTable.cpp`, `ReducerPackedDedupList.cpp`,
+`ReducerHashPack.cpp`. The default for typical workloads is
+`ReducerHeap`. The fact that mathicgb's authors made heap the
+default after extensive benchmarking on Gröbner-basis-shaped
+problems is a strong signal for our adoption.
+
+Mathicgb's heap reducer also carries a per-reducer "monomial slab"
+that pre-allocates the multiplier monomials in a side table
+indexed by reducer-id. The heap nodes themselves stay small (~24
+bytes: source poly pointer + index + reducer-id), which keeps
+cache pressure low. We will mirror this pattern.
+
+### Decision
+
+Adopt a heap-based Monagan-Pearce reducer for `bba::reduce_lobject`,
+matching the pattern documented above (FLINT's bookkeeping +
+mathicgb's slab layout + lazy divisor addition driven by the
+existing `find_divisor_idx`).
+
+**Algorithmic shape** (the four mechanics that have to all line
+up correctly):
+
+1. **In-flight reducers**, stored in a per-LObject slab:
+   ```text
+   Reducer { poly: &Poly, multiplier: Monomial, coeff: Coeff, index: usize, sugar: u32 }
+   ```
+   `coeff` is pre-negated for cancellation (so summing the heap-top
+   chain naturally produces the cancellation result). `index`
+   tracks the next term in `poly` that hasn't yet been emitted into
+   the heap.
+
+2. **Heap nodes**, max-heap by degrevlex:
+   ```text
+   HeapNode { cmp_key: [u64; 4], reducer_idx: usize }
+   ```
+   `cmp_key` is the packed monomial `multiplier * poly.terms[index]`,
+   pre-XORed against `ring.cmp_flip_mask` so plain lex compare on
+   `[u64; 4]` is the correct max-heap ordering. Cached at push
+   time, so the heap's internal compares need no `&Ring`.
+
+3. **Pop-with-cancellation**: pop the max; while the next pop has
+   the same `cmp_key`, accumulate. After draining the equal chain,
+   if the summed coeff is zero, advance all contributing reducers'
+   indices and recurse (or loop). If nonzero, that's the new
+   leader / output term.
+
+4. **Lazy divisor addition**: when a new leader emerges, run the
+   existing `find_divisor_idx` against `s_basis`. If it returns
+   `Some(idx)`, push a new `Reducer` with `index = 0` and the
+   appropriate negated coefficient onto both the slab and the
+   heap. The next pop-with-cancellation will (by construction)
+   sum the old leader and the new reducer's first term to zero,
+   driving us toward the next non-cancelled term.
+
+5. **Survivor materialisation**: the LObject reduces to zero iff
+   the heap becomes empty. Otherwise we have a survivor — drain
+   the remaining heap entries via repeated pop-with-cancellation,
+   pushing each emitted term into a fresh `Poly`. **This is the
+   only place `Monomial::clone` happens** in the entire reduction
+   chain (excluding the multiplier-monomial clones, one per added
+   reducer, paid into the slab).
+
+**Sugar tracking**: the LObject's sugar at any moment is `max(
+initial_sugar, max over all in-flight reducers of (reducer.sugar))`.
+Since reducers are only added (never removed mid-reduction), this
+is just the running max of `(g_i.sugar + multiplier_deg)` over
+adds, plus the initial. One `u32` slot on the LObject; updated on
+each `push_reducer`.
+
+**What this removes**:
+- `KBucket` entirely (the geobucket struct, its `absorb`,
+  `leading`, `extract_leading`, `minus_m_mult_p`, `is_zero`,
+  `dirty` mask, `lm_cache`, the 32 NUM_SLOTS array and the
+  `slot_for_len` length-bucketing).
+- `poly::merge` (replaced by heap-pop emission); `Poly::add` and
+  `Poly::sub` retain their public API but now go through a much
+  simpler implementation that constructs from the heap output.
+- `Poly::sub_mul_term` (subsumed by adding-as-reducer + heap
+  iteration).
+- The `LObject`'s embedded geobucket; replaced by a heap state
+  (`Vec<Reducer>` slab + `BinaryHeap<HeapNode>` or similar).
+- `kbucket.rs` as a module (retained in the repo through Phase 6
+  for A/B comparison; deleted in Phase 7 if heap wins).
+
+**What this preserves**:
+- `find_divisor_idx` (unchanged — basis sweep still happens on
+  each new leader).
+- `Monomial` and its arithmetic (unchanged).
+- `Poly` and its arithmetic outside the reducer (unchanged).
+- `SBasis` and its sevs/redund parallel arrays (unchanged).
+- `gm` pair criteria (unchanged).
+- Sugar strategy (preserved with simpler bookkeeping).
+- `bba::compute_gb` public API (unchanged).
+- Output: bit-for-bit identical reduced GB on identical inputs
+  (algorithmically Monagan-Pearce produces the same reduced
+  Gröbner basis as geobucket-based bba).
+
+### Consequences
+
+**Performance prediction** (rough, conservative):
+
+| Cost source | v5 share | Post-ADR-008 share |
+|---|---|---|
+| `poly::merge` | 20.1 % | ~3-5 % (only survivor materialisation) |
+| `KBucket::minus_m_mult_p` | 16.1 % | gone |
+| `KBucket::leading` | 15.3 % | gone (replaced by heap-pop, ~5-8 %) |
+| Heap operations (new) | — | ~10-15 % (push, pop, log factor) |
+| `Monomial::clone` per emitted term | ~3-5 % (inside merge's "loop body") | gone for non-survivors |
+| libc allocator | 5.3 % | ~1-2 % (slab is amortised) |
+
+Net wall prediction: **30-50 % wall reduction** on staging
+workloads, putting staging-5101449 at roughly 60-80 s
+(from v5's 115 s). This would close maybe a third of the
+gap to the C++ next-opt target (~5 s on samsung).
+
+**Risks**:
+- **Sugar regression**: the heap-based design's sugar bookkeeping
+  is structurally simpler but easy to get wrong. Validation gate:
+  the cargo test suite's reduction-result comparisons will catch
+  algorithm-level bugs; staging-validation against fixtures will
+  catch end-to-end correctness regressions.
+- **Heap log factor on large bases**: for very long reductions
+  with many active reducers, the O(log n) heap ops could
+  cumulatively cost more than the geobucket's O(slot_count)
+  leader scan. Singular's choice of geobucket-by-default was made
+  for this case. For helium-staging-shaped workloads (moderate
+  basis, short reductions), the trade-off goes the other way —
+  but worth confirming with a v6 profile.
+- **Cache locality of interleaved source poly access**: the heap
+  pops dereference different source polys in interleaved order.
+  Sequential within one source poly (cache-friendly) but
+  interleaved across many sources during the pop sequence
+  (cache-unfriendly). Possibly mitigated by L2's larger size
+  relative to the working set (a few thousand polys × ~24 bytes
+  per heap-active term = small).
+- **Significant code-volume change** (~500-1000 lines new in
+  `reducer.rs`, ~300 lines retired from `kbucket.rs`, ~50 lines
+  changed in `bba.rs`, similar in `lobject.rs`). Phased landing
+  with feature flag (Phase 5) lets the cargo test suite validate
+  each phase independently.
+
+**Migration plan** (the "implementation roadmap"; each phase is
+a separate commit):
+
+- **Phase 1** (this ADR's commit): scaffold `reducer.rs`, define
+  `Reducer` and `HeapNode` types, register the module. No
+  algorithm yet; cargo test still passes.
+- **Phase 2**: heap data structure (push, pop_max, peek). Unit
+  tests against a known-correct slow reference (sort all entries,
+  pick max repeatedly).
+- **Phase 3**: pop-with-cancellation (sum same-cmp_key chains,
+  return non-zero or recurse). Tests on hand-crafted small heaps.
+- **Phase 4**: lazy-add-divisor and survivor materialisation.
+  Tests against tiny reductions (manually verified).
+- **Phase 5**: plumb into `reduce_lobject` behind
+  `cfg!(feature = "heap_reducer")`. Both reducers compile; cargo
+  test runs both and asserts identical output on shared fixtures.
+- **Phase 6**: full staging-validation under heap-reducer flag.
+  Three-test fixture comparison is the correctness gate.
+- **Phase 7**: profile v6 under heap. If wall improves
+  meaningfully (≥ 15 % wall reduction), retire `kbucket.rs` (move
+  to `examples/legacy/`) and make heap the default.
+
+### References
+
+- `~/rustgb/src/bba.rs:220-286` (current `reduce_lobject` —
+  the integration target)
+- `~/rustgb/src/kbucket.rs` (the geobucket being superseded;
+  retired in Phase 7)
+- `~/Singular-rustgb/kernel/GBEngine/kstd2.cc` (Singular's bba
+  using geobucket — the historical default)
+- `~/Singular-rustgb/kernel/GBEngine/kstd1.cc` (Singular's
+  alternative `kStratHeap` strategies — heap-reducer evidence)
+- `~/flint/src/nmod_mpoly/divrem_monagan_pearce.c` (FLINT's
+  heap reducer; the closest reference implementation)
+- `~/mathicgb/src/mathicgb/ReducerHeap.cpp` (mathicgb's heap
+  reducer; the reference for the slab + small heap node pattern)
+- `~/mathicgb/src/mathicgb/Reducer.hpp` (mathicgb's runtime
+  reducer-selector enum)
+- `~/project/docs/profile-rustgb-v5-staging-5101449.md` (the
+  v5 profile evidence motivating this ADR)
+- ADR-002 (geobucket reducer — superseded by this ADR)
+- ADR-003 (heap reducer candidate — promoted to accepted by
+  this ADR)
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

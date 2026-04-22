@@ -38,6 +38,7 @@ pub mod ordering;
 pub mod pair;
 pub mod parallel;
 pub mod poly;
+pub mod reducer;
 pub mod ring;
 pub mod sbasis;
 
