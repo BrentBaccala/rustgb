@@ -285,6 +285,12 @@ impl KBucket {
     /// cancelling to zero (in which case the scan repeats on the
     /// remaining slots). The result is cached; repeated probes are
     /// O(1).
+    ///
+    /// Despite the `&mut self` receiver, this is logically a query:
+    /// it leaves the bucket algebraically equal to its old value. The
+    /// mutation is only redistributing the representation across slots
+    /// (peeling cancelled leaders, refreshing `dirty` / `lm_cache`).
+    /// To actually pop the leader, use [`extract_leading`](Self::extract_leading).
     pub fn leading(&mut self) -> Option<(Coeff, &Monomial)> {
         if self.dirty == 0
             && let Some((c, ref m, _)) = self.lm_cache

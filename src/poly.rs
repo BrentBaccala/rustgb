@@ -20,19 +20,54 @@ use crate::ring::Ring;
 ///
 /// See module documentation for invariants. `Send + Sync`: all fields
 /// are owned vectors of plain integer data.
-#[derive(Clone, Debug)]
+///
+/// The live terms are `coeffs[head..]` / `terms[head..]`. `head`
+/// advances when [`drop_leading_in_place`](Self::drop_leading_in_place)
+/// peels a leader — that's an O(1) cursor bump rather than the O(n)
+/// `Vec::remove(0)` that the previous representation required. The
+/// dead prefix is reclaimed when the `Poly` is cloned (see the
+/// custom `Clone` impl) or when it falls out of scope. All accessors
+/// (`coeffs()`, `terms()`, `iter()`, `leading()`, `len()`,
+/// `is_zero()`) operate on the live region.
+#[derive(Debug)]
 pub struct Poly {
     /// Coefficients in the same order as `terms`. All nonzero.
     coeffs: Vec<Coeff>,
     /// Monomials in strictly descending order.
     terms: Vec<Monomial>,
-    /// Cached leading-term sev (`terms[0].sev()`); 0 when empty.
+    /// Index of the live leading term. `coeffs[head..]` and
+    /// `terms[head..]` are the algebraically meaningful slice;
+    /// indices below `head` are abandoned but not yet freed.
+    /// Always `<= terms.len()`; equality means the polynomial is zero.
+    head: usize,
+    /// Cached leading-term sev (`terms[head].sev()`); 0 when empty.
     lm_sev: u64,
-    /// Cached leading coefficient (`coeffs[0]`); 0 when empty.
+    /// Cached leading coefficient (`coeffs[head]`); 0 when empty.
     lm_coeff: Coeff,
-    /// Cached leading monomial degree (`terms[0].total_deg()`); 0 when
-    /// empty.
+    /// Cached leading monomial degree (`terms[head].total_deg()`);
+    /// 0 when empty.
     lm_deg: u32,
+}
+
+impl Clone for Poly {
+    /// Clone only the live tail (`coeffs[head..]` / `terms[head..]`)
+    /// so the dead prefix is dropped at every clone site. This keeps
+    /// the bucket-slot reuse pattern (drop_leading repeatedly, then
+    /// absorb a new poly via `merge` which constructs fresh) from
+    /// accumulating dead memory across the chain of intermediate
+    /// clones a caller might make.
+    fn clone(&self) -> Self {
+        let coeffs = self.coeffs[self.head..].to_vec();
+        let terms = self.terms[self.head..].to_vec();
+        Self {
+            coeffs,
+            terms,
+            head: 0,
+            lm_sev: self.lm_sev,
+            lm_coeff: self.lm_coeff,
+            lm_deg: self.lm_deg,
+        }
+    }
 }
 
 impl Poly {
@@ -43,6 +78,7 @@ impl Poly {
         Self {
             coeffs: Vec::new(),
             terms: Vec::new(),
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -61,6 +97,7 @@ impl Poly {
         Self {
             coeffs: vec![c],
             terms: vec![m],
+            head: 0,
             lm_sev,
             lm_coeff: c,
             lm_deg,
@@ -110,6 +147,7 @@ impl Poly {
         let mut out = Self {
             coeffs,
             terms: mons,
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -150,6 +188,7 @@ impl Poly {
         let mut out = Self {
             coeffs,
             terms,
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -198,6 +237,7 @@ impl Poly {
         let mut p = Self {
             coeffs,
             terms: mons,
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -209,10 +249,10 @@ impl Poly {
     // ----- Cache maintenance -----
 
     fn refresh_cache(&mut self) {
-        if let Some(m) = self.terms.first() {
+        if let Some(m) = self.terms.get(self.head) {
             self.lm_sev = m.sev();
             self.lm_deg = m.total_deg();
-            self.lm_coeff = self.coeffs[0];
+            self.lm_coeff = self.coeffs[self.head];
         } else {
             self.lm_sev = 0;
             self.lm_coeff = 0;
@@ -222,11 +262,11 @@ impl Poly {
 
     // ----- Accessors -----
 
-    /// Number of nonzero terms.
+    /// Number of live (post-`head`) terms.
     #[allow(clippy::len_without_is_empty)] // `is_zero` is the domain-natural spelling; see below.
     #[inline]
     pub fn len(&self) -> usize {
-        self.terms.len()
+        self.terms.len() - self.head
     }
 
     /// Whether this is the zero polynomial.
@@ -236,12 +276,15 @@ impl Poly {
     /// spells the same thing in ring-theoretic terminology.
     #[inline]
     pub fn is_zero(&self) -> bool {
-        self.terms.is_empty()
+        self.head == self.terms.len()
     }
 
     /// Iterate over `(coeff, monomial)` pairs in descending order.
     pub fn iter(&self) -> impl Iterator<Item = (Coeff, &Monomial)> + '_ {
-        self.coeffs.iter().copied().zip(self.terms.iter())
+        self.coeffs[self.head..]
+            .iter()
+            .copied()
+            .zip(self.terms[self.head..].iter())
     }
 
     /// Leading term `(coeff, &monomial)`, or `None` if zero.
@@ -249,7 +292,7 @@ impl Poly {
         if self.is_zero() {
             None
         } else {
-            Some((self.coeffs[0], &self.terms[0]))
+            Some((self.coeffs[self.head], &self.terms[self.head]))
         }
     }
 
@@ -275,13 +318,13 @@ impl Poly {
     /// Borrow the coefficient slice (descending order).
     #[inline]
     pub fn coeffs(&self) -> &[Coeff] {
-        &self.coeffs
+        &self.coeffs[self.head..]
     }
 
     /// Borrow the monomial slice (descending order).
     #[inline]
     pub fn terms(&self) -> &[Monomial] {
-        &self.terms
+        &self.terms[self.head..]
     }
 
     /// Return a new polynomial with the leading term removed. If `self`
@@ -291,12 +334,13 @@ impl Poly {
     /// strictly descending and coefficients all nonzero), so this skips
     /// the sort+dedup pass that `from_terms` would do.
     pub fn drop_leading(&self) -> Poly {
-        if self.terms.len() <= 1 {
+        if self.len() <= 1 {
             return Self::zero();
         }
         let mut out = Self {
-            coeffs: self.coeffs[1..].to_vec(),
-            terms: self.terms[1..].to_vec(),
+            coeffs: self.coeffs[self.head + 1..].to_vec(),
+            terms: self.terms[self.head + 1..].to_vec(),
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -305,22 +349,25 @@ impl Poly {
         out
     }
 
-    /// In-place variant of [`drop_leading`](Self::drop_leading). Shifts
-    /// the tail down by one, keeping the same `Vec` allocation. Leaves
-    /// `self` as the zero polynomial if it was a single term. O(n) due
-    /// to the shift, but avoids the clone + allocation that
-    /// `drop_leading` does for the tail.
+    /// In-place variant of [`drop_leading`](Self::drop_leading).
     ///
-    /// Used by the geobucket's cancellation-peel path in
-    /// `KBucket::leading` / `extract_leading`, where the poly is taken
-    /// out of its slot, the leader removed, and the result put back in
-    /// the same slot (no caller holds a reference to the old value).
+    /// Bumps the internal `head` cursor by one — O(1). Does not free
+    /// the old leader's slot in the underlying `Vec`s; the dead prefix
+    /// is reclaimed when this `Poly` is cloned or dropped.
+    ///
+    /// Used by the geobucket's cancellation peel in
+    /// [`KBucket::leading`](crate::kbucket::KBucket::leading) and by
+    /// [`KBucket::extract_leading`](crate::kbucket::KBucket::extract_leading).
+    /// In a long bucket-slot lifetime (many drops without an
+    /// intervening absorb) the slot can hold a Poly whose live region
+    /// is much smaller than its allocation; the next `merge`/`absorb`
+    /// constructs a fresh Poly with `head == 0`, returning that memory
+    /// to bounded use.
     pub fn drop_leading_in_place(&mut self) {
-        if self.terms.is_empty() {
+        if self.is_zero() {
             return;
         }
-        self.coeffs.remove(0);
-        self.terms.remove(0);
+        self.head += 1;
         self.refresh_cache();
     }
 
@@ -365,10 +412,11 @@ impl Poly {
     /// Negation (flip every coefficient).
     pub fn neg(&self, ring: &Ring) -> Poly {
         let f = ring.field();
-        let coeffs: Vec<Coeff> = self.coeffs.iter().map(|&c| f.neg(c)).collect();
+        let coeffs: Vec<Coeff> = self.coeffs[self.head..].iter().map(|&c| f.neg(c)).collect();
         let mut out = Self {
             coeffs,
-            terms: self.terms.clone(),
+            terms: self.terms[self.head..].to_vec(),
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -384,10 +432,14 @@ impl Poly {
         if c == 0 || self.is_zero() {
             return Self::zero();
         }
-        let coeffs: Vec<Coeff> = self.coeffs.iter().map(|&ci| f.mul(ci, c)).collect();
+        let coeffs: Vec<Coeff> = self.coeffs[self.head..]
+            .iter()
+            .map(|&ci| f.mul(ci, c))
+            .collect();
         let mut out = Self {
             coeffs,
-            terms: self.terms.clone(),
+            terms: self.terms[self.head..].to_vec(),
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -403,14 +455,15 @@ impl Poly {
             return Some(Self::zero());
         }
         let mut terms = Vec::with_capacity(self.len());
-        for t in &self.terms {
+        for t in &self.terms[self.head..] {
             terms.push(t.mul(m, ring)?);
         }
         // Descending order is preserved: monomial multiplication by a
         // fixed m is monotone in degrevlex.
         let mut out = Self {
-            coeffs: self.coeffs.clone(),
+            coeffs: self.coeffs[self.head..].to_vec(),
             terms,
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -454,25 +507,30 @@ impl Poly {
         }
         let f = ring.field();
 
+        let s_c = self.coeffs();
+        let s_m = self.terms();
+        let q_c = q.coeffs();
+        let q_m = q.terms();
+
         // Walk `self` and `c * m * q` with a two-pointer merge.
-        let mut out_c: Vec<Coeff> = Vec::with_capacity(self.len() + q.len());
-        let mut out_m: Vec<Monomial> = Vec::with_capacity(self.len() + q.len());
+        let mut out_c: Vec<Coeff> = Vec::with_capacity(s_c.len() + q_c.len());
+        let mut out_m: Vec<Monomial> = Vec::with_capacity(s_m.len() + q_m.len());
 
-        let mut i = 0usize; // index into self
-        let mut j = 0usize; // index into q
+        let mut i = 0usize; // index into self.live
+        let mut j = 0usize; // index into q.live
 
-        while i < self.len() && j < q.len() {
-            // Next term from `c*m*q` is (c * q.coeffs[j], m * q.terms[j]).
-            let mq_term_mon = m.mul(&q.terms[j], ring)?;
-            match self.terms[i].cmp(&mq_term_mon, ring) {
+        while i < s_m.len() && j < q_m.len() {
+            // Next term from `c*m*q` is (c * q_c[j], m * q_m[j]).
+            let mq_term_mon = m.mul(&q_m[j], ring)?;
+            match s_m[i].cmp(&mq_term_mon, ring) {
                 std::cmp::Ordering::Greater => {
-                    out_c.push(self.coeffs[i]);
-                    out_m.push(self.terms[i].clone());
+                    out_c.push(s_c[i]);
+                    out_m.push(s_m[i].clone());
                     i += 1;
                 }
                 std::cmp::Ordering::Less => {
-                    // subtract: output is 0 - (c * q.coeffs[j]).
-                    let neg = f.neg(f.mul(c, q.coeffs[j]));
+                    // subtract: output is 0 - (c * q_c[j]).
+                    let neg = f.neg(f.mul(c, q_c[j]));
                     if neg != 0 {
                         out_c.push(neg);
                         out_m.push(mq_term_mon);
@@ -480,27 +538,27 @@ impl Poly {
                     j += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    let cmq = f.mul(c, q.coeffs[j]);
-                    let diff = f.sub(self.coeffs[i], cmq);
+                    let cmq = f.mul(c, q_c[j]);
+                    let diff = f.sub(s_c[i], cmq);
                     if diff != 0 {
                         out_c.push(diff);
-                        out_m.push(self.terms[i].clone());
+                        out_m.push(s_m[i].clone());
                     }
                     i += 1;
                     j += 1;
                 }
             }
         }
-        while i < self.len() {
-            out_c.push(self.coeffs[i]);
-            out_m.push(self.terms[i].clone());
+        while i < s_m.len() {
+            out_c.push(s_c[i]);
+            out_m.push(s_m[i].clone());
             i += 1;
         }
-        while j < q.len() {
-            let neg = f.neg(f.mul(c, q.coeffs[j]));
+        while j < q_m.len() {
+            let neg = f.neg(f.mul(c, q_c[j]));
             if neg != 0 {
                 out_c.push(neg);
-                out_m.push(m.mul(&q.terms[j], ring)?);
+                out_m.push(m.mul(&q_m[j], ring)?);
             }
             j += 1;
         }
@@ -508,6 +566,7 @@ impl Poly {
         let mut out = Self {
             coeffs: out_c,
             terms: out_m,
+            head: 0,
             lm_sev: 0,
             lm_coeff: 0,
             lm_deg: 0,
@@ -536,27 +595,35 @@ impl Poly {
     /// Panic if any internal invariant is violated.
     pub fn assert_canonical(&self, ring: &Ring) {
         assert_eq!(self.coeffs.len(), self.terms.len(), "length mismatch");
+        assert!(
+            self.head <= self.terms.len(),
+            "head {} out of range (terms.len = {})",
+            self.head,
+            self.terms.len()
+        );
         let p = ring.field().p();
-        for (k, (&c, m)) in self.coeffs.iter().zip(self.terms.iter()).enumerate() {
-            assert!(c > 0 && c < p, "coeff[{k}] = {c} not in 1..{p}");
+        let live_c = self.coeffs();
+        let live_m = self.terms();
+        for (k, (&c, m)) in live_c.iter().zip(live_m.iter()).enumerate() {
+            assert!(c > 0 && c < p, "live coeff[{k}] = {c} not in 1..{p}");
             m.assert_canonical(ring);
         }
-        for w in self.terms.windows(2) {
+        for w in live_m.windows(2) {
             let ord = w[0].cmp(&w[1], ring);
             assert!(
                 ord == std::cmp::Ordering::Greater,
-                "terms not strictly descending: got {ord:?}"
+                "live terms not strictly descending: got {ord:?}"
             );
         }
-        // Cached leading fields agree with the stored leading term.
+        // Cached leading fields agree with the live leading term.
         if self.is_zero() {
             assert_eq!(self.lm_sev, 0);
             assert_eq!(self.lm_coeff, 0);
             assert_eq!(self.lm_deg, 0);
         } else {
-            assert_eq!(self.lm_sev, self.terms[0].sev());
-            assert_eq!(self.lm_coeff, self.coeffs[0]);
-            assert_eq!(self.lm_deg, self.terms[0].total_deg());
+            assert_eq!(self.lm_sev, self.terms[self.head].sev());
+            assert_eq!(self.lm_coeff, self.coeffs[self.head]);
+            assert_eq!(self.lm_deg, self.terms[self.head].total_deg());
         }
     }
 }
@@ -569,7 +636,9 @@ impl Default for Poly {
 
 impl PartialEq for Poly {
     fn eq(&self, other: &Self) -> bool {
-        self.coeffs == other.coeffs && self.terms == other.terms
+        // Compare the live regions only — `head` may differ between
+        // two algebraically equal polys depending on their drop history.
+        self.coeffs() == other.coeffs() && self.terms() == other.terms()
     }
 }
 impl Eq for Poly {}
@@ -578,65 +647,58 @@ impl Eq for Poly {}
 /// second operand's coefficients are negated.
 fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
     let f = ring.field();
-    let mut out_c = Vec::with_capacity(a.len() + b.len());
-    let mut out_m = Vec::with_capacity(a.len() + b.len());
+    let a_c = a.coeffs();
+    let a_m = a.terms();
+    let b_c = b.coeffs();
+    let b_m = b.terms();
+    let mut out_c = Vec::with_capacity(a_c.len() + b_c.len());
+    let mut out_m = Vec::with_capacity(a_m.len() + b_m.len());
     let mut i = 0usize;
     let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        match a.terms[i].cmp(&b.terms[j], ring) {
+    while i < a_m.len() && j < b_m.len() {
+        match a_m[i].cmp(&b_m[j], ring) {
             std::cmp::Ordering::Greater => {
-                out_c.push(a.coeffs[i]);
-                out_m.push(a.terms[i].clone());
+                out_c.push(a_c[i]);
+                out_m.push(a_m[i].clone());
                 i += 1;
             }
             std::cmp::Ordering::Less => {
-                let c = if subtract {
-                    f.neg(b.coeffs[j])
-                } else {
-                    b.coeffs[j]
-                };
+                let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
                 if c != 0 {
                     out_c.push(c);
-                    out_m.push(b.terms[j].clone());
+                    out_m.push(b_m[j].clone());
                 }
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                let bc = if subtract {
-                    f.neg(b.coeffs[j])
-                } else {
-                    b.coeffs[j]
-                };
-                let s = f.add(a.coeffs[i], bc);
+                let bc = if subtract { f.neg(b_c[j]) } else { b_c[j] };
+                let s = f.add(a_c[i], bc);
                 if s != 0 {
                     out_c.push(s);
-                    out_m.push(a.terms[i].clone());
+                    out_m.push(a_m[i].clone());
                 }
                 i += 1;
                 j += 1;
             }
         }
     }
-    while i < a.len() {
-        out_c.push(a.coeffs[i]);
-        out_m.push(a.terms[i].clone());
+    while i < a_m.len() {
+        out_c.push(a_c[i]);
+        out_m.push(a_m[i].clone());
         i += 1;
     }
-    while j < b.len() {
-        let c = if subtract {
-            f.neg(b.coeffs[j])
-        } else {
-            b.coeffs[j]
-        };
+    while j < b_m.len() {
+        let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
         if c != 0 {
             out_c.push(c);
-            out_m.push(b.terms[j].clone());
+            out_m.push(b_m[j].clone());
         }
         j += 1;
     }
     let mut out = Poly {
         coeffs: out_c,
         terms: out_m,
+        head: 0,
         lm_sev: 0,
         lm_coeff: 0,
         lm_deg: 0,
@@ -798,6 +860,73 @@ mod tests {
         let single_tail = single.drop_leading();
         assert!(single_tail.is_zero());
         single_tail.assert_canonical(&r);
+    }
+
+    #[test]
+    fn drop_leading_in_place_walks_head_cursor() {
+        // Locks in the head-cursor mechanic: repeated in-place drops
+        // must produce the same logical poly as the same number of
+        // out-of-place drops, and arithmetic on the partly-dropped
+        // poly must agree with arithmetic on the equivalent fresh poly.
+        let r = mk_ring(3, 32003);
+        let original = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[3, 0, 0])),
+                (4, mono(&r, &[2, 1, 0])),
+                (3, mono(&r, &[1, 0, 1])),
+                (2, mono(&r, &[0, 0, 2])),
+                (1, mono(&r, &[0, 1, 0])),
+            ],
+        );
+
+        let mut peeled = original.clone();
+        peeled.drop_leading_in_place();
+        peeled.drop_leading_in_place();
+        peeled.assert_canonical(&r);
+        assert_eq!(peeled.len(), 3);
+
+        let fresh = original.drop_leading().drop_leading();
+        fresh.assert_canonical(&r);
+
+        // Logical equality across the head boundary.
+        assert_eq!(peeled, fresh);
+        assert_eq!(peeled.coeffs(), fresh.coeffs());
+        assert_eq!(peeled.terms(), fresh.terms());
+        assert_eq!(peeled.lm_coeff(), fresh.lm_coeff());
+        assert_eq!(peeled.lm_sev(), fresh.lm_sev());
+        assert_eq!(peeled.lm_deg(), fresh.lm_deg());
+
+        // Arithmetic across the head boundary: subtracting peeled
+        // from itself yields zero, and adding it to fresh doubles it.
+        let zero = peeled.sub(&peeled, &r);
+        zero.assert_canonical(&r);
+        assert!(zero.is_zero());
+
+        let doubled_via_peeled = peeled.add(&fresh, &r);
+        let doubled_via_fresh = fresh.add(&fresh, &r);
+        assert_eq!(doubled_via_peeled, doubled_via_fresh);
+
+        // Cloning a peeled poly must drop the dead prefix.
+        let cloned = peeled.clone();
+        cloned.assert_canonical(&r);
+        assert_eq!(cloned, peeled);
+        assert_eq!(cloned.coeffs().len(), cloned.len());
+
+        // Drop the rest one at a time; final state is zero with cache
+        // cleared.
+        let mut p = peeled;
+        for _ in 0..3 {
+            p.drop_leading_in_place();
+            p.assert_canonical(&r);
+        }
+        assert!(p.is_zero());
+        assert_eq!(p.lm_coeff(), 0);
+        assert_eq!(p.lm_sev(), 0);
+        assert_eq!(p.lm_deg(), 0);
+        // Extra drop on a zero poly is a no-op.
+        p.drop_leading_in_place();
+        assert!(p.is_zero());
     }
 
     #[test]
