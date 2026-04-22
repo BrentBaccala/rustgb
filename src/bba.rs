@@ -235,28 +235,9 @@ fn reduce_lobject(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
             .1
             .clone();
 
-        let sevs = s_basis.sevs();
-        let redund = s_basis.redundant_flags();
-        let mut divisor: Option<usize> = None;
-        for idx in 0..s_basis.len() {
-            if redund[idx] {
-                continue;
-            }
-            let s_sev = sevs[idx];
-            if (s_sev & !lm_sev) != 0 {
-                continue;
-            }
-            let s_lm = s_basis
-                .poly(idx)
-                .leading()
-                .expect("non-redundant basis element is nonzero")
-                .1;
-            if s_lm.divides(&lm, ring) {
-                divisor = Some(idx);
-                break;
-            }
-        }
-        let Some(idx) = divisor else { return };
+        let Some(idx) = find_divisor_idx(s_basis, lm_sev, &lm, ring) else {
+            return;
+        };
 
         // Perform the reduction step `lobj -= (lm_coeff / s_lc) * m * s`.
         // Every basis element was `monic()`-normalised at insert time,
@@ -283,6 +264,168 @@ fn reduce_lobject(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
         let new_sugar = lobj.sugar().max(s_sugar + m_deg);
         lobj.set_sugar(new_sugar);
     }
+}
+
+/// Find the index of a basis element whose leading monomial divides
+/// `lm`, skipping redundant entries. Returns the first match in
+/// insertion order, or `None`.
+///
+/// Internally dispatches to a SIMD-batched sev pre-filter when AVX2
+/// is enabled at compile time, and a scalar walk otherwise. The two
+/// paths produce identical results on identical inputs (verified by
+/// `find_divisor_idx_simd_matches_scalar` in the unit tests).
+///
+/// See `~/rustgb/docs/design-decisions.md` ADR-007 for the rationale.
+#[inline]
+fn find_divisor_idx(
+    s_basis: &SBasis,
+    lm_sev: u64,
+    lm: &crate::monomial::Monomial,
+    ring: &Ring,
+) -> Option<usize> {
+    let sevs = s_basis.sevs();
+    let redund = s_basis.redundant_flags();
+    let len = sevs.len();
+    let not_lm_sev = !lm_sev;
+
+    let mut idx = 0;
+    while idx < len {
+        // Find the next sev that passes the pre-filter
+        // (`(sevs[idx] & not_lm_sev) == 0`). Returns `len` if none.
+        idx = find_sev_match(sevs, not_lm_sev, idx);
+        if idx >= len {
+            return None;
+        }
+        // Sev passes; now check redundant flag and the actual divides.
+        // Mirror Singular's pattern (kSevScanAVX2 returns a candidate
+        // index, the caller does the redund + divides check).
+        if !redund[idx] {
+            let s_lm = s_basis
+                .poly(idx)
+                .leading()
+                .expect("non-redundant basis element is nonzero")
+                .1;
+            if s_lm.divides(lm, ring) {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Return the smallest index `i >= start` with
+/// `(sevs[i] & not_sev) == 0`, or `sevs.len()` if no such index exists.
+///
+/// AVX2 path: 16-entry-per-iteration unrolled main loop, mirroring
+/// Singular's `kSevScanAVX2`. Falls back to a scalar walk when AVX2
+/// is not enabled at compile time.
+#[cfg(target_feature = "avx2")]
+#[inline]
+fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize {
+    // SAFETY: caller passes a valid slice; we bounds-check every load
+    // against `len` before issuing it.
+    unsafe { find_sev_match_avx2(sevs, not_sev, start) }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline]
+fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize {
+    find_sev_match_scalar(sevs, not_sev, start)
+}
+
+/// Scalar implementation of [`find_sev_match`]. Used as the
+/// non-AVX2 build path and as the reference for unit tests of the
+/// AVX2 path.
+#[inline]
+fn find_sev_match_scalar(sevs: &[u64], not_sev: u64, start: usize) -> usize {
+    let len = sevs.len();
+    let mut idx = start;
+    while idx < len {
+        if (sevs[idx] & not_sev) == 0 {
+            return idx;
+        }
+        idx += 1;
+    }
+    len
+}
+
+/// AVX2 implementation of [`find_sev_match`]. Mirrors Singular's
+/// `kSevScanAVX2` (`~/Singular-next-opt/kernel/GBEngine/kstd2.cc:74`).
+///
+/// # Safety
+/// Requires AVX2 available at runtime. Guaranteed by the
+/// `cfg(target_feature = "avx2")` gate on the caller. All loads are
+/// bounds-checked against `sevs.len()` before being issued.
+#[cfg(target_feature = "avx2")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn find_sev_match_avx2(sevs: &[u64], not_sev: u64, start: usize) -> usize {
+    use std::arch::x86_64::*;
+    let len = sevs.len();
+    let mut j = start;
+    let ptr = sevs.as_ptr();
+
+    // SAFETY of all the unsafe blocks below: every load is bounded
+    // by the surrounding `while j + N < len` check before issuing,
+    // so the AVX2 256-bit loads stay inside the slice.
+    unsafe {
+        let vnot_sev = _mm256_set1_epi64x(not_sev as i64);
+        let vzero = _mm256_setzero_si256();
+
+        // Main loop: 16 entries per iteration. Singular's pattern:
+        // four 4-wide AND+CMPEQ operations, OR the masks together,
+        // and only branch out when *some* batch matched.
+        while j + 16 <= len {
+            let v1 = _mm256_loadu_si256(ptr.add(j) as *const __m256i);
+            let v2 = _mm256_loadu_si256(ptr.add(j + 4) as *const __m256i);
+            let v3 = _mm256_loadu_si256(ptr.add(j + 8) as *const __m256i);
+            let v4 = _mm256_loadu_si256(ptr.add(j + 12) as *const __m256i);
+            let a1 = _mm256_and_si256(v1, vnot_sev);
+            let a2 = _mm256_and_si256(v2, vnot_sev);
+            let a3 = _mm256_and_si256(v3, vnot_sev);
+            let a4 = _mm256_and_si256(v4, vnot_sev);
+            let c1 = _mm256_cmpeq_epi64(a1, vzero);
+            let c2 = _mm256_cmpeq_epi64(a2, vzero);
+            let c3 = _mm256_cmpeq_epi64(a3, vzero);
+            let c4 = _mm256_cmpeq_epi64(a4, vzero);
+            let m1 = _mm256_movemask_epi8(c1) as u32;
+            let m2 = _mm256_movemask_epi8(c2) as u32;
+            let m3 = _mm256_movemask_epi8(c3) as u32;
+            let m4 = _mm256_movemask_epi8(c4) as u32;
+            if (m1 | m2 | m3 | m4) != 0 {
+                // Find the first matching qword across the four batches.
+                // Each set qword has all 8 of its movemask bits set,
+                // so trailing_zeros / 8 is the qword index.
+                if m1 != 0 {
+                    return j + (m1.trailing_zeros() / 8) as usize;
+                }
+                if m2 != 0 {
+                    return j + 4 + (m2.trailing_zeros() / 8) as usize;
+                }
+                if m3 != 0 {
+                    return j + 8 + (m3.trailing_zeros() / 8) as usize;
+                }
+                return j + 12 + (m4.trailing_zeros() / 8) as usize;
+            }
+            j += 16;
+        }
+
+        // Tail: one 4-wide batch at a time.
+        while j + 4 <= len {
+            let v = _mm256_loadu_si256(ptr.add(j) as *const __m256i);
+            let a = _mm256_and_si256(v, vnot_sev);
+            let c = _mm256_cmpeq_epi64(a, vzero);
+            let m = _mm256_movemask_epi8(c) as u32;
+            if m != 0 {
+                return j + (m.trailing_zeros() / 8) as usize;
+            }
+            j += 4;
+        }
+    }
+
+    // Scalar tail (0..3 elements).
+    find_sev_match_scalar(sevs, not_sev, j)
 }
 
 /// Walk the basis and tail-reduce every non-redundant element against
@@ -465,6 +608,56 @@ mod tests {
         let r = mk_ring(3, 32003);
         let gb = compute_gb(Arc::clone(&r), vec![]);
         assert!(gb.is_empty());
+    }
+
+    /// Sanity check that `find_sev_match` (the dispatcher chosen at
+    /// compile time based on `target_feature = "avx2"`) produces the
+    /// same answer as `find_sev_match_scalar` for a range of inputs
+    /// that exercise the unrolled main loop, the 4-wide tail, and
+    /// the scalar tail. ADR-007.
+    #[test]
+    fn find_sev_match_simd_matches_scalar() {
+        // Generate a deterministic pseudo-random sev array large
+        // enough to span all three loop bodies in the AVX2 path
+        // (16-batch main, 4-batch tail, scalar tail). Use a basic LCG
+        // so the test has no external dependencies.
+        let len = 200; // 12 main batches (192 entries) + 1 four-batch + 4 scalar
+        let mut sevs: Vec<u64> = Vec::with_capacity(len);
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..len {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            sevs.push(state);
+        }
+
+        // Try several `not_sev` patterns that produce different match
+        // densities — all-zero (every entry matches), all-set (no
+        // entry matches unless its sev is zero), and a sparse mask.
+        for not_sev in [
+            0u64,
+            !0u64,
+            0x0000_0000_FFFF_FFFFu64,
+            0xAAAA_AAAA_5555_5555u64,
+            0x0000_0001_0000_0001u64,
+        ] {
+            // Try several start indices to exercise non-aligned entry
+            // points into the main loop and partial-batch tails.
+            for start in [0usize, 1, 7, 16, 17, 32, 96, 192, 196, 199] {
+                let scalar = find_sev_match_scalar(&sevs, not_sev, start);
+                let dispatch = find_sev_match(&sevs, not_sev, start);
+                assert_eq!(
+                    scalar, dispatch,
+                    "mismatch at not_sev = {not_sev:#x}, start = {start}: \
+                     scalar said {scalar}, dispatch said {dispatch}"
+                );
+            }
+        }
+
+        // Also explicitly check empty / single-element edge cases.
+        assert_eq!(find_sev_match(&[], 0u64, 0), 0);
+        assert_eq!(find_sev_match(&[5u64], 0u64, 0), 0);
+        assert_eq!(find_sev_match(&[5u64], !0u64, 0), 1);
+        assert_eq!(find_sev_match(&[0u64, 1u64], 1u64, 0), 0);
+        assert_eq!(find_sev_match(&[0u64, 1u64], 1u64, 1), 2);
     }
 
     #[test]

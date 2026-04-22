@@ -785,6 +785,232 @@ overhang, well within ordinary `Vec` slop. Not worth shrinking.
 
 ---
 
+## ADR-007: SIMD-batched sev pre-filter for the basis-sweep in `reduce_lobject`
+
+**Status:** Accepted and implemented. Landed alongside this ADR's
+commit in `~/rustgb`.
+**Date:** 2026-04-22
+
+### Context
+
+The v4 profile (`~/project/docs/profile-rustgb-v4-staging-5101449.md`)
+showed `bba::reduce_lobject` at 30.0 % of total cycles. A
+per-instruction `perf annotate` revealed that the single hottest
+instruction in the entire program is the sev pre-filter `jne`
+inside the divisor-search loop:
+
+```asm
+                       :  if (s_sev & !lm_sev) != 0 {
+0.68 :   2c18f:  test   %r15,(%rax,%r13,8)        ; sevs[idx] & !lm_sev
+18.70 :  2c193:  jne    2c160                      ; if hits, skip
+```
+
+That `jne` alone is 18.70 % of within-function cycles ≈ 5.6 % of
+total cycles. Including the rest of the per-iteration overhead
+(loop bound check, redundant-flag check, sevs bounds check, sevs
+load), the "skip-fast-path" of the basis sweep totals 41.78 %
+within-function ≈ **12.5 % of total program cycles**. The actual
+`Monomial::divides` call when the sev pre-filter passes adds
+another ~6.7 % of total.
+
+So roughly **19 % of the entire program's runtime is the
+basis-sweep inside `reduce_lobject`** — the loop at `bba.rs:241-258`
+that walks `s_basis` looking for a divisor of the current leader.
+The sweep itself is simple, but it fires on every reduction step
+across millions of reduction steps in a typical bba run, with the
+basis growing to ~3000 elements by the end of staging-5101449.
+
+The sev pre-filter is doing its algorithmic job (most candidates
+get rejected). The cost is per-iteration *fixed overhead* — load,
+test, branch — and three structural sources stall it:
+
+1. The sev load misses L1 frequently as the basis grows past a
+   few thousand u64s (cache thrashing during sweep).
+2. The data-dependent branch is hard to predict.
+3. Bounds checks Rust inserts for the indexed array accesses
+   (`sevs[idx]`, `redund[idx]`) cost one branch per iteration.
+
+This is the same pathology Singular's `next-opt` branch had on the
+same workload — and the same fix.
+
+### Singular's approach
+
+Singular's `next-opt` branch introduced `kSevScanAVX2`
+(`~/Singular-next-opt/kernel/GBEngine/kstd2.cc:74-121`):
+
+```c
+__attribute__((target("avx2")))
+static inline int kSevScanAVX2(const unsigned long* sevT,
+                               unsigned long not_sev,
+                               int j, int tl)
+{
+  const __m256i vnot_sev = _mm256_set1_epi64x((long long)not_sev);
+  const __m256i vzero    = _mm256_setzero_si256();
+  // Main loop: 16 entries (4 batches of 4) per iteration
+  while (j + 15 <= tl) {
+    __builtin_prefetch(sevT + j + 16, 0, 1);
+    __m256i vand1 = _mm256_and_si256(_mm256_loadu_si256(...), vnot_sev);
+    __m256i vand2 = _mm256_and_si256(_mm256_loadu_si256(...), vnot_sev);
+    __m256i vand3 = _mm256_and_si256(_mm256_loadu_si256(...), vnot_sev);
+    __m256i vand4 = _mm256_and_si256(_mm256_loadu_si256(...), vnot_sev);
+    __m256i vcmp1 = _mm256_cmpeq_epi64(vand1, vzero);
+    /* ... vcmp2, vcmp3, vcmp4 ... */
+    int combined = mask1 | mask2 | mask3 | mask4;
+    if (__builtin_expect(combined != 0, 0)) {
+      if (mask1) return j;
+      if (mask2) return j + 4;
+      if (mask3) return j + 8;
+      return j + 12;
+    }
+    j += 16;
+  }
+  /* tail loop: 4 entries at a time, then scalar */
+}
+```
+
+The pattern: load 4 sevs at a time via `_mm256_loadu_si256`,
+compute `sevs & not_sev` per element via `_mm256_and_si256`,
+compare against zero with `_mm256_cmpeq_epi64`, extract a 32-bit
+mask (8 bits per qword) via `_mm256_movemask_epi8`. The main
+loop is unrolled 4× to amortise the loop overhead and let the
+common all-miss case branch only once per 16 entries.
+
+There's also a SSE4.1 fallback (`kSevScanSSE4`,
+`kstd2.cc:127-`) for non-AVX2 CPUs and a scalar fallback
+(`kSevScan`). Runtime dispatch chooses the best available path
+once per `bba` invocation.
+
+The function returns the **first index** where the sev pre-filter
+passes (or `tl` past end if none found). The caller checks the
+redundant flag and runs the actual `divides` separately. This
+keeps the SIMD code pure-sev and easy to reason about.
+
+Singular's measured impact: kSevScanAVX2 took 7-11 % of total
+cycles in the v6 profile (it absorbed the time previously paid
+by `chainCritNormal` and the inner sweep), and the cumulative
+optimisation (sev_flat + AVX2 scan) was the largest single
+contributor to next-opt's ~36 % cumulative speedup.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** The closest analogue is FLINT's
+heap-based reducer's "process the next pending product" loop
+(`divrem_monagan_pearce.c`), but that walks a heap, not a basis,
+and the structure is fundamentally different. There is no
+"sweep T-set looking for a divisor" idiom in FLINT to compare
+against.
+
+### Decision
+
+Adopt the Singular pattern verbatim, gated by Rust's compile-time
+`target_feature = "avx2"`. Concretely:
+
+1. **Refactor the divisor search out of `reduce_lobject`** into a
+   helper `find_divisor_idx(s_basis, lm_sev, lm, ring)` so the
+   sweep code can be optimised independently and unit-tested in
+   isolation.
+2. **Inside the helper, dispatch on `cfg(target_feature = "avx2")`**:
+   - **AVX2 path:** mirror `kSevScanAVX2`. Process the basis in
+     batches; each batch loads 4 sevs, ANDs with `vnot_sev`, compares
+     against zero, extracts a movemask, and (if any bit set) finds
+     the first hit. For each hit, check `redundant[idx]` and call
+     `Monomial::divides` exactly as the scalar path does. Manually
+     unroll 4× as Singular does, for the same all-miss-fast-path
+     reason.
+   - **Scalar fallback:** the original loop, unchanged. Used when
+     building without AVX2 enabled (e.g., on older CPUs like
+     c200-1, which is Westmere-era).
+3. **No SSE4.1 fallback for this first cut.** Adding SSE4.1 is
+   straightforward (mirror Singular's `kSevScanSSE4`) but not
+   necessary for correctness. Defer until measurement on c200-1
+   shows it's worth the complexity.
+4. **Runtime feature detection deferred.** Compile-time gating is
+   simplest. Document in the rustgb README that release builds on
+   AVX2 hardware should use `RUSTFLAGS="-C target-cpu=native"` to
+   pick up the AVX2 path.
+
+Note that the redundant-flag check and the `Monomial::divides`
+probe stay scalar in the caller. Singular does the same — its
+SIMD function returns just an index, and the caller checks
+`redundant` and calls `divides`. Folding redund into the SIMD
+batch is possible (read 4 redund bytes alongside the 4 sevs, AND
+into the candidate mask) but adds complexity for marginal gain
+since `redund[idx]` is itself a single byte load, already cheap.
+
+### Consequences
+
+**Performance prediction:** Singular's measurement suggests this
+optimisation can cut the basis-sweep cost from ~12.5 % of total
+cycles (rustgb v4) to the ~7-11 % range that Singular's `kSevScanAVX2`
+occupies (which is a smaller share because Singular's reducer
+also has other costs we don't have). Conservatively, **~5-8 %
+wall reduction** on staging workloads. For a v5 profile,
+`reduce_lobject`'s self-time should drop from 30 % to ~22-25 %,
+with the freed share spreading proportionally.
+
+**Measured (post-implementation, 2026-04-22, samsung):**
+- Correctness: all three staging tests pass with exact fixture
+  matches under both AVX2-enabled and scalar builds.
+- SIMD activation verified: `objdump` shows 20 AVX2 instructions
+  (vpand, vpcmpeq, vpmovmskb, vpbroadcastq, vmovdqu) inlined into
+  `reduce_lobject` in the AVX2 build.
+- Wall numbers under perf load are noisy on samsung due to
+  background contention from concurrent processes; staging-5101449
+  un-profiled walls ranged 123-226 s across runs of the same code,
+  making per-ADR attribution unreliable. A clean v5 perf profile
+  comparison (under controlled load) would settle the cycle-count
+  attribution; deferred as the obvious next step.
+
+**Build configuration:** the AVX2 path is compile-time gated. A
+default `cargo build --release` on a non-AVX2-enabled rustc
+configuration will use the scalar path. To opt in:
+```
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+This should be added to the README / build instructions. CI builds
+on x86_64 hosts with AVX2 (the dev laptop and edge / c200-1's
+successor systems) will pick it up automatically.
+
+**Portability:** the scalar path is identical in behaviour. Both
+paths are unit-tested against each other (a property test that
+runs the same input through both and checks identical results).
+Cross-compilation to non-x86 (e.g., ARM) falls through to the
+scalar path with no special handling.
+
+**Safety:** the AVX2 intrinsics live in `unsafe` blocks. The
+unsafety is local: each intrinsic call wraps a `_mm256_loadu_si256`
+on a slice we have already bounds-checked at the top of the
+batch. The function's external API is safe.
+
+**Why not SIMD `Monomial::divides`?** It's the next thing in line
+(6.7 % of total) but lower priority for two reasons:
+1. The sev-sweep work is the larger absolute cost.
+2. SIMD-divides would need to handle two monomials' packed words
+   simultaneously, which is more complex than the single-stream
+   sev scan.
+
+Listed as a possible follow-up; not adopted now.
+
+### References
+
+- `~/rustgb/src/bba.rs:220-286` (current `reduce_lobject` — the
+  divisor search at lines 241-258 is the surface being changed)
+- `~/rustgb/src/sbasis.rs:33-47` (the `SBasis` struct showing
+  `sevs: Vec<u64>` is already a contiguous flat array, ready
+  for SIMD without layout changes)
+- `~/Singular-next-opt/kernel/GBEngine/kstd2.cc:74-121`
+  (`kSevScanAVX2` — the model adopted here)
+- `~/Singular-next-opt/kernel/GBEngine/kstd2.cc:127-` 
+  (`kSevScanSSE4` — the SSE4.1 fallback we are deferring)
+- `~/project/docs/profile-rustgb-v4-staging-5101449.md` (the
+  v4 profile showing `reduce_lobject` at 30 % and identifying
+  the sweep as the largest concentrated target)
+- This conversation's `perf annotate` of `reduce_lobject` showing
+  the per-instruction breakdown (the 18.70 % `jne` at offset
+  0x2c193 was the smoking gun)
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
