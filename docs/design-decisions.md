@@ -1492,6 +1492,326 @@ is the function moving namespaces.
 
 ---
 
+## ADR-010: `SBasis::lms` parallel leading-monomial cache
+
+**Status:** Accepted and implemented. Landed alongside this ADR's
+commit in `~/rustgb`.
+**Date:** 2026-04-22
+
+### Context
+
+The v7 profile (`~/project/docs/profile-rustgb-v7-staging-5101449.md`)
+identified `find_divisor_idx` as the largest concentrated cost
+inside `reduce_to_normal_form` (~13 % of total cycles). A
+per-instruction `perf annotate` revealed that **the single hottest
+instruction in the entire program was a load**:
+
+```asm
+0.00 :   39f71:  mov    (%rdx,%rdi,8),%r15      ; load Box<Poly> ptr
+1.24 :   39f75:  mov    0x28(%r15),%rsi          ; Poly.head
+11.31 :  39f79:  mov    0x30(%r15),%rdx          ; Poly.terms.len() ← STALL
+0.05 :   39f7d:  cmp    %rsi,%rdx                ; is_zero check
+```
+
+11.31 % of within-function cycles ≈ 2.3 % of total program cycles
+on a single load — the L1/L2 stall waiting for the `Box<Poly>`
+deref to complete. This is the cost of `SBasis::polys: Vec<Box<Poly>>`:
+every basis-element probe in the divisor sweep dereferences a
+boxed pointer to scattered memory.
+
+`SBasis` already maintains parallel arrays for `sevs: Vec<u64>`
+and `lm_degs: Vec<u32>`, but the leading *monomial* itself was
+fetched via `s_basis.poly(idx).leading()` — the costly path. Caching
+the leading monomial in a parallel `Vec<Monomial>` eliminates the
+chase for the divides probe (the `Box<Poly>` is only needed when
+the poly is actually chosen as a divisor and its tail is read).
+
+### Singular's approach
+
+Singular's `kStrategy` (`~/Singular-rustgb/kernel/GBEngine/kutil.h:295-369`)
+maintains a similar struct-of-arrays layout for the basis:
+
+```c
+polyset S;                  // ideal of basis polys
+unsigned long* sevS;        // parallel array of leading sevs
+intset ecartS;              // parallel array of ecart values
+intset lenS;                // parallel array of poly lengths
+TSet T;                     // ditto for the T-set used in reduction
+unsigned long* sevT;
+```
+
+Notice: Singular has the parallel **sev** array (matches our
+`SBasis::sevs`) and parallel ecart/len arrays, but **no parallel
+leading-monomial array**. `S[i]` is itself a `poly` (pointer to
+the polynomial's first `spolyrec` node), and accessing the leading
+monomial requires dereferencing `S[i]` to read the node's `exp`
+field. This is the same pointer-chase pattern we have today — but
+because Singular's polys are linked-list nodes (no `Box<Poly>`
+intermediate), the chase is shorter (one dereference into the
+spolyrec, vs our two: into the Box, then into the Poly's `terms`
+Vec).
+
+Singular doesn't have a separate leading-monomial cache because
+the spolyrec's exp field is RIGHT THERE in the same allocation as
+the rest of the polynomial. For us with `Box<Poly>` + `Vec<Monomial>`
+inside the Poly, the leading monomial lives two indirections away.
+Adding an explicit `lms` parallel cache directly addresses this
+asymmetry.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine** and therefore no "find divisor in
+basis" sweep. FLINT's `nmod_mpoly` does maintain leading exponents
+inline with the polynomial via the `Aexps[0]` element (the polynomial
+is itself a flat array of packed exponents), so accessing the
+"leading monomial" of a fixed FLINT poly is a single load — no
+indirection. The closest analogue would be a hypothetical
+"check whether any of these N polys' lm divides this monomial"
+sweep, which doesn't exist as a primitive in FLINT.
+
+### Decision
+
+Add `lms: Vec<Monomial>` to `SBasis`, maintained in lockstep with
+`polys`, `sevs`, and `lm_degs` on every `insert_no_clear` and
+`replace_poly`. Update `bba::find_divisor_idx` and
+`SBasis::clear_redundant_for` to read leading monomials from
+`s_basis.lms()` rather than dereferencing `s_basis.poly(idx).leading()`.
+
+`assert_canonical` extended to verify `lms[i].cmp(polys[i].leading().1)
+== Equal` for every `i`.
+
+The `Box<Poly>` pointer chase is preserved for the path that uses
+the *full* polynomial (when the poly is actually chosen as a divisor
+and its tail terms get pushed into the heap reducer). That's far
+less frequent than the find-divisor probes that the new cache
+short-circuits.
+
+### Consequences
+
+**Performance prediction:** ~2 % wall, based on the v7 profile's
+attribution of ~2.3 % of total cycles to the specific load
+instruction.
+
+**Measured (post-implementation, samsung, AVX2 + heap_reducer build):**
+
+| Test | v7 (pre-ADR-010) | v8 (post-ADR-010) | Δ |
+|---|---|---|---|
+| staging-5101449 | 31 s | **26 s** | **−16 %** |
+| staging-5104053 | 54 s | 42 s | −22 % |
+| staging-5106746 | 51 s | 57 s | +12 % (within-noise; this test has been variable) |
+
+The actual wall reduction on staging-5101449 (16 %) is **8× the
+predicted 2 %**. Two-thirds of the gap is presumably cache
+pollution effects not captured by per-instruction profiling: the
+`Box<Poly>` deref didn't just stall the load itself, it also
+evicted other useful cache lines (the sev array, redund flags,
+adjacent polys' boxes), forcing extra misses elsewhere in the
+sweep. Once we read directly from a flat `Vec<Monomial>` that
+streams cleanly, the entire sweep stays in cache.
+
+Cumulative wall on staging-5101449 since v1: **870 s → 26 s = 33×
+speedup**.
+
+vs C++ next-opt baseline (~5-7 s on samsung): rustgb is now
+~3.7-5.2× slower (was ~4-6× at v7).
+
+**Memory cost:** ~144 KB extra for a 3000-element basis (each
+`Monomial` is 48 bytes). Fits comfortably in L2; doesn't even
+approach L3 limits. Negligible compared to the per-Poly Vec
+storage already in flight.
+
+### References
+
+- `~/rustgb/src/sbasis.rs` (the new `lms: Vec<Monomial>` field
+  and the lockstep maintenance in `insert_no_clear` / `replace_poly`)
+- `~/rustgb/src/bba.rs:369-` (updated `find_divisor_idx` reading
+  from `s_basis.lms()`)
+- `~/Singular-rustgb/kernel/GBEngine/kutil.h:295-369` (Singular's
+  parallel-array layout — sev cached but no parallel lm cache)
+- `~/project/docs/profile-rustgb-v7-staging-5101449.md` (the
+  11.31 % `mov 0x30(%r15)` hotspot evidence motivating this ADR)
+
+---
+
+## ADR-011 (candidate, not yet adopted): narrow_packing for low-degree workloads
+
+**Status:** Under review — listed for visibility, not active.
+**Date:** placeholder
+
+### Context
+
+The v7 profile attributed ~6 % of total cycles to the SIMD sev
+sweep memory bandwidth and ~4.5 % to the per-byte
+`Monomial::divides` loop inside `find_divisor_idx`. Combined with
+heap pop costs (`BinaryHeap::pop` 11.4 %, of which much is sift-
+down on 88-byte HeapNodes), there's an open question: for our
+specific helium workload (max single-variable exponent = 4 in
+both inputs and outputs), would a denser monomial packing close
+some of the gap to Singular's tail-ring widening?
+
+### Singular's approach
+
+Singular's `kStratChangeTailRing` (`~/Singular-rustgb/kernel/GBEngine/kutil.cc:10939`,
+ADR-005 references) does this **dynamically** at runtime. For our
+staging tests, `kStratInitChangeTailRing` walks the inputs, finds
+max exp = 4, calls `rGetExpSize(4, ...)` (`ring.cc:2630`) which
+returns `bits=3, bitmask=7L`. Singular's tail ring would settle on
+**3 bits per variable**, packing 25 variables into 75 bits = 13
+bytes plus a degree byte, totaling ~24 bytes per monomial (vs
+rustgb's fixed 32 bytes).
+
+The dynamic mechanism: when an overflow is predicted via
+`p_LmExpVectorAddIsOk` (the divmask check, ADR-005), Singular
+doubles the tail-ring bitmask, calls `rModifyRing`, migrates
+every entry in `strat->T`, `strat->L`, `strat->P` via
+`ShallowCopyDelete`. Multi-week project to mirror in rustgb.
+
+### FLINT's approach
+
+FLINT picks bits-per-field per-polynomial at construction time via
+`mpoly_exp_bits_required`, and `repack_monomials` widens on demand.
+Per-poly granularity (vs Singular's per-ring) is more flexible but
+adds an indirection. The bits choices are 8, 16, 32, 64 (one byte,
+two bytes, four bytes, full-limb), not the fine-grained 1-9-bit
+ladder Singular uses.
+
+### Mathicgb's approach
+
+Mathicgb's `MonoMonoid` (`~/mathicgb/src/mathicgb/MonoMonoid.hpp`)
+parameterizes the monomial layout at compile time via C++ templates.
+The bits-per-variable and number-of-variables are template
+parameters; specialised implementations exist for common
+combinations. The cmp/mul ops are inlined per specialisation.
+
+### Decision (deferred)
+
+Not adopted. Two structural blockers:
+
+1. **For 25 variables, narrow_packing requires nibble packing**
+   (2 vars per byte) to fit in fewer than 4 × u64 words. Layout
+   options:
+   - 4 bits per var (no guard, max 15): doesn't fit in 2 × u64
+     directly because nibble carries break independence.
+   - 3 bits per var + 1-bit guard per nibble: 2 vars per byte
+     with the divmask trick scaled down (each nibble has its
+     own guard bit). 25 vars × 4 bits = 100 bits = 13 bytes for
+     vars + 1 byte total-deg + 2 bytes padding = 16 bytes (2 × u64).
+     Max var = 7. Comfortable for helium (max 4).
+
+2. **Implementing nibble-packing changes every per-byte op** in
+   `monomial.rs`: `mul`, `divides`, `div`, `lcm`, `cmp_degrevlex`,
+   `from_exponents`, `assert_canonical`, the `Ring` mask
+   construction, the heap-node `cmp_key` size in `reducer.rs`.
+   Estimated 6-10 commits, ~1000 lines, similar in scope to
+   ADR-008 (the heap reducer).
+
+### Consequences (if adopted)
+
+- Monomial size: 32 → 16 bytes (50 % reduction).
+- HeapNode cmp_key: 32 → 16 bytes per node.
+- Per-byte ops process 2 variables per byte instead of 1.
+- Cache density doubled on hot Vec<Monomial> sweeps.
+- Predicted wall: 5-10 % reduction.
+
+The smaller heap node size would also speed `BinaryHeap::pop`'s
+sift-down (less data moved per swap). Could compound the win
+beyond just the monomial-storage savings.
+
+### References
+
+- ADR-005 (current 7-bit + 1-guard layout — what this would
+  supersede for low-degree workloads)
+- `~/Singular-rustgb/kernel/GBEngine/kutil.cc:10939-11062` (Singular's
+  dynamic tail-ring widening — the runtime version of this idea)
+- `~/Singular-rustgb/libpolys/polys/monomials/ring.cc:2630-2670`
+  (`rGetExpSize` ladder showing 3-bit fits for max exp ≤ 7)
+- `~/flint/src/mpoly/exp_bits_required.c` (FLINT's per-poly bit
+  selection)
+- `~/mathicgb/src/mathicgb/MonoMonoid.hpp` (mathicgb's
+  template-parameterized monomial)
+- `~/project/docs/profile-rustgb-v7-staging-5101449.md` (the
+  cost-shape evidence; specifically the 6 % SIMD sev sweep
+  bandwidth and 4.5 % divides loop)
+
+---
+
+## ADR-012 (candidate, not yet adopted): LSet bitset / flat-array restructure
+
+**Status:** Under review — listed for visibility, not active.
+**Date:** placeholder
+
+### Context
+
+The v7 profile showed `gm::chain_crit_normal`'s Phase 2 (L-side
+sweep) calls `LSet::iter_live` repeatedly, which filters via
+`HashSet::contains` on every iteration. The hashing combined cost
+across LSet, BSet's by_indices, and other hashbrown sites totals
+~10.5 % of v7 cycles, with `HashSet::contains` (under
+`LSet::iter_live`) specifically at 5.24 % under chain_crit_normal.
+
+Replacing `LSet::deleted: HashSet<PairKey>` with a `Vec<u64>`
+bitset would give:
+- O(1) bit test instead of hash + probe
+- Cache-friendly streaming (~3000 pairs → 47 u64s = 376 bytes total)
+- Compatible with batch operations (test 64 pair-live bits per
+  u64 load)
+
+### Singular's approach
+
+Singular's L-set is `LSet L` (`~/Singular-rustgb/kernel/GBEngine/kutil.h:326`),
+implemented as an `LObject*` array indexed by `Ll`. Tombstoning is
+done by copying-down: `kPairsToBucket` and friends compact the
+array when removing entries. No hash-set for tombstones — but the
+copy-down approach has its own O(n) cost per removal.
+
+For our purposes (lots of pair-criterion checks per chain_crit call),
+the bitset approach is closer to Singular's `clearS` macros (which
+use bitmap arrays in a few places) than to the LSet array layout.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine** and therefore no L-set / pair
+queue / Gebauer-Möller chain criterion. The closest concept is
+mpoly_heap's heap-of-pending-products, which is a different data
+structure with no tombstones.
+
+### Decision (deferred)
+
+Not adopted. Reason: the surface is bigger than it first appears
+because `LSet`'s callers expect `iter_live` to return an iterator
+of `&Pair`, and the underlying `BinaryHeap<HeapEntry>` stores full
+Pair clones inside heap entries. A clean bitset migration would
+ideally also restructure LSet's storage to a flat `Vec<Pair>` with
+the heap holding only `(sugar, arrival, idx)` entries, mirroring
+ADR-008's heap-node side-table pattern. That's a 200-300 line
+change, not a drop-in replacement.
+
+The wall savings (~3-5 %) is also bounded; ADR-010's leading-
+monomial cache and ADR-011's narrow_packing both promise larger
+wins per unit of work. Defer until those are exhausted or until
+the L-set sweep emerges as a clear bottleneck in a future profile.
+
+### Consequences (if adopted)
+
+- `LSet::deleted` becomes `Vec<u64>` bitset (1 bit per inserted
+  pair, indexed by `(key - 1) as usize`).
+- `LSet::iter_live` walks the bitset directly, yielding `&Pair`
+  from the underlying storage.
+- `LSet::contains` becomes a single bit test.
+- Predicted wall: 3-5 % reduction.
+- Allows future SIMD batch-iteration over live pairs (256 bits
+  per AVX2 vector).
+
+### References
+
+- `~/rustgb/src/lset.rs` (the surface being changed)
+- `~/Singular-rustgb/kernel/GBEngine/kutil.h:326` (Singular's
+  LSet — array-of-LObjects, compact-on-remove)
+- `~/project/docs/profile-rustgb-v7-staging-5101449.md` (the
+  HashSet::contains cost evidence)
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

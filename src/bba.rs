@@ -373,6 +373,7 @@ fn find_divisor_idx(
     ring: &Ring,
 ) -> Option<usize> {
     let sevs = s_basis.sevs();
+    let lms = s_basis.lms();
     let redund = s_basis.redundant_flags();
     let len = sevs.len();
     let not_lm_sev = !lm_sev;
@@ -386,17 +387,14 @@ fn find_divisor_idx(
             return None;
         }
         // Sev passes; now check redundant flag and the actual divides.
-        // Mirror Singular's pattern (kSevScanAVX2 returns a candidate
-        // index, the caller does the redund + divides check).
-        if !redund[idx] {
-            let s_lm = s_basis
-                .poly(idx)
-                .leading()
-                .expect("non-redundant basis element is nonzero")
-                .1;
-            if s_lm.divides(lm, ring) {
-                return Some(idx);
-            }
+        // ADR-010: read the leading monomial from the lms cache
+        // (flat Vec<Monomial>, contiguous) instead of dereferencing
+        // s_basis.poly(idx) (a Box<Poly> with separately-allocated
+        // memory). Eliminates the L1/L2 miss that the v7 perf annotate
+        // showed at 11 % of within-function cycles in
+        // reduce_to_normal_form.
+        if !redund[idx] && lms[idx].divides(lm, ring) {
+            return Some(idx);
         }
         idx += 1;
     }

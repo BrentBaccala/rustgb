@@ -21,9 +21,10 @@ use crate::ring::Ring;
 
 /// The running basis of a Groebner-basis computation.
 ///
-/// Polynomials are owned; leading metadata (`sevs`, `lm_degs`) is
-/// cached in parallel arrays for the sweep's fast path.
-/// `Send + Sync` by construction (only plain arrays of owned data).
+/// Polynomials are owned; leading metadata (`sevs`, `lms`,
+/// `lm_degs`) is cached in parallel arrays for the sweep's fast
+/// path. `Send + Sync` by construction (only plain arrays of
+/// owned data).
 #[derive(Debug, Default)]
 pub struct SBasis {
     /// The polynomials, in insertion order. `Box` so `&Poly` remains
@@ -36,6 +37,15 @@ pub struct SBasis {
     /// Leading short-exponent vectors. `sevs[i] == polys[i].lm_sev()`
     /// when `polys[i]` is nonzero, else 0.
     sevs: Vec<u64>,
+    /// Leading monomial cache, kept in lockstep with `polys`.
+    /// `lms[i] == polys[i].leading().unwrap().1.clone()`. Used by
+    /// the divisor sweep in `bba::find_divisor_idx` (ADR-010) to
+    /// avoid the `Vec<Box<Poly>>` pointer chase per probed
+    /// candidate. Each `Monomial` is 48 bytes, so for ~3000-element
+    /// staging bases the cache totals ~144 KB — fits in L2,
+    /// streams cleanly during the sweep. See ADR-010 in
+    /// `~/rustgb/docs/design-decisions.md`.
+    lms: Vec<Monomial>,
     /// Leading total degrees. `lm_degs[i] == polys[i].lm_deg()`.
     lm_degs: Vec<u32>,
     /// Redundancy flags. `redundant[i] == true` means `polys[i]`'s
@@ -56,6 +66,7 @@ impl SBasis {
         Self {
             polys: Vec::new(),
             sevs: Vec::new(),
+            lms: Vec::new(),
             lm_degs: Vec::new(),
             redundant: Vec::new(),
             arrival: Vec::new(),
@@ -91,6 +102,13 @@ impl SBasis {
     #[inline]
     pub fn sevs(&self) -> &[u64] {
         &self.sevs
+    }
+
+    /// Slice of cached leading monomials. Length equals [`len`](Self::len).
+    /// `lms()[i] == polys[i].leading().unwrap().1.clone()`. ADR-010.
+    #[inline]
+    pub fn lms(&self) -> &[Monomial] {
+        &self.lms
     }
 
     /// Slice of cached leading-term total degrees.
@@ -150,12 +168,16 @@ impl SBasis {
         }
         let lm_sev = h.lm_sev();
         let lm_deg = h.lm_deg();
+        // Capture the leading monomial before the poly moves into
+        // the Box. `unwrap` is safe: we just checked is_zero above.
+        let lm = h.leading().expect("non-zero").1.clone();
         let idx = self.polys.len();
         let arrival = self.next_arrival;
         self.next_arrival += 1;
 
         self.polys.push(Box::new(h));
         self.sevs.push(lm_sev);
+        self.lms.push(lm);
         self.lm_degs.push(lm_deg);
         self.redundant.push(false);
         self.arrival.push(arrival);
@@ -171,11 +193,10 @@ impl SBasis {
     pub fn clear_redundant_for(&mut self, ring: &Ring, idx: usize) {
         debug_assert!(idx < self.polys.len());
         let lm_sev = self.sevs[idx];
-        let h_lm = self.polys[idx]
-            .leading()
-            .expect("non-zero basis element")
-            .1
-            .clone();
+        // ADR-010: read leader from the lms cache rather than
+        // dereferencing polys[idx].leading() — the lms cache lives
+        // contiguous with sevs, no Box pointer chase.
+        let h_lm = self.lms[idx].clone();
         for i in 0..idx {
             if self.redundant[i] {
                 continue;
@@ -183,10 +204,7 @@ impl SBasis {
             if (lm_sev & !self.sevs[i]) != 0 {
                 continue;
             }
-            let s_i_lm = self.polys[i]
-                .leading()
-                .expect("non-redundant basis element is nonzero")
-                .1;
+            let s_i_lm = &self.lms[i];
             if h_lm.divides(s_i_lm, ring) {
                 self.redundant[i] = true;
             }
@@ -239,6 +257,11 @@ impl SBasis {
         let _ = ring; // suppress unused warning in release
         self.sevs[idx] = new_poly.lm_sev();
         self.lm_degs[idx] = new_poly.lm_deg();
+        // ADR-010: refresh lms cache. Per the precondition above
+        // the new leading monomial equals the old one, so this is
+        // a no-op semantically; we update anyway in case a future
+        // caller relaxes the invariant.
+        self.lms[idx] = new_poly.leading().expect("non-zero").1.clone();
         *self.polys[idx] = new_poly;
     }
 
@@ -267,6 +290,7 @@ impl SBasis {
     pub fn assert_canonical(&self, ring: &Ring) {
         let n = self.polys.len();
         assert_eq!(self.sevs.len(), n);
+        assert_eq!(self.lms.len(), n, "lms cache length mismatch (ADR-010)");
         assert_eq!(self.lm_degs.len(), n);
         assert_eq!(self.redundant.len(), n);
         assert_eq!(self.arrival.len(), n);
@@ -275,6 +299,13 @@ impl SBasis {
             assert!(!p.is_zero(), "SBasis holds zero at index {i}");
             assert_eq!(self.sevs[i], p.lm_sev(), "sevs mismatch at {i}");
             assert_eq!(self.lm_degs[i], p.lm_deg(), "lm_degs mismatch at {i}");
+            // ADR-010: lms cache must agree with the poly's
+            // own leading monomial.
+            let actual_lm = p.leading().expect("non-zero").1;
+            assert!(
+                self.lms[i].cmp(actual_lm, ring).is_eq(),
+                "lms cache mismatch at {i}"
+            );
             if i > 0 {
                 assert!(
                     self.arrival[i] > self.arrival[i - 1],
