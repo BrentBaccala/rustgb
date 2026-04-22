@@ -217,7 +217,35 @@ fn insert_and_generate_pairs_with_sugar(
 /// Sugar is tracked: after reducing by `s_basis[idx]` with multiplier
 /// `m`, the LObject's sugar becomes
 /// `max(old_sugar, lm_deg(s_basis[idx]) + deg(m))`.
+/// Reduce `lobj` to normal form against `s_basis`.
+///
+/// Dispatches to one of two reducer implementations based on the
+/// `heap_reducer` cargo feature:
+/// * default (geobucket): [`reduce_lobject_geobucket`] — the
+///   ADR-002 reducer architecture, in production use through
+///   v5 of the optimisation series.
+/// * `--features heap_reducer`: [`reduce_lobject_heap`] — the
+///   ADR-008 heap-based Monagan-Pearce reducer.
+///
+/// Both implementations are always compiled (feature-gated only
+/// at the dispatch site, not at the function definition). The
+/// cargo test suite cross-validates them via the
+/// `geobucket_and_heap_reducer_agree` test below.
 fn reduce_lobject(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
+    #[cfg(not(feature = "heap_reducer"))]
+    reduce_lobject_geobucket(lobj, s_basis, ring);
+    #[cfg(feature = "heap_reducer")]
+    reduce_lobject_heap(lobj, s_basis, ring);
+}
+
+/// Geobucket-based reducer (ADR-002). Performs the reduction
+/// in place using the LObject's internal `KBucket`. Each
+/// reduction step calls `bucket.minus_m_mult_p` to subtract
+/// `c * m * s` and `bucket.refresh()` to recompute the leader.
+///
+/// This is the default reducer (compiled into `reduce_lobject`
+/// when `--features heap_reducer` is *not* set).
+pub fn reduce_lobject_geobucket(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
     loop {
         if lobj.is_zero() {
             return;
@@ -264,6 +292,67 @@ fn reduce_lobject(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
         let new_sugar = lobj.sugar().max(s_sugar + m_deg);
         lobj.set_sugar(new_sugar);
     }
+}
+
+/// Heap-based Monagan-Pearce reducer (ADR-008). Extracts the
+/// LObject's current poly via `into_poly`, drives the reduction
+/// through a [`crate::reducer::ReducerHeap`], and rebuilds the
+/// LObject from the surviving result.
+///
+/// Compiled into `reduce_lobject` when `--features heap_reducer`
+/// is set. Always compiled into the crate for the
+/// `geobucket_and_heap_reducer_agree` cross-validation test.
+///
+/// The geobucket-extraction step costs one extra `Poly`
+/// construction per reduction. If the v6 profile shows that as
+/// significant, the deferred LObject restructure (see ADR-008)
+/// would eliminate it.
+pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring>) {
+    use crate::reducer::{Reducer, ReducerHeap};
+
+    if lobj.is_zero() {
+        return;
+    }
+
+    // Extract the LObject's current state. We mem::replace with
+    // a placeholder so we can take ownership of the bucket; the
+    // placeholder is dropped almost immediately when we replace
+    // again at the end.
+    let initial_sugar = lobj.sugar();
+    let placeholder = LObject::from_poly_with_sugar(Arc::clone(ring), Poly::zero(), 0);
+    let consumed = std::mem::replace(lobj, placeholder);
+    let initial_poly = consumed.into_poly();
+    if initial_poly.is_zero() {
+        // Edge case: lobj was reported non-zero but the bucket
+        // collapsed to zero on extraction. Leave lobj as the
+        // placeholder (already zero).
+        return;
+    }
+
+    // Build the reducer state and seed it with the initial poly
+    // as the first reducer (multiplier = 1, coeff = 1).
+    let mut h = ReducerHeap::new(Arc::clone(ring), initial_sugar);
+    h.push_reducer(Reducer {
+        poly: &initial_poly,
+        multiplier: crate::monomial::Monomial::one(ring),
+        coeff: 1,
+        index: 0,
+        sugar: initial_sugar,
+    });
+
+    // Drive the reduction. The closure adapts our existing
+    // `find_divisor_idx` (the same one the geobucket path uses,
+    // including the AVX2-batched sev pre-filter from ADR-007)
+    // into the callback shape ReducerHeap::reduce_to_normal_form
+    // expects.
+    let (result, final_sugar) = h.reduce_to_normal_form(|leader| {
+        find_divisor_idx(s_basis, leader.sev(), leader, ring)
+            .map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))
+    });
+
+    // Replace the LObject with one carrying the heap reducer's
+    // result + final sugar.
+    *lobj = LObject::from_poly_with_sugar(Arc::clone(ring), result, final_sugar);
 }
 
 /// Find the index of a basis element whose leading monomial divides
@@ -608,6 +697,110 @@ mod tests {
         let r = mk_ring(3, 32003);
         let gb = compute_gb(Arc::clone(&r), vec![]);
         assert!(gb.is_empty());
+    }
+
+    /// ADR-008 cross-validation: the geobucket reducer
+    /// (`reduce_lobject_geobucket`) and the heap reducer
+    /// (`reduce_lobject_heap`) must produce algorithmically
+    /// equivalent results on the same input. They are
+    /// expected to give bit-for-bit identical surviving polys
+    /// (modulo canonical form), since both implement the
+    /// same reduction-to-normal-form algorithm against the
+    /// same monic basis.
+    ///
+    /// Test fixtures: hand-built (basis, lobject_poly) pairs
+    /// covering several reduction shapes:
+    ///   - irreducible input (no divisor)
+    ///   - single-step reduction
+    ///   - chain reduction
+    ///   - reduction to zero
+    ///   - mid-tail reduction (head is irreducible, but
+    ///     a tail term reduces)
+    #[test]
+    fn geobucket_and_heap_reducer_agree() {
+        use crate::sbasis::SBasis;
+        let r = mk_ring(3, 32003);
+        let neg_one = r.field().neg(1);
+
+        type TermSpec = (Coeff, Vec<u32>);
+        type PolySpec = Vec<TermSpec>;
+        type Case = (Vec<PolySpec>, PolySpec);
+
+        let cases: Vec<Case> = vec![
+            // (1) Empty basis: lobject = x + y + z reduces to itself.
+            (vec![], vec![
+                (1, vec![1, 0, 0]),
+                (1, vec![0, 1, 0]),
+                (1, vec![0, 0, 1]),
+            ]),
+            // (2) basis = {x}, lobject = x + y + z → reduces to y + z.
+            (vec![vec![(1, vec![1, 0, 0])]], vec![
+                (1, vec![1, 0, 0]),
+                (1, vec![0, 1, 0]),
+                (1, vec![0, 0, 1]),
+            ]),
+            // (3) basis = {x - y}, lobject = x → reduces to y
+            // (after subtracting 1*(x-y) = x - y, we get y).
+            (
+                vec![vec![(1, vec![1, 0, 0]), (neg_one, vec![0, 1, 0])]],
+                vec![(1, vec![1, 0, 0])],
+            ),
+            // (4) basis = {x - y, y - z}, lobject = x → chain → z.
+            (
+                vec![
+                    vec![(1, vec![1, 0, 0]), (neg_one, vec![0, 1, 0])],
+                    vec![(1, vec![0, 1, 0]), (neg_one, vec![0, 0, 1])],
+                ],
+                vec![(1, vec![1, 0, 0])],
+            ),
+            // (5) basis = {x - 1}, lobject = x^3 - 1 → reduces to 0.
+            (
+                vec![vec![(1, vec![1, 0, 0]), (neg_one, vec![0, 0, 0])]],
+                vec![(1, vec![3, 0, 0]), (neg_one, vec![0, 0, 0])],
+            ),
+            // (6) basis = {x*y - z}, lobject = x*y*z → tail reduction.
+            (
+                vec![vec![(1, vec![1, 1, 0]), (neg_one, vec![0, 0, 1])]],
+                vec![(1, vec![1, 1, 1])],
+            ),
+        ];
+
+        for (basis_terms, f_terms) in cases {
+            // Build the basis polynomials and load them into an SBasis.
+            let basis_polys: Vec<Poly> = basis_terms
+                .into_iter()
+                .map(|terms| {
+                    Poly::from_terms(
+                        &r,
+                        terms.into_iter().map(|(c, e)| (c, mono(&r, &e))).collect(),
+                    )
+                })
+                .collect();
+            let mut s_basis = SBasis::new();
+            for p in &basis_polys {
+                s_basis.insert(&r, p.clone());
+            }
+
+            let f = Poly::from_terms(
+                &r,
+                f_terms.into_iter().map(|(c, e)| (c, mono(&r, &e))).collect(),
+            );
+
+            // Run both reducers on identical starting state.
+            let mut lobj_geo = LObject::from_poly(Arc::clone(&r), f.clone());
+            reduce_lobject_geobucket(&mut lobj_geo, &s_basis, &r);
+            let geo_result = lobj_geo.into_poly();
+
+            let mut lobj_heap = LObject::from_poly(Arc::clone(&r), f.clone());
+            reduce_lobject_heap(&mut lobj_heap, &s_basis, &r);
+            let heap_result = lobj_heap.into_poly();
+
+            assert_eq!(
+                geo_result, heap_result,
+                "reducers disagree on f = {f:?} with basis_polys = {basis_polys:?}: \
+                 geobucket = {geo_result:?}, heap = {heap_result:?}"
+            );
+        }
     }
 
     /// Sanity check that `find_sev_match` (the dispatcher chosen at

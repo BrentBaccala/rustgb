@@ -14,6 +14,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # stdlib only for now; add as needed.
 
+[features]
+# Default reducer is the geobucket (ADR-002). Enabling this feature
+# switches `bba::reduce_lobject` to the heap-based Monagan-Pearce
+# reducer (ADR-008). Both reducers are always compiled; the flag
+# only chooses which one bba uses internally. Cross-validation
+# tests in `bba` always exercise both regardless of flag state.
+heap_reducer = []
+
 [dev-dependencies]
 proptest = "1"
 
