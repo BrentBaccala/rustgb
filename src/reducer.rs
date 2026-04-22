@@ -36,6 +36,7 @@ use crate::field::Coeff;
 use crate::monomial::Monomial;
 use crate::poly::Poly;
 use crate::ring::Ring;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 /// One in-flight reducer in a [`ReducerHeap`].
@@ -156,11 +157,11 @@ pub struct ReducerHeap<'a> {
     /// no `HeapNode` references it any more, but its slot stays).
     reducers: Vec<Reducer<'a>>,
     /// Max-heap of pending product terms, ordered by degrevlex
-    /// via [`HeapNode::cmp_key`]. Phase 2 will add the operations
-    /// that maintain this heap; phase 1 keeps it as a plain
-    /// [`Vec`] so the type compiles without committing to a
-    /// specific heap implementation yet.
-    heap: Vec<HeapNode>,
+    /// via [`HeapNode::cmp_key`]. The std-library `BinaryHeap` is
+    /// a max-heap and our [`HeapNode::cmp`] implements degrevlex
+    /// via lex compare on the cached `cmp_key`, so push/pop/peek
+    /// give the right semantics directly.
+    heap: BinaryHeap<HeapNode>,
     /// Running sugar. Initialised at construction; updated to
     /// `max(self.sugar, reducer.sugar)` on each `push_reducer`.
     sugar: u32,
@@ -175,7 +176,7 @@ impl<'a> ReducerHeap<'a> {
         Self {
             ring,
             reducers: Vec::new(),
-            heap: Vec::new(),
+            heap: BinaryHeap::new(),
             sugar: initial_sugar,
         }
     }
@@ -207,6 +208,57 @@ impl<'a> ReducerHeap<'a> {
     #[inline]
     pub fn heap_len(&self) -> usize {
         self.heap.len()
+    }
+
+    /// Whether the heap is empty. Equivalent to `self.heap_len() == 0`.
+    /// When this returns true the reduction has terminated; either
+    /// the LObject reduced to zero (no survivor), or the survivor
+    /// has already been fully drained into a `Poly`.
+    #[inline]
+    pub fn heap_is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    // ----- Heap operations (phase 2) -----
+    //
+    // The heap is a max-heap by degrevlex via HeapNode::cmp on the
+    // cached cmp_key. The underlying BinaryHeap is std-library;
+    // these methods are thin wrappers that document the role of
+    // each operation in the Monagan-Pearce reducer's lifecycle.
+
+    /// Push a heap node. The node carries the pre-XOR'd cmp_key
+    /// for the term `multiplier * g.terms[index]` for some reducer
+    /// in the slab; the caller is responsible for constructing it
+    /// (typically `Self::push_term`, deferred to phase 4 where the
+    /// reducer-construction surface lands).
+    #[inline]
+    pub fn push_node(&mut self, node: HeapNode) {
+        self.heap.push(node);
+    }
+
+    /// Look at the maximum heap node without removing it. Returns
+    /// `None` if the heap is empty.
+    ///
+    /// Used by [`pop_with_cancellation`](Self::pop_with_cancellation)
+    /// (phase 3) to peek at successive max entries and detect
+    /// whether they share the leading `cmp_key` — the signal that
+    /// terms cancel and need to be summed.
+    #[inline]
+    pub fn peek_max(&self) -> Option<&HeapNode> {
+        self.heap.peek()
+    }
+
+    /// Remove and return the maximum heap node. Returns `None`
+    /// if the heap is empty.
+    ///
+    /// In Monagan-Pearce, this corresponds to taking the next
+    /// pending product to consider for emission. The caller must
+    /// then either advance the source reducer's index (and push
+    /// the next term back onto the heap) or, if the source's
+    /// tail is exhausted, leave the slot vacant.
+    #[inline]
+    pub fn pop_max(&mut self) -> Option<HeapNode> {
+        self.heap.pop()
     }
 }
 
@@ -301,5 +353,185 @@ mod tests {
             reducer_idx: 7,
         };
         assert_eq!(a, b);
+    }
+
+    // ----- Phase 2: heap operations -----
+
+    /// Helper: build a deterministic pseudo-random sequence of
+    /// HeapNodes with diverse cmp_keys for property testing.
+    /// Keys are spread across all four words to exercise the
+    /// MSB-first lex-compare path.
+    fn pseudo_random_nodes(n: usize, seed: u64) -> Vec<HeapNode> {
+        let mut state = seed;
+        let mut step = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        (0..n)
+            .map(|i| HeapNode {
+                cmp_key: [step(), step(), step(), step()],
+                reducer_idx: i,
+            })
+            .collect()
+    }
+
+    /// Slow reference: pop the max repeatedly via sort.
+    fn slow_drain_descending(mut nodes: Vec<HeapNode>) -> Vec<HeapNode> {
+        nodes.sort();
+        nodes.reverse();
+        nodes
+    }
+
+    #[test]
+    fn empty_heap_pop_and_peek_return_none() {
+        let r = mk_ring(3);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        assert!(h.heap_is_empty());
+        assert!(h.peek_max().is_none());
+        assert!(h.pop_max().is_none());
+        assert!(h.heap_is_empty());
+    }
+
+    #[test]
+    fn push_then_pop_single_node() {
+        let r = mk_ring(3);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        let n = HeapNode {
+            cmp_key: [1, 2, 3, 4],
+            reducer_idx: 42,
+        };
+        h.push_node(n.clone());
+        assert_eq!(h.heap_len(), 1);
+        assert!(!h.heap_is_empty());
+        assert_eq!(h.peek_max(), Some(&n));
+        assert_eq!(h.pop_max(), Some(n));
+        assert!(h.heap_is_empty());
+    }
+
+    #[test]
+    fn push_pop_drains_in_descending_order() {
+        // Property test against the slow sort-based reference.
+        // For each seed, push N nodes onto the heap and verify
+        // that draining pops them in descending degrevlex order
+        // (the same order the slow reference produces).
+        let r = mk_ring(3);
+        for &seed in &[0x1234_5678_9abc_def0u64, 0xdead_beef_cafe_babe, 1, 2, 0xff_ff] {
+            for &n in &[1usize, 2, 5, 16, 64, 200] {
+                let nodes = pseudo_random_nodes(n, seed);
+                let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+                for node in &nodes {
+                    h.push_node(node.clone());
+                }
+                assert_eq!(h.heap_len(), n);
+                let mut got = Vec::with_capacity(n);
+                while let Some(top) = h.pop_max() {
+                    got.push(top);
+                }
+                assert!(h.heap_is_empty());
+                let expected = slow_drain_descending(nodes);
+                assert_eq!(
+                    got.iter().map(|n| n.cmp_key).collect::<Vec<_>>(),
+                    expected.iter().map(|n| n.cmp_key).collect::<Vec<_>>(),
+                    "drain order mismatch for seed {seed:#x}, n = {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peek_matches_pop() {
+        // After every push, peek_max should report the same cmp_key
+        // that the next pop_max returns.
+        let r = mk_ring(3);
+        let nodes = pseudo_random_nodes(50, 0xfeed_face);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        for node in &nodes {
+            h.push_node(node.clone());
+            let peek_key = h.peek_max().unwrap().cmp_key;
+            // Don't actually pop — instead, verify that on the
+            // *next* pop later we'd see this key. Take a snapshot
+            // by cloning the heap state for the check.
+            let mut h2 = ReducerHeap::new(Arc::clone(&r), 0);
+            // Re-build h2 from the underlying BinaryHeap's iterator
+            // to avoid moving h.
+            for n2 in h.heap.iter() {
+                h2.push_node(n2.clone());
+            }
+            let popped = h2.pop_max().unwrap();
+            assert_eq!(popped.cmp_key, peek_key);
+        }
+    }
+
+    #[test]
+    fn interleaved_push_and_pop_drains_correctly() {
+        // Push some, pop some, push more, drain — verifies the
+        // heap can absorb pops in the middle of building (the
+        // lifecycle that pop-with-cancellation will exercise).
+        let r = mk_ring(3);
+        let nodes = pseudo_random_nodes(30, 0xa1b2_c3d4);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+
+        // Push first 20.
+        for n in &nodes[..20] {
+            h.push_node(n.clone());
+        }
+        // Pop 5 (saving them).
+        let mut popped: Vec<HeapNode> = (0..5).map(|_| h.pop_max().unwrap()).collect();
+        // Push remaining 10.
+        for n in &nodes[20..30] {
+            h.push_node(n.clone());
+        }
+        // Drain.
+        while let Some(top) = h.pop_max() {
+            popped.push(top);
+        }
+
+        // Total nodes seen = 30; their cmp_keys, when sorted
+        // descending, should match the input sorted descending.
+        assert_eq!(popped.len(), 30);
+        let mut got_keys: Vec<[u64; 4]> = popped.iter().map(|n| n.cmp_key).collect();
+        got_keys.sort();
+        let mut want_keys: Vec<[u64; 4]> = nodes.iter().map(|n| n.cmp_key).collect();
+        want_keys.sort();
+        assert_eq!(got_keys, want_keys);
+    }
+
+    #[test]
+    fn duplicate_cmp_keys_both_pop() {
+        // Two nodes with the same cmp_key but different
+        // reducer_idx should both be poppable. Order between
+        // them is unspecified, but neither should be lost.
+        let r = mk_ring(3);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        let a = HeapNode {
+            cmp_key: [9, 0, 0, 0],
+            reducer_idx: 1,
+        };
+        let b = HeapNode {
+            cmp_key: [9, 0, 0, 0],
+            reducer_idx: 2,
+        };
+        let c = HeapNode {
+            cmp_key: [5, 0, 0, 0],
+            reducer_idx: 3,
+        };
+        h.push_node(a.clone());
+        h.push_node(c.clone());
+        h.push_node(b.clone());
+        // Top two should both have cmp_key [9, 0, 0, 0].
+        let p1 = h.pop_max().unwrap();
+        assert_eq!(p1.cmp_key, [9, 0, 0, 0]);
+        let p2 = h.pop_max().unwrap();
+        assert_eq!(p2.cmp_key, [9, 0, 0, 0]);
+        // Reducer indices: should be {1, 2} between p1 and p2.
+        let idxs = [p1.reducer_idx, p2.reducer_idx];
+        assert!(idxs.contains(&1) && idxs.contains(&2));
+        // Last pop is c.
+        let p3 = h.pop_max().unwrap();
+        assert_eq!(p3.cmp_key, [5, 0, 0, 0]);
+        assert_eq!(p3.reducer_idx, 3);
+        assert!(h.heap_is_empty());
     }
 }
