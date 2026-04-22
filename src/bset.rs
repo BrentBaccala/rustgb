@@ -22,6 +22,14 @@ use crate::pair::Pair;
 #[derive(Debug, Default)]
 pub struct BSet {
     pairs: Vec<Pair>,
+    /// Parallel array of `pair.lcm_sev` values. Maintained in
+    /// lockstep with `pairs` (push appends to both; swap_remove
+    /// swap-removes from both at the same index). Used by the
+    /// SIMD-batched chain-criterion sweep introduced in ADR-009;
+    /// see `~/rustgb/docs/design-decisions.md` ADR-009 for the
+    /// rationale (Singular's `sev_flat` flat-parallel-array
+    /// pattern, applied to the BSet's pairs).
+    lcm_sevs: Vec<u64>,
     /// (i, j) → index into `pairs`. Never holds a stale mapping: on
     /// removal the last element is swapped in and the hash for the
     /// swapped-in pair is updated.
@@ -33,6 +41,7 @@ impl BSet {
     pub fn new() -> Self {
         Self {
             pairs: Vec::new(),
+            lcm_sevs: Vec::new(),
             by_indices: HashMap::new(),
         }
     }
@@ -62,6 +71,7 @@ impl BSet {
             key
         );
         self.by_indices.insert(key, idx);
+        self.lcm_sevs.push(pair.lcm_sev);
         self.pairs.push(pair);
     }
 
@@ -71,10 +81,19 @@ impl BSet {
         &self.pairs
     }
 
+    /// Borrow the parallel `lcm_sev` array. `lcm_sevs()[i]` equals
+    /// `pairs()[i].lcm_sev` for every valid `i`. Used by the
+    /// ADR-009 SIMD-batched chain-criterion sweep.
+    #[inline]
+    pub fn lcm_sevs(&self) -> &[u64] {
+        &self.lcm_sevs
+    }
+
     /// Remove the pair at `at` (swap-remove). Returns the removed
     /// pair. Keeps `by_indices` consistent.
     pub fn swap_remove(&mut self, at: usize) -> Pair {
         let removed = self.pairs.swap_remove(at);
+        self.lcm_sevs.swap_remove(at);
         self.by_indices.remove(&(removed.i, removed.j));
         if at < self.pairs.len() {
             // The element previously at the end now lives at `at`.
@@ -92,10 +111,19 @@ impl BSet {
     /// Debug-only invariant check.
     pub fn assert_canonical(&self, ring: &crate::ring::Ring) {
         assert_eq!(self.pairs.len(), self.by_indices.len(), "index size");
+        assert_eq!(
+            self.pairs.len(),
+            self.lcm_sevs.len(),
+            "pairs / lcm_sevs length mismatch"
+        );
         for (idx, pair) in self.pairs.iter().enumerate() {
             pair.assert_canonical(ring);
             let got = self.by_indices.get(&(pair.i, pair.j));
             assert_eq!(got, Some(&idx), "by_indices mismatch for {idx}");
+            assert_eq!(
+                self.lcm_sevs[idx], pair.lcm_sev,
+                "lcm_sevs[{idx}] out of sync with pair.lcm_sev"
+            );
         }
     }
 }

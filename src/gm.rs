@@ -28,7 +28,7 @@ use crate::monomial::Monomial;
 use crate::pair::Pair;
 use crate::poly::Poly;
 use crate::ring::Ring;
-use crate::sbasis::{SBasis, divides_with_sev};
+use crate::sbasis::SBasis;
 
 /// Generate one candidate pair for `(s_idx, h_idx)`.
 ///
@@ -138,30 +138,52 @@ pub fn chain_crit_normal(
     l: &mut LSet,
 ) {
     // Phase 1: B-internal dedup.
+    //
+    // For each i, find every j whose lcm is divisible by pairs[i]'s
+    // lcm and kill it. The naive O(n^2) scalar inner loop tests
+    // `divides_with_sev(a.lcm_sev, c.lcm_sev, ...)` for every j.
+    // ADR-009 replaces the scalar sev pre-filter with a SIMD-batched
+    // scan over the BSet's flat `lcm_sevs` array.
+    //
+    // Sev pre-filter for "a divides c": every set bit of a.lcm_sev
+    // must also be set in c.lcm_sev. That's the "subset_mask ⊆
+    // sevs[idx]" predicate, which `find_sev_superset_match` returns
+    // the next matching index for. (Note: this is the dual of
+    // ADR-007's `find_sev_match`, which checks the opposite
+    // direction — ADR-007 wanted "candidate divides leader" with
+    // candidate iterating, here we want "outer-pair divides
+    // inner-pair" with inner-pair iterating.)
     let n = b.len();
     let mut kill: Vec<bool> = vec![false; n];
     {
         let pairs = b.pairs();
+        let lcm_sevs = b.lcm_sevs();
         for i in 0..n {
             if kill[i] {
                 continue;
             }
-            for j in 0..n {
+            let a = &pairs[i];
+            let a_sev = a.lcm_sev;
+            let mut j = 0;
+            loop {
+                j = crate::simd::find_sev_superset_match(lcm_sevs, a_sev, j);
+                if j >= n {
+                    break;
+                }
                 if i == j || kill[j] {
+                    j += 1;
                     continue;
                 }
-                let a = &pairs[i];
                 let c = &pairs[j];
-                let equal = a.lcm_sev == c.lcm_sev && a.lcm == c.lcm;
+                let equal = a.lcm == c.lcm;
                 if equal {
                     if j > i {
                         kill[j] = true;
                     }
-                    continue;
-                }
-                if divides_with_sev(a.lcm_sev, c.lcm_sev, &a.lcm, &c.lcm, ring) {
+                } else if a.lcm.divides(&c.lcm, ring) {
                     kill[j] = true;
                 }
+                j += 1;
             }
         }
     }

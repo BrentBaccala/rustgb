@@ -41,6 +41,7 @@ pub mod poly;
 pub mod reducer;
 pub mod ring;
 pub mod sbasis;
+mod simd;
 
 pub use bba::compute_gb;
 pub use computation::{Computation, SharedLSet, SharedSBasis};

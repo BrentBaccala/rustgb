@@ -403,119 +403,10 @@ fn find_divisor_idx(
     None
 }
 
-/// Return the smallest index `i >= start` with
-/// `(sevs[i] & not_sev) == 0`, or `sevs.len()` if no such index exists.
-///
-/// AVX2 path: 16-entry-per-iteration unrolled main loop, mirroring
-/// Singular's `kSevScanAVX2`. Falls back to a scalar walk when AVX2
-/// is not enabled at compile time.
-#[cfg(target_feature = "avx2")]
-#[inline]
-fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize {
-    // SAFETY: caller passes a valid slice; we bounds-check every load
-    // against `len` before issuing it.
-    unsafe { find_sev_match_avx2(sevs, not_sev, start) }
-}
-
-#[cfg(not(target_feature = "avx2"))]
-#[inline]
-fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize {
-    find_sev_match_scalar(sevs, not_sev, start)
-}
-
-/// Scalar implementation of [`find_sev_match`]. Used as the
-/// non-AVX2 build path and as the reference for unit tests of the
-/// AVX2 path.
-#[inline]
-fn find_sev_match_scalar(sevs: &[u64], not_sev: u64, start: usize) -> usize {
-    let len = sevs.len();
-    let mut idx = start;
-    while idx < len {
-        if (sevs[idx] & not_sev) == 0 {
-            return idx;
-        }
-        idx += 1;
-    }
-    len
-}
-
-/// AVX2 implementation of [`find_sev_match`]. Mirrors Singular's
-/// `kSevScanAVX2` (`~/Singular-next-opt/kernel/GBEngine/kstd2.cc:74`).
-///
-/// # Safety
-/// Requires AVX2 available at runtime. Guaranteed by the
-/// `cfg(target_feature = "avx2")` gate on the caller. All loads are
-/// bounds-checked against `sevs.len()` before being issued.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn find_sev_match_avx2(sevs: &[u64], not_sev: u64, start: usize) -> usize {
-    use std::arch::x86_64::*;
-    let len = sevs.len();
-    let mut j = start;
-    let ptr = sevs.as_ptr();
-
-    // SAFETY of all the unsafe blocks below: every load is bounded
-    // by the surrounding `while j + N < len` check before issuing,
-    // so the AVX2 256-bit loads stay inside the slice.
-    unsafe {
-        let vnot_sev = _mm256_set1_epi64x(not_sev as i64);
-        let vzero = _mm256_setzero_si256();
-
-        // Main loop: 16 entries per iteration. Singular's pattern:
-        // four 4-wide AND+CMPEQ operations, OR the masks together,
-        // and only branch out when *some* batch matched.
-        while j + 16 <= len {
-            let v1 = _mm256_loadu_si256(ptr.add(j) as *const __m256i);
-            let v2 = _mm256_loadu_si256(ptr.add(j + 4) as *const __m256i);
-            let v3 = _mm256_loadu_si256(ptr.add(j + 8) as *const __m256i);
-            let v4 = _mm256_loadu_si256(ptr.add(j + 12) as *const __m256i);
-            let a1 = _mm256_and_si256(v1, vnot_sev);
-            let a2 = _mm256_and_si256(v2, vnot_sev);
-            let a3 = _mm256_and_si256(v3, vnot_sev);
-            let a4 = _mm256_and_si256(v4, vnot_sev);
-            let c1 = _mm256_cmpeq_epi64(a1, vzero);
-            let c2 = _mm256_cmpeq_epi64(a2, vzero);
-            let c3 = _mm256_cmpeq_epi64(a3, vzero);
-            let c4 = _mm256_cmpeq_epi64(a4, vzero);
-            let m1 = _mm256_movemask_epi8(c1) as u32;
-            let m2 = _mm256_movemask_epi8(c2) as u32;
-            let m3 = _mm256_movemask_epi8(c3) as u32;
-            let m4 = _mm256_movemask_epi8(c4) as u32;
-            if (m1 | m2 | m3 | m4) != 0 {
-                // Find the first matching qword across the four batches.
-                // Each set qword has all 8 of its movemask bits set,
-                // so trailing_zeros / 8 is the qword index.
-                if m1 != 0 {
-                    return j + (m1.trailing_zeros() / 8) as usize;
-                }
-                if m2 != 0 {
-                    return j + 4 + (m2.trailing_zeros() / 8) as usize;
-                }
-                if m3 != 0 {
-                    return j + 8 + (m3.trailing_zeros() / 8) as usize;
-                }
-                return j + 12 + (m4.trailing_zeros() / 8) as usize;
-            }
-            j += 16;
-        }
-
-        // Tail: one 4-wide batch at a time.
-        while j + 4 <= len {
-            let v = _mm256_loadu_si256(ptr.add(j) as *const __m256i);
-            let a = _mm256_and_si256(v, vnot_sev);
-            let c = _mm256_cmpeq_epi64(a, vzero);
-            let m = _mm256_movemask_epi8(c) as u32;
-            if m != 0 {
-                return j + (m.trailing_zeros() / 8) as usize;
-            }
-            j += 4;
-        }
-    }
-
-    // Scalar tail (0..3 elements).
-    find_sev_match_scalar(sevs, not_sev, j)
-}
+// `find_sev_match` (and its AVX2 / scalar implementations) live
+// in `crate::simd` as of ADR-009 so they can be reused from
+// `gm::chain_crit_normal`. See `~/rustgb/src/simd.rs`.
+use crate::simd::find_sev_match;
 
 /// Walk the basis and tail-reduce every non-redundant element against
 /// the others. This is the final pass that turns a Gröbner basis
@@ -807,9 +698,10 @@ mod tests {
     /// compile time based on `target_feature = "avx2"`) produces the
     /// same answer as `find_sev_match_scalar` for a range of inputs
     /// that exercise the unrolled main loop, the 4-wide tail, and
-    /// the scalar tail. ADR-007.
+    /// the scalar tail. ADR-007 (extracted to `crate::simd` in ADR-009).
     #[test]
     fn find_sev_match_simd_matches_scalar() {
+        use crate::simd::find_sev_match_scalar;
         // Generate a deterministic pseudo-random sev array large
         // enough to span all three loop bodies in the AVX2 path
         // (16-batch main, 4-batch tail, scalar tail). Use a basic LCG

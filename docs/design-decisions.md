@@ -1340,6 +1340,158 @@ a separate commit):
 
 ---
 
+## ADR-009: SIMD-batched sev sweep for `chain_crit_normal` B-internal dedup
+
+**Status:** Accepted and implemented. Landed alongside this ADR's
+commit in `~/rustgb`.
+**Date:** 2026-04-22
+
+### Context
+
+The v6 profile (`~/project/docs/profile-rustgb-v6-staging-5101449.md`,
+post-ADR-008) showed `gm::chain_crit_normal` jumped from 3.2 % of
+total cycles in v5 to **19.8 %** in v6 — Amdahl's law in action,
+the same effect Singular's `next-opt v6` profile saw after they
+sped up their reducer. The function is now tied with the heap
+reducer's outer loop as the largest concentrated cost.
+
+`chain_crit_normal` (`gm.rs:131-`) has two phases:
+
+* **Phase 1 — B-internal dedup** (`gm.rs:140-172`): O(n²) sweep
+  over `BSet`'s newly generated pairs. For each pair `i`, scan
+  every other pair `j` for `lcm(a_i) | lcm(a_j)` (with sev
+  pre-filter). Pairs whose lcm is divisible by another pair's lcm
+  are killed.
+* **Phase 2 — L-side G-M elimination** (`gm.rs:174-`): for each
+  live pair in `LSet`, sev-prefilter against `h_lm_sev`, then
+  test `h_lm.divides(&pair.lcm)` and an LCM-equality predicate.
+
+The v6 call-graph breakdown inside the 19.8 % was:
+- ~5.4 % `divides_with_sev` → `Monomial::divides` (the actual
+  divides probe in both phases)
+- ~4.0 % `HashSet::contains` (under `LSet::iter_live` in Phase 2)
+- ~10 % the inner-loop bodies (Phase 1's O(n²), plus Phase 2's
+  per-pair work)
+
+The dominant *constant* cost — the per-iteration test+branch
+overhead in Phase 1's O(n²) scan — is structurally identical to
+the basis-sweep cost ADR-007 fixed inside `reduce_lobject`. The
+same SIMD-batched sev pre-filter pattern applies directly.
+
+### Singular's approach
+
+Singular's `next-opt` branch addressed exactly this problem with
+the **`sev_flat`** optimisation (see
+`profile-next-opt-v3-samsung.md`): store the basis / pair sev
+arrays in flat parallel `unsigned long*` Vecs, then SIMD-batch
+the scan with `kSevScanAVX2` (the same routine ADR-007 mirrors
+in `find_sev_match_avx2`). Their measurement: `chainCritNormal`
+dropped from ~22 % to ~3 % of total cycles after sev_flat plus
+the SIMD scan.
+
+The `sev_flat` data layout is what we already have on `SBasis`
+(`sevs: Vec<u64>` parallel to `polys: Vec<Box<Poly>>` — see
+ADR-007). For BSet we need the analogous structure: a parallel
+`lcm_sevs: Vec<u64>` maintained alongside `pairs: Vec<Pair>`.
+Each pair already caches `lcm_sev` inside its `Pair` struct, so
+the change is purely about laying that one field out flat for
+SIMD-friendly access.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** No chain criterion, no pair
+deduplication. The `mpoly_monomial_*` family in FLINT does
+include sev-prefilter helpers for individual polynomial ops, but
+nothing analogous to the chain criterion's O(n²) pair sweep.
+
+### Decision
+
+Apply the ADR-007 SIMD pattern verbatim to `chain_crit_normal`
+Phase 1:
+
+1. **Add `BSet::lcm_sevs: Vec<u64>`** as a parallel array,
+   maintained alongside `pairs` on every `push` and `swap_remove`.
+   Pure plumbing; pair's existing `lcm_sev` field is kept (it's
+   still the source of truth on each Pair; the side array is a
+   SIMD-friendly mirror).
+2. **Extract `find_sev_match` from `bba.rs` into a shared
+   `simd.rs` module** so it can be reused from `gm.rs`. The
+   function is structurally identical regardless of caller; the
+   "which sev do we scan and what do we compare against" varies,
+   not the SIMD code.
+3. **Rewrite Phase 1's inner loop** to use the SIMD-batched
+   `find_sev_match` over `BSet::lcm_sevs` against `!a.lcm_sev`,
+   then for each candidate index check `kill[idx]` and call
+   `divides_with_sev` only if it's still live.
+
+Phase 2 (L-side) is **not** changed in this ADR. The L-side
+sweep is iterating an LSet whose backing store (`BinaryHeap<HeapEntry>`
+with a separate `HashSet<PairKey>` for tombstones) doesn't have
+a flat sev array. Adding one would require restructuring LSet,
+and the LSet's `iter_live` cost is dominated by `HashSet::contains`
+rather than the sev pre-filter. That deserves its own ADR (likely
+ADR-010 — replace LSet's HashSet with a bitset, or restructure
+to a flat-array layout). Defer until profile evidence post-ADR-009
+is in.
+
+### Consequences
+
+**Performance prediction:** Phase 1 is the larger of the two
+phases (the O(n² scan over hundreds of new pairs per iteration).
+Cutting its scan cost by 3-4× (matching ADR-007's basis-sweep
+result) should drop `chain_crit_normal` from 19.8 % to roughly
+~10-12 % of v6 cycles, freeing ~7-8 percentage points = ~7-8 %
+wall reduction. Less than ADR-008's win but still material.
+
+**Measured (post-implementation, samsung, AVX2 + heap_reducer build):**
+
+| Test | v6 (post-ADR-008) | v7 (post-ADR-009) | Δ |
+|---|---|---|---|
+| staging-5101449 | 38 s | **31 s** | **−18 %** |
+| staging-5104053 | 52 s | 54 s | +4 % (within noise) |
+| staging-5106746 | 58 s | **51 s** | **−12 %** |
+
+Cumulative wall on staging-5101449 since v1 (raw memmove):
+**870 s → 31 s = 28× speedup**.
+
+All three staging tests still produce exact fixture matches.
+
+The wall improvement on the larger workloads (staging-5101449,
+-5106746) is consistent with the prediction; staging-5104053 is
+in the noise band, possibly because its B-internal phase has a
+shorter scan length per call (different basis-growth shape).
+
+**Maintenance overhead:** the parallel `lcm_sevs: Vec<u64>` has
+to stay in sync with `pairs: Vec<Pair>`. Discipline: every `push`
+mirrors into both; every `swap_remove` mirrors out of both. The
+existing `assert_canonical` debug check is extended to verify
+the parallel arrays' invariants. Risk is low because BSet's
+mutation surface is only `push` and `swap_remove` (no internal
+shuffling).
+
+**Cross-reference with ADR-007:** the extracted `find_sev_match`
+becomes a small standalone module (`simd.rs`) used from both
+`bba.rs` (in `find_divisor_idx`) and `gm.rs` (in the new B-sweep).
+Behaviour is unchanged for ADR-007's caller; the only API shift
+is the function moving namespaces.
+
+### References
+
+- `~/rustgb/src/gm.rs:131-172` (current `chain_crit_normal`
+  Phase 1 — the surface being changed)
+- `~/rustgb/src/bset.rs:23-101` (the `BSet` gaining the parallel
+  `lcm_sevs` array)
+- `~/rustgb/src/bba.rs:` (`find_sev_match` and
+  `find_sev_match_avx2` — the helpers being extracted into
+  `simd.rs`)
+- ADR-007 (`SIMD-batched sev pre-filter for the basis-sweep`) —
+  the model adopted here; same Singular reference (`kSevScanAVX2`,
+  `kstd2.cc:74-121`)
+- `~/project/docs/profile-rustgb-v6-staging-5101449.md` (the
+  19.8 % `chain_crit_normal` evidence motivating this ADR)
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
