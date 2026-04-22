@@ -586,6 +586,205 @@ representation.
 
 ---
 
+## ADR-006: poly::merge — pre-allocated output, FLINT-style index writes
+
+**Status:** Accepted and implemented. Landed alongside this ADR's
+commit in `~/rustgb`.
+**Date:** 2026-04-22
+
+### Context
+
+After ADR-005 collapsed `Monomial::mul` from 30 % of cycles to
+fully-inlined-out, the v3 profile
+(`~/project/docs/profile-rustgb-v3-staging-5101449.md`) showed
+`poly::merge` as the new top concentrated function at 21.2 % of
+total cycles. Inside `merge`, `Vec::push` accounted for 7.0 % of
+total cycles (3.4 % of which was `core::ptr::write` itself), with
+the remainder split between `Monomial::cmp` (7.0 %) and the loop
+body (~7 %).
+
+`merge` is hot because every reducer step that absorbs a non-empty
+`build_neg_cmp` result into a non-empty geobucket slot fires it
+(via `KBucket::absorb` → `Poly::add` → `merge`). Across an
+entire bba run on staging-5101449 that's millions of merge calls,
+each one constructing a fresh `Vec<Coeff>` and `Vec<Monomial>`
+output by repeated `push`-ing.
+
+The question this ADR answers: how should the merge emit its
+output terms?
+
+### Singular's approach
+
+Singular's `p_Add_q__T` (`~/Singular-rustgb/libpolys/polys/templates/p_Add_q__T.cc`,
+86 lines) sidesteps the question entirely by **never allocating
+output nodes**. Polynomials are linked lists of `spolyrec` nodes;
+emitting a term is one pointer write that splices an existing input
+node into the output list:
+
+```c
+Greater:
+  a = pNext(a) = p;     // splice existing node into output
+  pIter(p);             // advance source pointer
+  if (p==NULL) { pNext(a) = q; goto Finish; }   // O(1) tail splice
+  goto Top;
+```
+
+When one input is exhausted, `pNext(a) = q` joins the entire
+remaining tail of the other in **one pointer write**, regardless of
+length. The input lists are explicitly destroyed by the call (the
+docstring says `Destroys: p, q`). The "Equal" path adds
+coefficients in place via `n_InpAdd__T`, freeing the q-side node;
+on cancellation, `n_Delete__T` + `p_LmFreeAndNext` consume both
+nodes. Cmp uses `p_MemCmp__T` (word-wise compare with `ordsgn`).
+
+Per-emitted-term cost: **one pointer write + one pointer chase +
+one cmp**. No allocation, no copy of coefficient or exponent data.
+
+This is structurally inaccessible to rustgb: we picked flat-array
+storage in ADR-001 (head-cursor over a `Vec`), so we don't have
+linked-list nodes to splice and there is no "tail splice" trick
+available. Adopting Singular's design here would require redoing
+ADR-001.
+
+### FLINT's approach
+
+FLINT's `_nmod_mpoly_add` (`~/flint/src/nmod_mpoly/add.c:16-67` and
+the general-N variant at lines 69-124) uses flat parallel arrays
+with **pre-allocated output and direct index writes**:
+
+```c
+if ((Bexps[i]^maskhi) > (Cexps[j]^maskhi)) {
+    Aexps[k] = Bexps[i];
+    Acoeffs[k] = Bcoeffs[i];
+    i++;
+}
+else if ((Bexps[i]^maskhi) == (Cexps[j]^maskhi)) {
+    Aexps[k] = Bexps[i];
+    Acoeffs[k] = nmod_add(Bcoeffs[i], Ccoeffs[j], fctx);
+    k -= (Acoeffs[k] == 0);   // branch-free cancellation skip
+    i++; j++;
+}
+else { /* mirror */ }
+k++;
+```
+
+Three structural choices:
+
+1. **Pre-allocated output.** The wrapper `nmod_mpoly_add`
+   (`add.c:169-186`) calls `nmod_mpoly_init3(T, B->length + C->length, ...)`
+   to size the output to the worst case (no cancellation) before
+   the inner loop begins.
+2. **Index-and-write.** The inner loop writes into pre-sized array
+   slots (`Aexps[k] = Bexps[i]; Acoeffs[k] = Bcoeffs[i]`). No bounds
+   check, no length update per write.
+3. **Branch-free cancellation.** `k -= (Acoeffs[k] == 0)` decrements
+   the write cursor when the result was zero, "uncommitting" the
+   slot. No `if`-then-skip-push branch.
+
+Length is recovered at the end: `return k` → caller assigns
+`T->length = k`.
+
+There is also a hot-path specialisation `_nmod_mpoly_add1` for
+`N == 1` (single-limb exponents), which inlines the cmp as
+`(Bexps[i] ^ maskhi) > (Cexps[j] ^ maskhi)` rather than calling
+`mpoly_monomial_cmp`. rustgb's exponent block is always 4 u64s, so
+this specialisation does not apply directly, though the cmp is
+already inlined via `cmp_degrevlex`.
+
+### Decision
+
+Adopt FLINT's pattern verbatim. Concretely:
+
+1. **Pre-allocate** `out_c` and `out_m` to the upper-bound capacity
+   `a.len() + b.len()` (already done in the existing code, but
+   currently followed by `push`).
+2. **Write via `Vec::spare_capacity_mut()` + `MaybeUninit::write`**
+   instead of `Vec::push`. This skips the per-push bounds-check
+   against `len < capacity` and the per-push length increment.
+   Writing into the spare-capacity slice is safe; only the final
+   `set_len` call is `unsafe`.
+3. **Branch-free cancellation** in the Less and Equal arms:
+   ```rust
+   spare_c[k].write(c);
+   spare_m[k].write(m.clone());
+   k += (c != 0) as usize;
+   ```
+   The write to slot `k` is wasted on cancellation (the next
+   iteration overwrites the same slot), but the *branch* is gone —
+   matching FLINT's `k -= (acc == 0)` shape with a `+=` instead of
+   `-=` (we never speculatively bumped k, so we conditionally hold
+   it back rather than conditionally back it off).
+4. **Single `set_len`** at the end. The Vec is now logically
+   length-`k` with `capacity - k` slots in spare; the wasted writes
+   (if any) leak their bytes when the Vec eventually drops, which
+   is fine because both `Coeff` (u32) and `Monomial` (POD struct)
+   have no Drop side effects.
+
+`sub_mul_term` (`poly.rs:503`) has the same structural pattern
+(2-pointer merge with materialised `c·m·q` terms) and would
+benefit from the same change, but it is not in the v3 hot path.
+Defer until profile evidence shows it matters.
+
+### Consequences
+
+**Performance prediction:** the v3 profile attributed 7.0 % of
+total cycles to `Vec::push` inside `merge`. Eliminating the
+per-push bounds-check + length-increment pair (keeping the
+underlying `ptr::write`) should cut that to ~2-3 %, for **~4-5 %
+wall reduction**. The `Monomial::clone()` cost (32-byte struct
+copy) is unaffected; that's an unavoidable cost of value-move
+into an array slot.
+
+**Measured (post-implementation, v4 profile, samsung):**
+`Vec::push` is **completely gone** from the v4 profile.
+`poly::merge`'s share dropped from 21.2 % (v3) to 17.2 % (v4) —
+the predicted ~4 percentage point reduction. Inside the new merge,
+`Monomial::cmp` is 8.4 % and the loop body accounts for the rest;
+no `Vec::push` line at all. Wall under perf load went 3:34 (v3) →
+2:52 (v4), a 19 % reduction; the cleaner steady-state metric is
+the ~4 pp share drop, which translates to roughly the predicted
+wall improvement once contention noise is averaged out.
+All staging tests still produce exact fixture matches.
+
+The branch-free cancellation removes one branch per Equal-with-cancel
+or Less-with-zero-coefficient case. Cancellation is rare in general
+but happens reliably for the leading term in every `KBucket::absorb`
+call (that's the algorithmic point of `minus_m_mult_p`), so the
+saving is at least one branch per merge call.
+
+**Safety:** the only `unsafe` is the final `set_len(k)`. The
+write-through-spare-capacity pattern via `MaybeUninit::write` is
+safe at compile time. The wasted-write slots beyond `k` are not
+considered initialised by the Vec (`set_len` truncates), so they
+are not dropped — but neither `Coeff` nor `Monomial` has a Drop
+impl with side effects we care about, so this is correct.
+
+**Capacity invariant:** `out.coeffs.capacity()` may exceed
+`out.coeffs.len()` after the merge, by up to (number of cancelled
+terms). For the typical bucket-absorb workload that's a single-digit
+overhang, well within ordinary `Vec` slop. Not worth shrinking.
+
+**API:** the `merge` signature is unchanged. Callers
+(`Poly::add`, `Poly::sub`, `Poly::add_assign`) need no changes.
+
+### References
+
+- `~/rustgb/src/poly.rs:648-708` (current `merge` — the code
+  being replaced)
+- `~/Singular-rustgb/libpolys/polys/templates/p_Add_q__T.cc`
+  (Singular's linked-list merge with O(1) tail splice; reference
+  but structurally inapplicable to flat-array storage)
+- `~/flint/src/nmod_mpoly/add.c:16-124` (FLINT's
+  `_nmod_mpoly_add1` and `_nmod_mpoly_add` — the model adopted
+  here)
+- `~/flint/src/nmod_mpoly/add.c:126-196` (the wrapper
+  `nmod_mpoly_add` showing the pre-allocation pattern)
+- `~/project/docs/profile-rustgb-v3-staging-5101449.md` (the
+  21.2 % `poly::merge` and 7.0 % `Vec::push` evidence that
+  motivated this ADR)
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

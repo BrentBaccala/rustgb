@@ -645,55 +645,90 @@ impl Eq for Poly {}
 
 /// Merge two sorted polynomials into one. If `subtract` is true, the
 /// second operand's coefficients are negated.
+///
+/// Implementation per ADR-006: pre-allocates the output to the
+/// upper-bound capacity `a.len() + b.len()`, writes through
+/// `Vec::spare_capacity_mut()` with `MaybeUninit::write`, and finalises
+/// the length once via `set_len` instead of pushing one term at a
+/// time. Cancellation is branch-free: the write happens
+/// unconditionally and the cursor is incremented only when the
+/// resulting coefficient is nonzero. This mirrors FLINT's
+/// `_nmod_mpoly_add` (`~/flint/src/nmod_mpoly/add.c:16-124`).
 fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
     let f = ring.field();
     let a_c = a.coeffs();
     let a_m = a.terms();
     let b_c = b.coeffs();
     let b_m = b.terms();
-    let mut out_c = Vec::with_capacity(a_c.len() + b_c.len());
-    let mut out_m = Vec::with_capacity(a_m.len() + b_m.len());
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a_m.len() && j < b_m.len() {
-        match a_m[i].cmp(&b_m[j], ring) {
-            std::cmp::Ordering::Greater => {
-                out_c.push(a_c[i]);
-                out_m.push(a_m[i].clone());
-                i += 1;
-            }
-            std::cmp::Ordering::Less => {
-                let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
-                if c != 0 {
-                    out_c.push(c);
-                    out_m.push(b_m[j].clone());
+    let cap = a_c.len() + b_c.len();
+    let mut out_c: Vec<Coeff> = Vec::with_capacity(cap);
+    let mut out_m: Vec<Monomial> = Vec::with_capacity(cap);
+
+    // Number of initialised slots written so far. Tracked outside the
+    // inner block so the final `set_len` can read it after the
+    // spare-capacity borrows have been dropped.
+    let mut k: usize = 0;
+    {
+        let spare_c = out_c.spare_capacity_mut();
+        let spare_m = out_m.spare_capacity_mut();
+        let mut i = 0usize;
+        let mut j = 0usize;
+
+        while i < a_m.len() && j < b_m.len() {
+            match a_m[i].cmp(&b_m[j], ring) {
+                std::cmp::Ordering::Greater => {
+                    spare_c[k].write(a_c[i]);
+                    spare_m[k].write(a_m[i].clone());
+                    k += 1;
+                    i += 1;
                 }
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                let bc = if subtract { f.neg(b_c[j]) } else { b_c[j] };
-                let s = f.add(a_c[i], bc);
-                if s != 0 {
-                    out_c.push(s);
-                    out_m.push(a_m[i].clone());
+                std::cmp::Ordering::Less => {
+                    let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
+                    spare_c[k].write(c);
+                    spare_m[k].write(b_m[j].clone());
+                    // Branch-free cancellation skip: write
+                    // unconditionally; advance k only on nonzero.
+                    // The next iteration overwrites the same slot if
+                    // k didn't advance.
+                    k += (c != 0) as usize;
+                    j += 1;
                 }
-                i += 1;
-                j += 1;
+                std::cmp::Ordering::Equal => {
+                    let bc = if subtract { f.neg(b_c[j]) } else { b_c[j] };
+                    let s = f.add(a_c[i], bc);
+                    spare_c[k].write(s);
+                    spare_m[k].write(a_m[i].clone());
+                    k += (s != 0) as usize;
+                    i += 1;
+                    j += 1;
+                }
             }
         }
-    }
-    while i < a_m.len() {
-        out_c.push(a_c[i]);
-        out_m.push(a_m[i].clone());
-        i += 1;
-    }
-    while j < b_m.len() {
-        let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
-        if c != 0 {
-            out_c.push(c);
-            out_m.push(b_m[j].clone());
+        while i < a_m.len() {
+            spare_c[k].write(a_c[i]);
+            spare_m[k].write(a_m[i].clone());
+            k += 1;
+            i += 1;
         }
-        j += 1;
+        while j < b_m.len() {
+            let c = if subtract { f.neg(b_c[j]) } else { b_c[j] };
+            spare_c[k].write(c);
+            spare_m[k].write(b_m[j].clone());
+            k += (c != 0) as usize;
+            j += 1;
+        }
+    }
+    // SAFETY: We have written exactly `k` initialised slots starting
+    // at index 0 in both `out_c` and `out_m`. Slots in [k, capacity)
+    // may have been written to by the branch-free cancellation pattern
+    // (their bytes are non-canonical garbage), but `set_len(k)`
+    // truncates them out of the live region so they are never read
+    // and never dropped via the Vec's destructor. Both `Coeff` (u32)
+    // and `Monomial` (POD struct of u64s and u32s) have no Drop side
+    // effects, so no resource leak occurs.
+    unsafe {
+        out_c.set_len(k);
+        out_m.set_len(k);
     }
     let mut out = Poly {
         coeffs: out_c,
