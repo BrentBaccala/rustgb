@@ -324,6 +324,100 @@ impl<'a> ReducerHeap<'a> {
         self.push_current_term(reducer_idx);
     }
 
+    /// Drive a full reduction to normal form against an arbitrary
+    /// divisor-source.
+    ///
+    /// Repeatedly pops the next non-cancelled leader; for each
+    /// leader, calls `find_divisor` with the leader's monomial.
+    /// If `find_divisor` returns `Some((g, g_sugar))`, that
+    /// polynomial's leading monomial divides the leader (the
+    /// callback's contract), so we add `g` as a new reducer with
+    /// `multiplier = leader_mono / lm(g)` and pre-negated coeff
+    /// `-leader_coeff / lc(g)`. The next pop will (by construction)
+    /// cancel the leader against the new reducer's first term and
+    /// drive the reduction forward. If `find_divisor` returns
+    /// `None`, the leader is irreducible and joins the survivor
+    /// poly's term sequence.
+    ///
+    /// Assumes basis polynomials are monic (lc = 1), per
+    /// rustgb's bba convention. With this assumption `lc(g) = 1`,
+    /// so the new reducer's coeff is just `-leader_coeff`.
+    ///
+    /// Consumes self and returns `(survivor_poly, final_sugar)`.
+    /// `survivor_poly` is `Poly::zero()` if the LObject reduced
+    /// to zero. `final_sugar` is the running sugar after all
+    /// reducers were added, useful for the caller to update the
+    /// LObject's sugar metadata.
+    pub fn reduce_to_normal_form<F>(mut self, mut find_divisor: F) -> (Poly, u32)
+    where
+        F: FnMut(&Monomial) -> Option<(&'a Poly, u32)>,
+    {
+        let mut survivor_terms: Vec<(Coeff, Monomial)> = Vec::new();
+        // Field is Copy; take an owned copy so the borrow doesn't
+        // conflict with the &mut self calls below.
+        let f = *self.ring.field();
+
+        while let Some((c, m)) = self.pop_with_cancellation() {
+            match find_divisor(&m) {
+                Some((g, g_sugar)) => {
+                    let g_lm = g
+                        .leading()
+                        .expect("find_divisor returned non-zero divisor")
+                        .1;
+                    let multiplier = m
+                        .div(g_lm, &self.ring)
+                        .expect("find_divisor's contract: lm(g) divides m");
+                    debug_assert_eq!(
+                        g.lm_coeff(),
+                        1,
+                        "basis polynomials must be monic"
+                    );
+                    let coeff = f.neg(c);
+                    let m_deg = multiplier.total_deg();
+                    let new_sugar = g_sugar.saturating_add(m_deg);
+                    // **Index = 1**, not 0: the divisor's leading
+                    // term is implicitly cancelled by the act of
+                    // emitting `(c, m)` from pop_with_cancellation
+                    // and then choosing to reduce by g. The leading
+                    // term `coeff * multiplier * g.terms[0]` would
+                    // equal `-c * m`, exactly the inverse of the
+                    // popped leader. Pushing `index = 0` and letting
+                    // the heap cancel it would require us to NOT
+                    // have popped the leader in the first place,
+                    // which is incompatible with the streaming
+                    // pop-emit semantics. Instead, we skip the
+                    // implicit-cancellation leading term and only
+                    // queue the divisor's tail contribution
+                    // `coeff * multiplier * g.terms[1..]`. This is
+                    // the same trick FLINT uses in
+                    // `divrem_monagan_pearce.c` (the new heap node
+                    // for a freshly-found divisor is inserted with
+                    // `j = 1`, not `j = 0`).
+                    self.push_reducer(Reducer {
+                        poly: g,
+                        multiplier,
+                        coeff,
+                        index: 1,
+                        sugar: new_sugar,
+                    });
+                    // Loop continues with the divisor's tail merged
+                    // into the heap.
+                }
+                None => {
+                    // Irreducible leader: emit into the survivor.
+                    survivor_terms.push((c, m));
+                }
+            }
+        }
+
+        let survivor = if survivor_terms.is_empty() {
+            Poly::zero()
+        } else {
+            Poly::from_descending_terms_unchecked(&self.ring, survivor_terms)
+        };
+        (survivor, self.sugar)
+    }
+
     /// Pop the next non-cancelled (coefficient, monomial) leader.
     /// Returns `None` when the heap is empty (the reduction has
     /// terminated; if the LObject's poly was the only reducer,
@@ -836,6 +930,283 @@ mod tests {
             let got = drain_with_cancellation(&mut h);
 
             assert_eq!(got, want_terms);
+        }
+    }
+
+    // ----- Phase 4: reduce_to_normal_form -----
+
+    /// Reference reduction using Poly::sub_mul_term in a loop.
+    /// Equivalent to the heap reducer but algorithmically distinct;
+    /// used as the property-test oracle.
+    fn reference_reduce(
+        ring: &Ring,
+        f: Poly,
+        basis: &[Poly],
+    ) -> Poly {
+        let field = ring.field();
+        let mut current = f;
+        loop {
+            if current.is_zero() {
+                return current;
+            }
+            let lm = current.leading().unwrap().1.clone();
+            let lc = current.lm_coeff();
+
+            // Find the first basis element whose lm divides current's lm.
+            let divisor_idx = basis
+                .iter()
+                .position(|g| !g.is_zero() && g.leading().unwrap().1.divides(&lm, ring));
+            let Some(idx) = divisor_idx else {
+                // Irreducible leader: pop it off, recurse on the tail.
+                // Easier: just emit the head into a survivor and
+                // continue with the tail.
+                let mut survivor_terms: Vec<(Coeff, Monomial)> = Vec::new();
+                let mut working = current;
+                'outer: loop {
+                    if working.is_zero() {
+                        break;
+                    }
+                    let lm2 = working.leading().unwrap().1.clone();
+                    let lc2 = working.lm_coeff();
+                    let new_idx = basis.iter().position(|g| {
+                        !g.is_zero() && g.leading().unwrap().1.divides(&lm2, ring)
+                    });
+                    if let Some(j) = new_idx {
+                        let g = &basis[j];
+                        let g_lm = g.leading().unwrap().1;
+                        let multiplier = lm2.div(g_lm, ring).unwrap();
+                        debug_assert_eq!(g.lm_coeff(), 1, "basis must be monic");
+                        // working -= lc2 * multiplier * g
+                        working = working.sub_mul_term(lc2, &multiplier, g, ring).unwrap();
+                        continue 'outer;
+                    } else {
+                        // Move head to survivor and continue with tail.
+                        survivor_terms.push((lc2, lm2));
+                        working = working.drop_leading();
+                    }
+                }
+                let _ = field;
+                if survivor_terms.is_empty() {
+                    return Poly::zero();
+                }
+                return Poly::from_descending_terms_unchecked(ring, survivor_terms);
+            };
+            // Reducible: subtract.
+            let g = &basis[idx];
+            let g_lm = g.leading().unwrap().1;
+            let multiplier = lm.div(g_lm, ring).unwrap();
+            debug_assert_eq!(g.lm_coeff(), 1, "basis must be monic");
+            current = current.sub_mul_term(lc, &multiplier, g, ring).unwrap();
+        }
+    }
+
+    /// Helper: run the heap reducer to normal form against a basis,
+    /// using the same first-divisor-found policy as the reference.
+    fn heap_reduce<'a>(
+        ring: Arc<Ring>,
+        f: &'a Poly,
+        basis: &'a [Poly],
+        sugars: &[u32],
+    ) -> Poly {
+        let mut h = ReducerHeap::new(Arc::clone(&ring), f.lm_deg());
+        let one = Monomial::one(&ring);
+        h.push_reducer(Reducer {
+            poly: f,
+            multiplier: one,
+            coeff: 1,
+            index: 0,
+            sugar: f.lm_deg(),
+        });
+        let basis_owned: Vec<&Poly> = basis.iter().collect();
+        let (out, _sugar) = h.reduce_to_normal_form(|leader| {
+            for (idx, g) in basis_owned.iter().enumerate() {
+                if g.is_zero() {
+                    continue;
+                }
+                let g_lm = g.leading().unwrap().1;
+                if g_lm.divides(leader, &ring) {
+                    return Some((*g, sugars[idx]));
+                }
+            }
+            None
+        });
+        out
+    }
+
+    #[test]
+    fn no_divisors_returns_input_verbatim() {
+        // If no basis element divides any term of f, normal form == f.
+        let r = mk_ring(3);
+        let f = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[1, 0, 0])),
+                (3, mono(&r, &[0, 1, 0])),
+                (2, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let basis: Vec<Poly> = vec![]; // empty basis
+        let got = heap_reduce(Arc::clone(&r), &f, &basis, &[]);
+        assert_eq!(got, f);
+    }
+
+    #[test]
+    fn single_step_reduction_matches_reference() {
+        // Singular's textbook example, simplified:
+        // Ring k[x, y, z], char 32003.
+        // basis = { g = x }  (lm = x)
+        // f = x + y + z
+        // Reduce: f's leader x is divisible by g's leader x.
+        // multiplier = 1, subtract 1*1*g = x. Result: y + z.
+        // y not divisible by x, z not divisible by x → survivor = y + z.
+        let r = mk_ring(3);
+        let g = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0, 0]))]);
+        let f = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[1, 0, 0])),
+                (1, mono(&r, &[0, 1, 0])),
+                (1, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let basis = vec![g];
+        let got = heap_reduce(Arc::clone(&r), &f, &basis, &[1]);
+        let want = reference_reduce(&r, f.clone(), &basis);
+        assert_eq!(got, want);
+        // Also spot-check the answer: should be y + z.
+        let expected = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[0, 1, 0])),
+                (1, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn multi_step_reduction_matches_reference() {
+        // basis = { g0 = x - y, g1 = y - z }  (after monic norm.)
+        // f = x  →  reduce by g0 (x divides x) →  y  →  reduce by g1 → z
+        // → z not reducible → survivor = z.
+        let r = mk_ring(3);
+        // g0 = x - y. lm = x, lc = 1; tail = -y.
+        let neg_one = r.field().neg(1);
+        let g0 = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[1, 0, 0])),
+                (neg_one, mono(&r, &[0, 1, 0])),
+            ],
+        );
+        // g1 = y - z.
+        let g1 = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[0, 1, 0])),
+                (neg_one, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let f = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0, 0]))]);
+        let basis = vec![g0, g1];
+        let got = heap_reduce(Arc::clone(&r), &f, &basis, &[1, 1]);
+        let want = reference_reduce(&r, f, &basis);
+        assert_eq!(got, want);
+        let expected = Poly::from_terms(&r, vec![(1, mono(&r, &[0, 0, 1]))]);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn reduces_to_zero_when_input_is_in_ideal() {
+        // basis = { g = x - 1 } in k[x] (1 var).
+        // f = x^3 - 1 = (x-1)(x^2 + x + 1) is in the ideal generated by g.
+        // Normal form should be 0.
+        let r = mk_ring(1);
+        let neg_one = r.field().neg(1);
+        let g = Poly::from_terms(
+            &r,
+            vec![(1, mono(&r, &[1])), (neg_one, mono(&r, &[0]))],
+        );
+        let f = Poly::from_terms(
+            &r,
+            vec![(1, mono(&r, &[3])), (neg_one, mono(&r, &[0]))],
+        );
+        let basis = vec![g];
+        let got = heap_reduce(Arc::clone(&r), &f, &basis, &[1]);
+        let want = reference_reduce(&r, f, &basis);
+        assert_eq!(got, want);
+        assert!(got.is_zero(), "expected reduction to zero, got {got:?}");
+    }
+
+    #[test]
+    fn matches_reference_on_random_basis_and_input() {
+        // Strong correctness witness: for several hand-crafted
+        // (basis, input) pairs that mirror the shapes the bba
+        // driver produces, verify the heap reducer's output
+        // exactly matches the reference reducer's output.
+        let r = mk_ring(3);
+        let neg_one = r.field().neg(1);
+
+        type TermSpec = (Coeff, Vec<u32>);
+        type PolySpec = Vec<TermSpec>;
+        type Case = (Vec<PolySpec>, PolySpec);
+
+        let cases: Vec<Case> = vec![
+            // basis = { x - y, y^2 - 1 }, f = x^2
+            (
+                vec![
+                    vec![(1, vec![1, 0, 0]), (neg_one, vec![0, 1, 0])],
+                    vec![(1, vec![0, 2, 0]), (neg_one, vec![0, 0, 0])],
+                ],
+                vec![(1, vec![2, 0, 0])],
+            ),
+            // basis = { x*y - z }, f = x*y*z
+            (
+                vec![
+                    vec![(1, vec![1, 1, 0]), (neg_one, vec![0, 0, 1])],
+                ],
+                vec![(1, vec![1, 1, 1])],
+            ),
+            // Empty basis: f reduces to itself.
+            (vec![], vec![(3, vec![2, 0, 1]), (5, vec![0, 1, 1])]),
+            // basis = { x }, f = x^3 + x*y + 7  →  survivor = 7
+            (
+                vec![vec![(1, vec![1, 0, 0])]],
+                vec![
+                    (1, vec![3, 0, 0]),
+                    (1, vec![1, 1, 0]),
+                    (7, vec![0, 0, 0]),
+                ],
+            ),
+        ];
+
+        for (basis_terms, f_terms) in cases {
+            let basis: Vec<Poly> = basis_terms
+                .into_iter()
+                .map(|terms| {
+                    Poly::from_terms(
+                        &r,
+                        terms
+                            .into_iter()
+                            .map(|(c, e)| (c, mono(&r, &e)))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let sugars: Vec<u32> = basis.iter().map(|p| p.lm_deg()).collect();
+            let f = Poly::from_terms(
+                &r,
+                f_terms
+                    .into_iter()
+                    .map(|(c, e)| (c, mono(&r, &e)))
+                    .collect(),
+            );
+            let got = heap_reduce(Arc::clone(&r), &f, &basis, &sugars);
+            let want = reference_reduce(&r, f.clone(), &basis);
+            assert_eq!(
+                got, want,
+                "heap reducer disagrees with reference for f = {f:?}"
+            );
         }
     }
 
