@@ -1,14 +1,16 @@
 //! Packed-exponent monomials.
 //!
 //! A [`Monomial`] represents `x_0^{e_0} * x_1^{e_1} * ... * x_{n-1}^{e_{n-1}}`
-//! for a ring with `nvars = n`. Exponents are packed 8 bits each into
-//! four `u64` words — 32 bytes total. For degrevlex comparison we use
-//! a layout tuned so that lex-comparing the four `u64` words (most
-//! significant word first) yields degrevlex order; total degree is
-//! cached in a separate `u32` field so the effective degree can exceed
-//! the 255 that a single 8-bit exponent slot allows.
+//! for a ring with `nvars = n`. Exponents are packed into four `u64`
+//! words — 32 bytes total — at 8 bytes per slot, of which the low 7
+//! bits hold the exponent (max value 127) and bit 7 is reserved as an
+//! overflow guard. See `~/rustgb/docs/design-decisions.md` ADR-005 for
+//! the rationale; in short: this matches Singular's `p_LmExpVectorAddIsOk`
+//! divmask trick (a single AND-and-test per word detects per-byte
+//! overflow on the result of a packed-word add) and FLINT's flat
+//! `mpoly_monomial_add`.
 //!
-//! ## Packing (degrevlex, 8 bits/var)
+//! ## Packing (degrevlex, 7 bits/var + guard)
 //!
 //! ```text
 //! word 3 (MSB) : [ byte31 | byte30 | byte29 | ... | byte24 ]
@@ -17,25 +19,46 @@
 //! word 0 (LSB) : [  byte7 |  byte6 | ....................  ]
 //! ```
 //!
-//! Byte 31 holds `min(total_deg, 255)` (the "capped" total degree).
-//! Bytes 30..(31 - nvars) hold the *complemented* exponent of variable
-//! `(31 - byte_index)`'s — i.e. variable `nvars - 1` is stored at byte
-//! `30`, variable `nvars - 2` at byte `29`, etc., down to variable `0`
-//! at byte `31 - nvars`. Bytes below `31 - nvars` are always zero and
-//! do not affect comparison results (they contribute identical bits to
-//! every monomial in the same ring).
+//! Byte 31 holds `min(total_deg, 255)` (the "capped" total degree —
+//! 8 bits, no guard, since this byte is rewritten cleanly after every
+//! mul rather than incremented in place). Bytes 30..(31 - nvars) hold
+//! the **direct** exponent of the variables: variable `nvars - 1` at
+//! byte `30`, variable `nvars - 2` at byte `29`, ..., variable `0` at
+//! byte `31 - nvars`. In each variable byte, bits 0-6 hold the
+//! exponent and bit 7 is the overflow guard (always 0 in a canonical
+//! monomial). Bytes below `31 - nvars` are always zero.
 //!
-//! Why complemented? Lex-compare of u64 words (MSB first) puts the
-//! largest-index variable in the highest byte. Degrevlex's tie-break
-//! rule says: on equal total degree, find the largest index `k` at
-//! which exponents differ; the monomial with *smaller* exponent at
-//! index `k` is greater. Storing `255 - e_k` flips the direction:
-//! larger complement wins lex compare, which is smaller `e_k` wins
-//! degrevlex. That is exactly the rule.
+//! ## Multiplication and overflow detection
 //!
-//! Caveat: total degrees that exceed 255 are stored capped at 255.
-//! [`Monomial::cmp`] falls back on the cached `total_deg: u32` when
-//! either operand's cap is saturated.
+//! `Monomial::mul` is a plain word-wise wrapping-add of the four
+//! packed words (LLVM auto-vectorises this into one `vpaddq`). Because
+//! each variable byte's value is ≤ 127, byte-wise sums fit in 8 bits
+//! and no carry can propagate from one variable byte into the next —
+//! the word-add is byte-isolated for the purposes of correctness.
+//! Overflow is detected by examining the guard bits of the result
+//! word: `(a + b) & ring.overflow_mask` is nonzero iff some byte's
+//! sum exceeded 127 (and either set bit 7 of that byte itself, or
+//! would have carried further but had nowhere to go).
+//!
+//! ## Comparison
+//!
+//! Degrevlex compare is still a lex compare of the four packed words
+//! MSB first, but with each word XOR'd against `ring.cmp_flip_mask`
+//! before the compare. The mask has `0x7F` in each variable byte slot
+//! and `0x00` in the total-degree byte, so:
+//!
+//! * Top byte (total-deg cap) compares directly: larger byte wins,
+//!   matching degrevlex's primary "higher total degree wins".
+//! * Variable bytes: `e ^ 0x7F = 127 - e` (since bit 7 is always 0
+//!   in canonical form). Larger `e` becomes smaller after XOR, so
+//!   smaller exponent wins the byte compare — matching degrevlex's
+//!   tie-break rule "smaller exponent at the largest-index differing
+//!   variable wins".
+//!
+//! Caveat: total degrees that exceed 255 saturate the top byte. When
+//! either operand's cap is saturated, `cmp_degrevlex` falls back on
+//! the cached `total_deg: u32` first, then on the variable bytes
+//! through the same XOR-flipped compare.
 //!
 //! ## Caches
 //!
@@ -45,8 +68,10 @@
 //! * `total_deg`: sum of exponents, not capped.
 //! * `component`: always 0 today. Reserved for future module support.
 //!
-//! Reference: mathicgb `MonoMonoid.hpp`, Singular's `ExpL`, and the
-//! FLINT `mpoly_monomial_*` helpers. Algorithms re-derived, not copied.
+//! Reference: mathicgb `MonoMonoid.hpp`, Singular's `p_ExpVectorAdd` /
+//! `p_LmExpVectorAddIsOk`, and FLINT's `mpoly_monomial_add`.
+//! Algorithms re-derived, not copied. See ADR-005 for the
+//! Singular/FLINT comparison and the rationale for the 7+1 layout.
 
 use crate::ordering::MonoOrder;
 use crate::ring::{BITS_PER_VAR, Ring};
@@ -77,15 +102,16 @@ impl Monomial {
 
     /// Build a monomial from an exponent slice of length `ring.nvars()`.
     ///
-    /// Returns `None` if the length is wrong or any exponent exceeds
-    /// 255 (the 8-bit per-variable limit).
+    /// Returns `None` if the length is wrong, any exponent exceeds
+    /// [`crate::ring::MAX_VAR_EXP`] (= 127, the 7-bit per-variable
+    /// limit), or the total degree exceeds `u32::MAX`.
     pub fn from_exponents(ring: &Ring, exps: &[u32]) -> Option<Self> {
         let n = ring.nvars() as usize;
         if exps.len() != n {
             return None;
         }
         for &e in exps {
-            if e > u8::MAX as u32 {
+            if e > crate::ring::MAX_VAR_EXP {
                 return None;
             }
         }
@@ -99,16 +125,16 @@ impl Monomial {
             if e > 0 {
                 sev |= 1u64 << (i % 64);
             }
-            // Always write the complemented byte, even when the
-            // exponent is zero (then complement == 255): leaving a
-            // variable byte at 0 would misread as exponent 255.
+            // Direct storage: the byte is the exponent itself, in
+            // bits 0-6. Bit 7 (the overflow guard) stays clear in
+            // canonical form. A zero exponent leaves the byte at 0,
+            // which is the natural reading.
             let byte_idx = byte_index_for_var(n, i);
             let (word, shift) = split_byte_index(byte_idx);
-            let complement = (u8::MAX as u32 - e) as u64;
-            packed[word] |= complement << shift;
+            packed[word] |= (e as u64) << shift;
         }
 
-        // Top byte: capped total degree.
+        // Top byte: capped total degree (full 8 bits, no guard).
         let capped = total.min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] |= capped << 56;
 
@@ -162,8 +188,9 @@ impl Monomial {
     fn exponent_raw(&self, nvars: usize, i: usize) -> u32 {
         let byte_idx = byte_index_for_var(nvars, i);
         let (word, shift) = split_byte_index(byte_idx);
-        let complement = ((self.packed[word] >> shift) & 0xFF) as u32;
-        u8::MAX as u32 - complement
+        // Direct storage: bits 0-6 hold the exponent; bit 7 is the
+        // (always-zero in canonical form) overflow guard, masked off.
+        ((self.packed[word] >> shift) & 0x7F) as u32
     }
 
     /// Copy the exponent vector into a `Vec<u32>`.
@@ -175,56 +202,50 @@ impl Monomial {
     // ----- Arithmetic -----
 
     /// Multiply two monomials. Returns `None` if any resulting exponent
-    /// exceeds 255.
+    /// exceeds [`crate::ring::MAX_VAR_EXP`] (= 127), or the resulting
+    /// total degree exceeds `u32::MAX`.
     ///
-    /// Fast path: operate directly on the packed u64 words, skipping
-    /// the unpack-to-`Vec<u32>`-then-repack round trip. Each variable
-    /// byte stores `255 - e`; the product byte wants
-    /// `c_new = 255 - (e_a + e_b) = c_a + c_b - 255`. Overflow
-    /// (`e_a + e_b > 255`) is equivalent to `c_a + c_b < 255`.
+    /// Implementation per ADR-005: plain word-wise wrapping-add of the
+    /// four packed u64 words (LLVM auto-vectorises this into a single
+    /// `vpaddq`), followed by a divmask-style overflow check that
+    /// inspects the guard bit of each variable byte. The top byte
+    /// (total-degree cap) is rewritten cleanly from the cached u32
+    /// total rather than relying on the wrap-add result.
     pub fn mul(&self, other: &Self, ring: &Ring) -> Option<Self> {
-        let n = ring.nvars() as usize;
-        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
-        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
-        let mut packed = [0u64; WORDS_PER_MONO];
-        #[allow(clippy::needless_range_loop)]
-        for word in 0..WORDS_PER_MONO {
-            let word_low_byte = word * 8;
-            let word_high_byte = word_low_byte + 7;
-            let lo = first_var_byte.max(word_low_byte);
-            let hi = last_var_byte.min(word_high_byte);
-            if lo > hi {
-                continue;
-            }
-            let low_byte = (lo - word_low_byte) as u32;
-            let high_byte = (hi - word_low_byte) as u32;
-            let a = self.packed[word];
-            let b = other.packed[word];
-            let mut new_word: u64 = 0;
-            for b_idx in low_byte..=high_byte {
-                let shift = b_idx * 8;
-                let ca = (a >> shift) & 0xFF;
-                let cb = (b >> shift) & 0xFF;
-                // ca = 255 - e_a, cb = 255 - e_b. Overflow iff
-                // e_a + e_b > 255 iff ca + cb < 255.
-                if ca + cb < 0xFF {
-                    return None;
-                }
-                let cnew = ca + cb - 0xFF;
-                new_word |= cnew << shift;
-            }
-            packed[word] |= new_word;
+        // Word-wise add. Auto-vectorises; overflow within a variable
+        // byte sets the guard bit (bit 7) of that byte, no carry can
+        // propagate to the neighbouring byte because both inputs are
+        // ≤ 127 in their low 7 bits and bit 7 is always 0 in canonical
+        // form, so each byte sum is ≤ 254 — always fits in 8 bits.
+        let mut packed: [u64; WORDS_PER_MONO] =
+            std::array::from_fn(|word| self.packed[word].wrapping_add(other.packed[word]));
+
+        // Divmask overflow check: any guard bit set in the result
+        // signals per-byte exponent > 127. The mask zeroes the
+        // total-degree byte, so a wrapped top byte does not trigger
+        // a false positive here.
+        let ovf_mask = ring.overflow_mask();
+        if packed
+            .iter()
+            .zip(ovf_mask.iter())
+            .any(|(p, m)| (p & m) != 0)
+        {
+            return None;
         }
-        // Total degree update (uncapped).
+
+        // Total degree (uncapped, exact via the cached u32 sum).
         let total = self.total_deg as u64 + other.total_deg as u64;
         if total > u32::MAX as u64 {
             return None;
         }
+        // Rewrite the top byte: clear the wrap-add result and write
+        // the actual cap.
         let capped = total.min(u8::MAX as u64);
-        packed[WORDS_PER_MONO - 1] |= capped << 56;
+        packed[WORDS_PER_MONO - 1] = (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
+
         // SEV update: e_new > 0 iff e_a > 0 OR e_b > 0; so OR the sevs.
         let sev = self.sev | other.sev;
-        let _ = ring;
+
         Some(Self {
             packed,
             sev,
@@ -235,93 +256,53 @@ impl Monomial {
 
     /// `true` iff `self | other` (each `e_i(self) ≤ e_i(other)`).
     ///
-    /// Fast path: in packed complement-byte form, `e_a ≤ e_b` ↔
-    /// `(255 - e_a) ≥ (255 - e_b)` ↔ `c_a ≥ c_b`. We compute this
-    /// per-byte directly on the packed u64 words.
+    /// With direct exponent storage (ADR-005), this is a per-byte
+    /// `≤` test. Implemented byte-by-byte over the variable bytes;
+    /// could be SIMD'd later if it shows up in a profile.
     pub fn divides(&self, other: &Self, ring: &Ring) -> bool {
         let n = ring.nvars() as usize;
         let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
         let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
-        #[allow(clippy::needless_range_loop)]
-        for word in 0..WORDS_PER_MONO {
-            let word_low_byte = word * 8;
-            let word_high_byte = word_low_byte + 7;
-            let lo = first_var_byte.max(word_low_byte);
-            let hi = last_var_byte.min(word_high_byte);
-            if lo > hi {
-                continue;
-            }
-            let low_byte = (lo - word_low_byte) as u32;
-            let high_byte = (hi - word_low_byte) as u32;
-            let a = self.packed[word];
-            let b = other.packed[word];
-            for b_idx in low_byte..=high_byte {
-                let shift = b_idx * 8;
-                let ca = (a >> shift) & 0xFF;
-                let cb = (b >> shift) & 0xFF;
-                // self | other iff e_self[i] ≤ e_other[i] iff
-                // (255 - e_self) ≥ (255 - e_other) iff c_self ≥ c_other.
-                if ca < cb {
-                    return false;
-                }
+        for byte_idx in first_var_byte..=last_var_byte {
+            let (word, shift) = split_byte_index(byte_idx);
+            // Mask to 0x7F to ignore the (always-zero in canonical
+            // form) guard bit. Direct storage: byte value == exponent.
+            let ea = (self.packed[word] >> shift) & 0x7F;
+            let eb = (other.packed[word] >> shift) & 0x7F;
+            if ea > eb {
+                return false;
             }
         }
-        let _ = ring; // retained for API stability
         true
     }
 
     /// Divide. Precondition `other.divides(self)`; returns `None`
     /// otherwise.
     ///
-    /// Fast path: operate on packed complement-bytes directly.
-    /// `e_new = e_self - e_other`, so complement-byte
-    /// `c_new = 255 - (e_self - e_other) = (255 - e_self) + e_other
-    ///        = c_self + (255 - c_other)
-    ///        = c_self + 0xFF - c_other`.
-    ///
-    /// `other | self` requires `e_other ≤ e_self`, which in complement
-    /// form is `c_other ≥ c_self`. So we reject when `c_other < c_self`
-    /// (that means `e_other > e_self`).
+    /// With direct storage, the per-byte op is `e_new = e_self - e_other`,
+    /// rejecting when `e_other > e_self`. Per-byte loop maintained for
+    /// the same reason as `divides`.
     pub fn div(&self, other: &Self, ring: &Ring) -> Option<Self> {
         let n = ring.nvars() as usize;
-        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
-        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
+        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n;
+        let last_var_byte = WORDS_PER_MONO * 8 - 2;
         let mut packed = [0u64; WORDS_PER_MONO];
         let mut sev: u64 = 0;
-        #[allow(clippy::needless_range_loop)]
-        for word in 0..WORDS_PER_MONO {
-            let word_low_byte = word * 8;
-            let word_high_byte = word_low_byte + 7;
-            let lo = first_var_byte.max(word_low_byte);
-            let hi = last_var_byte.min(word_high_byte);
-            if lo > hi {
-                continue;
+        for byte_idx in first_var_byte..=last_var_byte {
+            let (word, shift) = split_byte_index(byte_idx);
+            let ea = (self.packed[word] >> shift) & 0x7F;
+            let eb = (other.packed[word] >> shift) & 0x7F;
+            if eb > ea {
+                return None;
             }
-            let low_byte = (lo - word_low_byte) as u32;
-            let high_byte = (hi - word_low_byte) as u32;
-            let a = self.packed[word];
-            let b = other.packed[word];
-            let mut new_word: u64 = 0;
-            for b_idx in low_byte..=high_byte {
-                let shift = b_idx * 8;
-                let ca = (a >> shift) & 0xFF;
-                let cb = (b >> shift) & 0xFF;
-                // e_other > e_self (doesn't divide) iff c_other < c_self.
-                if cb < ca {
-                    return None;
-                }
-                let cnew = ca + 0xFF - cb;
-                // c_new = 255 - e_new; if e_new > 0, c_new < 255.
-                if cnew < 0xFF {
-                    // Recover variable index from byte position:
-                    // var i has byte index i + 31 - n, so i = byte - 31 + n.
-                    let abs_byte = word_low_byte + b_idx as usize;
-                    let var_i = abs_byte + n - (WORDS_PER_MONO * 8 - 1);
-                    sev |= 1u64 << (var_i % 64);
-                }
-                new_word |= cnew << shift;
+            let new_e = ea - eb;
+            packed[word] |= new_e << shift;
+            if new_e > 0 {
+                // Recover variable index from byte position:
+                // var i has byte index `i + 31 - n`, so `i = byte - 31 + n`.
+                let var_i = byte_idx + n - (WORDS_PER_MONO * 8 - 1);
+                sev |= 1u64 << (var_i % 64);
             }
-            packed[word] |= new_word;
         }
         // Total degree: self.total_deg - other.total_deg.
         if other.total_deg > self.total_deg {
@@ -330,7 +311,6 @@ impl Monomial {
         let total = self.total_deg - other.total_deg;
         let capped = (total as u64).min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] |= capped << 56;
-        let _ = ring;
         Some(Self {
             packed,
             sev,
@@ -346,8 +326,8 @@ impl Monomial {
         for (i, slot) in exps.iter_mut().enumerate() {
             *slot = self.exponent_raw(n, i).max(other.exponent_raw(n, i));
         }
-        // Each per-var exponent stays ≤ 255; total is ≤ 2·255·n, fits u32.
-        Self::from_exponents(ring, &exps).expect("lcm per-var exponents ≤ 255")
+        // Each per-var exponent stays ≤ MAX_VAR_EXP (127); total fits u32.
+        Self::from_exponents(ring, &exps).expect("lcm per-var exponents ≤ MAX_VAR_EXP")
     }
 
     // ----- Ordering -----
@@ -355,22 +335,34 @@ impl Monomial {
     /// Compare under the ring's ordering.
     pub fn cmp(&self, other: &Self, ring: &Ring) -> Ordering {
         match ring.ordering() {
-            MonoOrder::DegRevLex => self.cmp_degrevlex(other),
+            MonoOrder::DegRevLex => self.cmp_degrevlex(other, ring),
         }
     }
 
     /// Degrevlex comparison.
     ///
-    /// Fast path: lex-compare the four packed words MSB first. The
-    /// layout guarantees this yields the degrevlex order *provided*
-    /// neither top-byte total-degree cap is saturated (i.e. both
-    /// total degrees are ≤ 255). When either operand saturates, the
-    /// top byte is uninformative and we fall back on the `total_deg`
-    /// cache, then on the remaining bytes below the top.
-    fn cmp_degrevlex(&self, other: &Self) -> Ordering {
+    /// With direct exponent storage (ADR-005) the lex order of the raw
+    /// packed words would compare variable bytes the wrong way (larger
+    /// exponent = greater), so we XOR each word against
+    /// `ring.cmp_flip_mask` first. The mask is `0x7F` in each variable
+    /// byte slot and `0x00` in the total-degree byte and unused bytes,
+    /// so:
+    /// * Top byte (capped total-deg) compares directly: larger byte
+    ///   wins (degrevlex's primary "higher total degree" rule).
+    /// * Variable bytes after XOR: `127 - e`. Smaller `e` becomes
+    ///   greater after the flip, matching degrevlex's tie-break
+    ///   "smaller exponent at the largest-index differing variable
+    ///   wins".
+    ///
+    /// Saturation fallback: when either operand's capped top byte is
+    /// 255, the cap byte is uninformative; we fall back on the cached
+    /// `total_deg: u32` first, then on the variable bytes through the
+    /// same XOR-flipped compare.
+    fn cmp_degrevlex(&self, other: &Self, ring: &Ring) -> Ordering {
         let a_cap = (self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
         let b_cap = (other.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
         let saturated = a_cap == u8::MAX as u64 || b_cap == u8::MAX as u64;
+        let mask = ring.cmp_flip_mask();
 
         if saturated {
             match self.total_deg.cmp(&other.total_deg) {
@@ -378,22 +370,29 @@ impl Monomial {
                 ord => return ord,
             }
             // Equal (uncapped) total degrees: compare the lower three
-            // words, then the low 56 bits of the top word.
+            // words via the flip mask, then the low 56 bits of the top
+            // word (also via the flip mask, which has the top byte
+            // zeroed).
             for i in (0..WORDS_PER_MONO - 1).rev() {
-                match self.packed[i].cmp(&other.packed[i]) {
+                let av = self.packed[i] ^ mask[i];
+                let bv = other.packed[i] ^ mask[i];
+                match av.cmp(&bv) {
                     Ordering::Equal => {}
                     ord => return ord,
                 }
             }
-            let mask = (1u64 << 56) - 1;
-            let a_lo = self.packed[WORDS_PER_MONO - 1] & mask;
-            let b_lo = other.packed[WORDS_PER_MONO - 1] & mask;
-            return a_lo.cmp(&b_lo);
+            let lo_mask = (1u64 << 56) - 1;
+            let av_top = (self.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
+            let bv_top = (other.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
+            return av_top.cmp(&bv_top);
         }
 
-        // Fast path: lex compare of all four words, MSB first.
+        // Fast path: lex compare of all four words via the flip mask,
+        // MSB first.
         for i in (0..WORDS_PER_MONO).rev() {
-            match self.packed[i].cmp(&other.packed[i]) {
+            let av = self.packed[i] ^ mask[i];
+            let bv = other.packed[i] ^ mask[i];
+            match av.cmp(&bv) {
                 Ordering::Equal => {}
                 ord => return ord,
             }
@@ -412,11 +411,26 @@ impl Monomial {
 
         for i in 0..n {
             let e = self.exponent_raw(n, i);
-            assert!(e <= u8::MAX as u32, "exponent {e} at var {i} > 255");
+            assert!(
+                e <= crate::ring::MAX_VAR_EXP,
+                "exponent {e} at var {i} exceeds 7-bit limit ({})",
+                crate::ring::MAX_VAR_EXP
+            );
             total += e as u64;
             if e > 0 {
                 sev |= 1u64 << (i % 64);
             }
+        }
+
+        // Guard bits must all be zero in canonical form.
+        for word in 0..WORDS_PER_MONO {
+            assert_eq!(
+                self.packed[word] & ring.overflow_mask()[word],
+                0,
+                "overflow guard bit set in word {word} (packed = {:#018x}, mask = {:#018x})",
+                self.packed[word],
+                ring.overflow_mask()[word]
+            );
         }
 
         assert!(total <= u32::MAX as u64, "total degree overflows u32");
@@ -510,6 +524,64 @@ mod tests {
     }
 
     #[test]
+    fn from_exponents_rejects_above_max_var_exp() {
+        // ADR-005: per-variable exponents are 7-bit, max 127.
+        let r = mk_ring(3);
+        assert!(Monomial::from_exponents(&r, &[127, 0, 0]).is_some());
+        assert!(Monomial::from_exponents(&r, &[128, 0, 0]).is_none());
+        assert!(Monomial::from_exponents(&r, &[0, 200, 0]).is_none());
+        assert!(Monomial::from_exponents(&r, &[0, 0, 255]).is_none());
+    }
+
+    #[test]
+    fn mul_overflow_detected_via_guard_bit() {
+        // ADR-005: overflow on a single variable is caught by the
+        // divmask check on the result of the packed-word add.
+        let r = mk_ring(4);
+        // 100 + 50 = 150 > 127: overflow on var 1.
+        let a = Monomial::from_exponents(&r, &[1, 100, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[1, 50, 0, 0]).unwrap();
+        assert!(a.mul(&b, &r).is_none(), "150 should overflow 7-bit slot");
+
+        // 64 + 64 = 128: smallest possible overflow (sets the guard
+        // bit exactly).
+        let a = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
+        assert!(a.mul(&b, &r).is_none(), "exactly 128 should overflow");
+
+        // 63 + 64 = 127: just under the limit, must succeed.
+        let a = Monomial::from_exponents(&r, &[63, 0, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
+        let p = a.mul(&b, &r).expect("127 should fit");
+        p.assert_canonical(&r);
+        assert_eq!(p.exponent(&r, 0).unwrap(), 127);
+    }
+
+    #[test]
+    fn mul_no_carry_propagation_between_neighbouring_bytes() {
+        // The whole point of the guard bit (and the ≤127 invariant)
+        // is that a per-byte sum can never exceed 254, so it cannot
+        // carry into the next byte and corrupt a neighbour. Verify
+        // that two non-overflowing sums in adjacent variables both
+        // come out correctly.
+        let r = mk_ring(5);
+        let a = Monomial::from_exponents(&r, &[60, 70, 80, 90, 100]).unwrap();
+        let b = Monomial::from_exponents(&r, &[60, 50, 40, 30, 20]).unwrap();
+        // Per-var sums: 120, 120, 120, 120, 120 — all ≤127, no
+        // overflow on any byte.
+        let p = a.mul(&b, &r).expect("all per-var sums = 120 ≤ 127");
+        p.assert_canonical(&r);
+        for i in 0..5 {
+            assert_eq!(
+                p.exponent(&r, i).unwrap(),
+                120,
+                "exponent of var {i} corrupted by neighbour byte"
+            );
+        }
+        assert_eq!(p.total_deg(), 600);
+    }
+
+    #[test]
     fn sev_matches_nonzero_vars() {
         let r = mk_ring(10);
         let m = Monomial::from_exponents(&r, &[0, 2, 0, 0, 5, 0, 0, 1, 0, 0]).unwrap();
@@ -582,13 +654,15 @@ mod tests {
 
     #[test]
     fn large_total_deg_cap_still_orders_correctly() {
-        let r = mk_ring(2);
-        // total_deg = 255 + 200 = 455 > 255; top byte saturates.
-        let a = Monomial::from_exponents(&r, &[255, 200]).unwrap();
-        let b = Monomial::from_exponents(&r, &[200, 255]).unwrap();
-        // Total degrees are equal. Largest index with differing
-        // exponent is 1: a_1 = 200, b_1 = 255. Smaller exponent wins
-        // degrevlex, so a > b.
+        // With 7-bit-per-var packing (ADR-005), per-variable max is
+        // 127. Use nvars = 3 so total_deg can still saturate the
+        // 8-bit top-byte cap (>255): 127 + 127 + 50 = 304.
+        let r = mk_ring(3);
+        let a = Monomial::from_exponents(&r, &[127, 50, 127]).unwrap();
+        let b = Monomial::from_exponents(&r, &[50, 127, 127]).unwrap();
+        // Total degrees are equal (304). Largest index with differing
+        // exponent is 1: a_1 = 50, b_1 = 127. Smaller exponent at
+        // largest differing index wins degrevlex, so a > b.
         assert_eq!(a.cmp(&b, &r), Ordering::Greater);
     }
 

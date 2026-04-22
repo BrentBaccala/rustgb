@@ -339,9 +339,10 @@ same mental model. It diverges from FLINT's explicit-arg style.
 
 ## ADR-005: Monomial representation — direct exponents, 7 bits/var, divmask overflow guard
 
-**Status:** Accepted (proposed; supersedes the original complemented-storage
-representation that the initial commit shipped with).
-**Date:** 2026-04-21
+**Status:** Accepted and implemented (supersedes the original
+complemented-storage representation that the initial commit shipped
+with). Landed alongside this ADR's commit in `~/rustgb`.
+**Date:** 2026-04-21 (decision); 2026-04-22 (implementation)
 
 ### Context
 
@@ -489,7 +490,7 @@ Replace the current Monomial representation with:
 
 ### Consequences
 
-**Performance:** Profile v2 hotspot reshuffle prediction:
+**Performance:** Profile v2 hotspot reshuffle prediction was:
 
 | Function | v2 (current) | After ADR-005 | Notes |
 |---|---|---|---|
@@ -497,9 +498,17 @@ Replace the current Monomial representation with:
 | `Monomial::cmp` (under merge) | ~6 % | ~9 % | XOR per word added |
 | Net effect on wall | — | **~ −22 %** | residue stays the same shape |
 
-Expected wall on staging-5101449: ~3:00 (was 4:02). After this
-fix the new top function will be `poly::merge` (~13.7 % today,
-likely the new plurality-share hotspot).
+**Measured (post-implementation, 2026-04-22):**
+
+| Test | Pre-ADR-005 wall | Post-ADR-005 wall | Δ |
+|---|---|---|---|
+| staging-5101449 | 255 s | **204 s** | −20 % (matches prediction) |
+| staging-5104053 | 311 s | **262 s** | −16 % |
+| staging-5106746 | 484 s | **348 s** | −28 % |
+
+All three staging tests pass with exact fixture matches. A v3 perf
+profile (next ADR work) should confirm the predicted hotspot shift
+to `poly::merge` and `KBucket::leading`.
 
 **Safety:** strictly stronger than the original "trust silently
 in release" sketch. The divmask check catches every overflow at
