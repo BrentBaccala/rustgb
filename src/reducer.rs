@@ -260,6 +260,131 @@ impl<'a> ReducerHeap<'a> {
     pub fn pop_max(&mut self) -> Option<HeapNode> {
         self.heap.pop()
     }
+
+    // ----- Reducer management + cancellation pop (phase 3) -----
+
+    /// Add a reducer to the slab and queue its leading term onto
+    /// the heap. Returns the slab index of the new reducer.
+    ///
+    /// If `reducer.poly` is the zero polynomial (no terms past
+    /// `index`), the reducer is added to the slab but no heap node
+    /// is pushed — the reducer is effectively dead on arrival.
+    /// This is consistent with FLINT's "at most one heap node per
+    /// reducer" invariant: an exhausted reducer has zero in flight.
+    ///
+    /// Updates the running sugar to `max(self.sugar, reducer.sugar)`.
+    pub fn push_reducer(&mut self, reducer: Reducer<'a>) -> usize {
+        let idx = self.reducers.len();
+        self.sugar = self.sugar.max(reducer.sugar);
+        self.reducers.push(reducer);
+        // Queue the leading term if non-empty.
+        self.push_current_term(idx);
+        idx
+    }
+
+    /// Compute the cmp_key of the term currently at the front of
+    /// `reducers[reducer_idx]` (i.e. `multiplier * poly.terms[index]`
+    /// XOR'd against the ring's cmp_flip_mask) and push a HeapNode
+    /// for it. No-op if the reducer is exhausted (`index >= poly.len`).
+    ///
+    /// In the unusual case where the multiplier × term product
+    /// would overflow the 7-bit-per-variable budget (ADR-005),
+    /// the term is dropped and the reducer is effectively
+    /// truncated. This matches the existing `KBucket::minus_m_mult_p`
+    /// silent-noop-on-overflow semantics; see ADR-005's deferred
+    /// "panic on overflow" enhancement.
+    fn push_current_term(&mut self, reducer_idx: usize) {
+        let r = &self.reducers[reducer_idx];
+        if r.index >= r.poly.len() {
+            return;
+        }
+        let Some(term_mono) = r.multiplier.mul(&r.poly.terms()[r.index], &self.ring) else {
+            // Overflow: drop this term (and effectively truncate
+            // the reducer at this index). Caller is responsible
+            // for ensuring this doesn't happen for correctness;
+            // see ADR-005.
+            debug_assert!(
+                false,
+                "monomial product overflowed during heap reduction"
+            );
+            return;
+        };
+        let mask = self.ring.cmp_flip_mask();
+        let cmp_key = std::array::from_fn(|i| term_mono.packed()[i] ^ mask[i]);
+        self.heap.push(HeapNode {
+            cmp_key,
+            reducer_idx,
+        });
+    }
+
+    /// Advance the named reducer past its current term and queue
+    /// the next term onto the heap (if any).
+    fn advance_reducer(&mut self, reducer_idx: usize) {
+        self.reducers[reducer_idx].index += 1;
+        self.push_current_term(reducer_idx);
+    }
+
+    /// Pop the next non-cancelled (coefficient, monomial) leader.
+    /// Returns `None` when the heap is empty (the reduction has
+    /// terminated; if the LObject's poly was the only reducer,
+    /// then we've drained it; if reducers were added along the
+    /// way and the chain cancelled to zero everywhere, the LObject
+    /// reduced to zero).
+    ///
+    /// Algorithm: pop the max; if the next pops share the same
+    /// `cmp_key`, they're contributing to the same monomial and
+    /// their coefficients sum. Each contributing reducer's index
+    /// is advanced past its emitted term. If the resulting sum is
+    /// zero, the chain cancelled and we recurse on the next leader;
+    /// if non-zero, that's the leader the caller wants.
+    pub fn pop_with_cancellation(&mut self) -> Option<(Coeff, Monomial)> {
+        loop {
+            let max_node = self.heap.pop()?;
+            // Collect the contributing reducer indices and compute
+            // the monomial value (the same for all contributors,
+            // by the same-cmp_key invariant).
+            let chain_key = max_node.cmp_key;
+            let max_idx = max_node.reducer_idx;
+            let r = &self.reducers[max_idx];
+            // Recover the actual monomial. Could rebuild from the
+            // multiplier and source term, but the cmp_key is the
+            // XOR'd packed bytes, so unpacking gets us back. Easier
+            // to just recompute from the reducer state.
+            let mono = r
+                .multiplier
+                .mul(&r.poly.terms()[r.index], &self.ring)
+                .expect("just pushed; overflow already checked");
+            let f = self.ring.field();
+            let mut total_coeff = f.mul(r.coeff, r.poly.coeffs()[r.index]);
+
+            // Advance the max contributor.
+            let mut to_advance: Vec<usize> = Vec::with_capacity(2);
+            to_advance.push(max_idx);
+
+            // Drain any equal-cmp_key entries.
+            while let Some(next) = self.heap.peek() {
+                if next.cmp_key != chain_key {
+                    break;
+                }
+                let next_node = self.heap.pop().unwrap();
+                let nr = &self.reducers[next_node.reducer_idx];
+                let next_coeff = f.mul(nr.coeff, nr.poly.coeffs()[nr.index]);
+                total_coeff = f.add(total_coeff, next_coeff);
+                to_advance.push(next_node.reducer_idx);
+            }
+
+            // Advance every contributor past its emitted term.
+            for &idx in &to_advance {
+                self.advance_reducer(idx);
+            }
+
+            if total_coeff != 0 {
+                return Some((total_coeff, mono));
+            }
+            // total_coeff == 0: complete cancellation; loop and
+            // try the next leader.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +621,249 @@ mod tests {
         let mut want_keys: Vec<[u64; 4]> = nodes.iter().map(|n| n.cmp_key).collect();
         want_keys.sort();
         assert_eq!(got_keys, want_keys);
+    }
+
+    // ----- Phase 3: push_reducer + pop_with_cancellation -----
+
+    use crate::monomial::Monomial;
+    use crate::poly::Poly;
+
+    fn mono(r: &Ring, e: &[u32]) -> Monomial {
+        Monomial::from_exponents(r, e).unwrap()
+    }
+
+    /// Helper: collect the full output of pop_with_cancellation
+    /// into a Vec until the heap drains. Used as a "drive the
+    /// reducer to completion" pattern in tests.
+    fn drain_with_cancellation<'a>(
+        h: &mut ReducerHeap<'a>,
+    ) -> Vec<(Coeff, Monomial)> {
+        let mut out = Vec::new();
+        while let Some(pair) = h.pop_with_cancellation() {
+            out.push(pair);
+        }
+        out
+    }
+
+    #[test]
+    fn single_reducer_no_cancellation_emits_all_terms() {
+        // Push one reducer (multiplier=1, coeff=1) over a 3-term
+        // poly. Drain pop_with_cancellation; should emit each term
+        // in descending order with coeff matching the source.
+        let r = mk_ring(3);
+        let one = Monomial::one(&r);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[3, 0, 0])),  // x_0^3
+                (2, mono(&r, &[1, 1, 0])),  // x_0 x_1
+                (1, mono(&r, &[0, 0, 2])),  // x_2^2
+            ],
+        );
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one.clone(),
+            coeff: 1,
+            index: 0,
+            sugar: 3,
+        });
+        assert_eq!(h.sugar(), 3);
+
+        let out = drain_with_cancellation(&mut h);
+        assert_eq!(out.len(), 3);
+        // Terms emerge in descending degrevlex order — same as the
+        // source polynomial's canonical order.
+        assert_eq!(out[0].0, 5);
+        assert_eq!(out[0].1, mono(&r, &[3, 0, 0]));
+        assert_eq!(out[1].0, 2);
+        assert_eq!(out[1].1, mono(&r, &[1, 1, 0]));
+        assert_eq!(out[2].0, 1);
+        assert_eq!(out[2].1, mono(&r, &[0, 0, 2]));
+    }
+
+    #[test]
+    fn two_reducers_complete_cancellation_drains_to_zero() {
+        // Two copies of the same poly with opposite-sign coeffs:
+        // 1 * p + (-1) * p should cancel everywhere.
+        let r = mk_ring(3);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[2, 0, 0])),
+                (3, mono(&r, &[0, 1, 0])),
+            ],
+        );
+        let one = Monomial::one(&r);
+        let f = r.field();
+        let neg_one = f.neg(1); // = p - 1 in Z/p
+
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one.clone(),
+            coeff: 1,
+            index: 0,
+            sugar: 2,
+        });
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one,
+            coeff: neg_one,
+            index: 0,
+            sugar: 2,
+        });
+
+        // Every leader cancels; pop_with_cancellation should
+        // return None right away after eating all the cancelled
+        // chains.
+        let out = drain_with_cancellation(&mut h);
+        assert!(out.is_empty(), "everything should cancel; got {out:?}");
+        assert!(h.heap_is_empty());
+    }
+
+    #[test]
+    fn partial_cancellation_yields_remainder() {
+        // p = 5*x^2 + 3*y, q = 2*x^2 + 7*z.
+        // 1 * p + 1 * q  →  (5+2)*x^2 + 3*y + 7*z
+        // (assumed degrevlex: x^2 > y > z by degree, then by var index)
+        let r = mk_ring(3);
+        let p = Poly::from_terms(
+            &r,
+            vec![(5, mono(&r, &[2, 0, 0])), (3, mono(&r, &[0, 1, 0]))],
+        );
+        let q = Poly::from_terms(
+            &r,
+            vec![(2, mono(&r, &[2, 0, 0])), (7, mono(&r, &[0, 0, 1]))],
+        );
+        let one = Monomial::one(&r);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one.clone(),
+            coeff: 1,
+            index: 0,
+            sugar: 2,
+        });
+        h.push_reducer(Reducer {
+            poly: &q,
+            multiplier: one,
+            coeff: 1,
+            index: 0,
+            sugar: 2,
+        });
+        let out = drain_with_cancellation(&mut h);
+        // Three distinct monomials in the result: x^2 with combined
+        // coeff 7, then either y or z next (degrevlex compares by
+        // total degree first → both y and z are degree 1; then
+        // tie-break by largest-index differing variable: z wins
+        // tie-break, so y < z is wrong in degrevlex... let me verify).
+        //
+        // Degrevlex tie-break for two degree-1 monomials y vs z:
+        // largest index where exps differ: z's index (2) > y's (1).
+        // At that index: y has 0, z has 1. Smaller wins → y > z.
+        // So order is: x^2 > y > z.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, 7);
+        assert_eq!(out[0].1, mono(&r, &[2, 0, 0]));
+        assert_eq!(out[1].0, 3);
+        assert_eq!(out[1].1, mono(&r, &[0, 1, 0]));
+        assert_eq!(out[2].0, 7);
+        assert_eq!(out[2].1, mono(&r, &[0, 0, 1]));
+    }
+
+    #[test]
+    fn matches_poly_add_on_random_pairs() {
+        // Property: pushing two reducers (1*p, 1*q) into the heap
+        // and draining via pop_with_cancellation must yield the
+        // same term sequence as p.add(q) does via poly::merge.
+        // Verifies the heap reducer's output agrees with the
+        // existing geobucket-equivalent (Poly::add) on simple
+        // sum cases.
+        let r = mk_ring(4);
+        let pairs = vec![
+            (
+                vec![(3u32, vec![2, 1, 0, 0]), (5, vec![1, 0, 1, 0])],
+                vec![(2, vec![2, 1, 0, 0]), (4, vec![0, 1, 1, 0])],
+            ),
+            (
+                vec![(7, vec![3, 0, 0, 0]), (1, vec![0, 0, 0, 1])],
+                vec![(2, vec![1, 2, 0, 0])],
+            ),
+            (
+                vec![],
+                vec![(11, vec![1, 1, 1, 0])],
+            ),
+        ];
+        for (p_terms, q_terms) in pairs {
+            let p = Poly::from_terms(
+                &r,
+                p_terms
+                    .into_iter()
+                    .map(|(c, e)| (c, mono(&r, &e)))
+                    .collect(),
+            );
+            let q = Poly::from_terms(
+                &r,
+                q_terms
+                    .into_iter()
+                    .map(|(c, e)| (c, mono(&r, &e)))
+                    .collect(),
+            );
+
+            // Reference: Poly::add via the geobucket-friendly merge.
+            let want = p.add(&q, &r);
+            let want_terms: Vec<(Coeff, Monomial)> =
+                want.iter().map(|(c, m)| (c, m.clone())).collect();
+
+            // Heap reducer: 1*p + 1*q.
+            let one = Monomial::one(&r);
+            let mut h = ReducerHeap::new(Arc::clone(&r), 0);
+            h.push_reducer(Reducer {
+                poly: &p,
+                multiplier: one.clone(),
+                coeff: 1,
+                index: 0,
+                sugar: 0,
+            });
+            h.push_reducer(Reducer {
+                poly: &q,
+                multiplier: one,
+                coeff: 1,
+                index: 0,
+                sugar: 0,
+            });
+            let got = drain_with_cancellation(&mut h);
+
+            assert_eq!(got, want_terms);
+        }
+    }
+
+    #[test]
+    fn sugar_is_max_over_pushed_reducers() {
+        let r = mk_ring(2);
+        let p = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0]))]);
+        let one = Monomial::one(&r);
+        let mut h = ReducerHeap::new(Arc::clone(&r), 7);
+        assert_eq!(h.sugar(), 7);
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one.clone(),
+            coeff: 1,
+            index: 0,
+            sugar: 3,
+        });
+        // 7 still wins over 3.
+        assert_eq!(h.sugar(), 7);
+        h.push_reducer(Reducer {
+            poly: &p,
+            multiplier: one,
+            coeff: 1,
+            index: 0,
+            sugar: 12,
+        });
+        // 12 takes over.
+        assert_eq!(h.sugar(), 12);
     }
 
     #[test]

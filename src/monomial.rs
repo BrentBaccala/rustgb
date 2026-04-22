@@ -176,6 +176,18 @@ impl Monomial {
         self.component
     }
 
+    /// Borrow the packed exponent block (4 × u64 = 32 bytes).
+    /// Layout per the module documentation: byte 31 = capped
+    /// total degree, bytes [31-nvars, 30] = direct exponents
+    /// (per ADR-005), low bytes always zero.
+    ///
+    /// Used by [`crate::reducer`] (ADR-008) to construct heap
+    /// `cmp_key`s by XOR'ing against the ring's `cmp_flip_mask`.
+    #[inline]
+    pub fn packed(&self) -> &[u64; 4] {
+        &self.packed
+    }
+
     /// Exponent of variable `i`. Returns `None` if `i >= ring.nvars()`.
     pub fn exponent(&self, ring: &Ring, i: u32) -> Option<u32> {
         if i >= ring.nvars() {
