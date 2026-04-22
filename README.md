@@ -68,6 +68,9 @@ examples/
 
 ## Reference reading
 
+- [`docs/design-decisions.md`](docs/design-decisions.md) — ADR-style
+  ledger of architectural choices in this crate, with Singular and
+  FLINT comparisons. Read before making non-trivial structural changes.
 - [`~/project/docs/rust-bba-port-plan.md`](../project/docs/rust-bba-port-plan.md) —
   full roadmap and architectural rationale.
 - [`~/project/docs/rust-polynomial-crates-survey.md`](../project/docs/rust-polynomial-crates-survey.md) —
