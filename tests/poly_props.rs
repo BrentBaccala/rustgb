@@ -276,3 +276,44 @@ fn single_term_edge_cases() {
     x.assert_canonical(&r);
     assert_eq!(x.lm_coeff(), 3);
 }
+
+#[test]
+fn drop_100k_term_poly_does_not_overflow_stack() {
+    // Regression guard on the linked-list backend's iterative Drop
+    // impl (ADR-014). A naive recursive drop on a 100 000-term chain
+    // would blow the default 8 MB thread stack; the Vec backend's
+    // destructor is a simple loop and doesn't care.
+    //
+    // Either way we want to confirm the public `Poly` contract holds
+    // at this scale on whichever backend cargo selected for this
+    // test run. Scaling to 100 K terms costs ~10 ms on the Vec
+    // backend and ~40 ms on the linked-list backend — cheap enough
+    // to keep in the default suite.
+    let r = Ring::new(4, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap();
+    let n: usize = 100_000;
+
+    // Generate N distinct monomials by sweeping exponents in base-64
+    // across four variables; sort descending so
+    // `from_descending_terms_unchecked`'s contract holds.
+    let mut distinct: Vec<Monomial> = Vec::with_capacity(n);
+    'outer: for d in 0u32..64 {
+        for c in 0u32..64 {
+            for b in 0u32..64 {
+                for a in 0u32..64 {
+                    if distinct.len() >= n {
+                        break 'outer;
+                    }
+                    distinct.push(Monomial::from_exponents(&r, &[a, b, c, d]).unwrap());
+                }
+            }
+        }
+    }
+    distinct.sort_by(|x, y| y.cmp(x, &r));
+    let terms: Vec<(Coeff, Monomial)> = distinct.into_iter().map(|m| (1u32, m)).collect();
+    let p = Poly::from_descending_terms_unchecked(&r, terms);
+    assert_eq!(p.len(), n);
+    // Dropping the huge poly at scope exit must not overflow the
+    // stack. If this test ever regresses by stack-overflow on the
+    // linked-list backend, Drop has gone back to recursive.
+    drop(p);
+}

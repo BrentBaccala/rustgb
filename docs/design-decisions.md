@@ -1931,6 +1931,162 @@ needed.
 
 ---
 
+## ADR-014: Linked-list `Poly` backend behind `linked_list_poly` Cargo feature
+
+**Status:** Accepted
+**Date:** 2026-04-23
+
+### Context
+
+ADR-001 chose flat parallel `Vec<Coeff>` + `Vec<Monomial>` as the
+primary `Poly` representation and spelled out the profile evidence
+for that choice: the staging-5101449 profile had put 62.6 % of total
+cycles into a single `memmove` before the head-cursor fix. Flat
+arrays remain the right default.
+
+But two concerns keep pulling us toward also having a linked-list
+backend available:
+
+1. **Cross-checking the reference implementation.** Singular — the
+   reference we are porting from — uses linked-list `spolyrec`
+   storage throughout. Several Singular-specific optimisations
+   (list-splice arithmetic, pointer-stable basis storage across
+   reduction rounds, O(1) tail-stealing) are natural on a linked
+   list and awkward-to-impossible on flat arrays. To make it
+   tractable to port those optimisations in the future without
+   committing to them now, we want a second backend we can enable.
+2. **A/B correctness signal.** If both backends run the same test
+   suite to completion, that's a second independent check on the
+   test suite's coverage (and on the arithmetic layer's
+   correctness). Bugs that both backends happen to share are still
+   possible, but bugs specific to one representation's invariants
+   are caught the moment the other backend's CI turns green.
+
+ADR-013 already reshaped the FFI to be cursor-based, so the public
+boundary does not assume random access. The remaining obstacle was
+internal: `Poly::coeffs() -> &[Coeff]` and
+`Poly::terms() -> &[Monomial]` were on the public API and were used
+in a handful of places (reducer, FFI, tests). A linked-list backend
+cannot satisfy those slice signatures without materialising the
+whole poly.
+
+### Singular's approach
+
+Singular's polynomials are **singly linked lists** of `spolyrec`
+nodes (`~/Singular/libpolys/polys/monomials/p_polys.h`). Each node
+carries an inline exponent buffer plus `number coeff` and
+`poly next`. Term traversal is `pIter(p) = pNext(p)`; leading-term
+drop is `pIter(p)` + `p_FreeBinAddr`; both O(1). Arithmetic is
+implemented via list-splicing merges
+(`p_Add_q`, `p_Sub_q_Mult_m` in `pInline2.h`) that can reuse input
+nodes in the output list instead of allocating fresh. Memory is
+managed via `omalloc` bins sized to `spolyrec`.
+
+This ADR defines a second rustgb `Poly` backend that matches
+Singular's shape closely. We do **not** copy Singular code; we
+match the data-structure choice.
+
+### FLINT's approach
+
+**N/A for the backend-selection decision.** FLINT only has one
+polynomial storage layer (flat parallel arrays in `nmod_mpoly` —
+see `~/flint/src/nmod_mpoly/nmod_mpoly.h`). FLINT never made the
+choice we are making here because FLINT never maintained a
+linked-list alternative to compare against; moreover, FLINT has no
+Gröbner-basis engine and thus no bba driver whose hot-path memory
+characteristics the decision is sensitive to (ADR-001 for why that
+matters).
+
+### Decision
+
+Add a linked-list backend as a second, compile-time-selectable
+polynomial representation:
+
+- **New file:** `~/rustgb/src/poly/poly_list.rs`. Mirror the Vec
+  backend's public API verbatim — same constructors, same accessors,
+  same arithmetic, same canonicality check. Internal storage:
+  ```rust
+  pub struct Poly {
+      head: Option<Box<Node>>,
+      len: usize,
+      lm_sev: u64,
+      lm_coeff: Coeff,
+      lm_deg: u32,
+  }
+  struct Node { coeff: Coeff, mono: Monomial, next: Option<Box<Node>> }
+  ```
+- **New Cargo feature:** `linked_list_poly`. Default off. Enabling
+  it flips `src/poly/mod.rs` to re-export the linked-list backend's
+  `Poly` / `PolyCursor` under those names. All call sites keep
+  writing `Poly`, `&Poly`, `Vec<Poly>`; no trait genericity, no
+  runtime enum dispatch, no type parameters threaded through
+  `SBasis` / `LObject` / `KBucket` / `Reducer`.
+- **API normalisation (landed with this ADR):** `Poly::coeffs()` and
+  `Poly::terms()` are removed from the public API. Callers use the
+  `PolyCursor` introduced in the previous refactor pass; see the
+  parent `src/poly/mod.rs` for the cursor shape. Internal
+  implementations on the Vec backend use private `live_coeffs()` /
+  `live_terms()` helpers — not visible outside `poly_vec`.
+- **Iterative `Drop`:** linked-list `Poly` implements `Drop` by
+  walking the chain and detaching `next` before each node is
+  released. A naïve recursive drop on a 100 000-term poly overflows
+  the default 8 MB thread stack; the iterative drop runs in O(n)
+  time without deepening the call stack. A regression test in
+  `tests/poly_props.rs::drop_100k_term_poly_does_not_overflow_stack`
+  constructs a 100 000-term chain and drops it.
+- **Not yet done — list-splice node reuse.** Arithmetic methods on
+  the linked-list backend currently allocate fresh `Box<Node>` for
+  every output term, matching the allocation profile of the Vec
+  backend's output-`Vec::push`. Splicing input nodes directly into
+  the output chain (Singular's pattern) is left as future work —
+  the current shape is correct and exercises the test suite, which
+  is this ADR's main goal.
+
+### Consequences
+
+- **Two build-and-test paths per rustgb change.** Landing this ADR
+  creates an ongoing obligation: significant arithmetic changes
+  should be run through both `cargo test --release` (Vec) and
+  `cargo test --release --features linked_list_poly` (List). CI
+  does not yet gate on both; this is deferred follow-up work.
+- **Slice-returning accessors gone from the public API.** Code that
+  used to write `p.coeffs()[i]` / `p.terms()[i]` now writes
+  `p.cursor()` + `.advance()`, or uses the iterator returned by
+  `p.iter()`. The reducer (the main in-flight consumer) already
+  went through this migration in the previous commit; the FFI
+  (`rustgb_term_iter_next`) was migrated to hold a
+  `PolyCursor<'static>` — lifetime-extended at the FFI boundary
+  under the caller's basis-outlives-iterator contract. No
+  third-party callers remain.
+- **Default remains Vec.** ADR-001's profile evidence still holds;
+  no performance claim in that ADR is being revisited by this one.
+  The staging-validation runner continues to build and run against
+  the default (Vec) backend.
+- **Non-trivial test-suite time on the List backend.** At the
+  moment the List backend's arithmetic is ~5× slower than the Vec
+  backend on the property-test suite (~0.5 s vs. ~0.1 s per
+  `poly_props` run). This is acceptable for A/B correctness
+  checks; if the List backend ever becomes a performance path
+  rather than a reference path, that gap would need to be closed.
+
+### References
+
+- `~/rustgb/src/poly/mod.rs` — dispatcher, re-exports the selected
+  backend under the names `Poly` and `PolyCursor`
+- `~/rustgb/src/poly/poly_vec.rs` — flat-array backend (default)
+- `~/rustgb/src/poly/poly_list.rs` — linked-list backend (behind
+  the `linked_list_poly` feature)
+- `~/rustgb/Cargo.toml` — `linked_list_poly = []` feature definition
+- `~/rustgb/tests/poly_props.rs::drop_100k_term_poly_does_not_overflow_stack`
+  — regression guard for the iterative-drop contract
+- ADR-001 — original Vec decision + staging-5101449 profile
+- ADR-013 — FFI iterator handle (the enabling refactor on the
+  public boundary)
+- Singular's `spolyrec` / `pIter`:
+  `~/Singular/libpolys/polys/monomials/p_polys.h`
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
