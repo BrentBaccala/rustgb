@@ -336,7 +336,7 @@ pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring
         poly: &initial_poly,
         multiplier: crate::monomial::Monomial::one(ring),
         coeff: 1,
-        index: 0,
+        cursor: initial_poly.cursor(),
         sugar: initial_sugar,
     });
 

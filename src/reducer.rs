@@ -34,7 +34,7 @@
 
 use crate::field::Coeff;
 use crate::monomial::Monomial;
-use crate::poly::Poly;
+use crate::poly::{Poly, PolyCursor};
 use crate::ring::Ring;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -69,10 +69,18 @@ pub struct Reducer<'a> {
     /// basis elements `lc(g_i) == 1`, this simplifies to
     /// `-leader_coeff`.
     pub coeff: Coeff,
-    /// Index of the next term in `poly.terms` not yet queued
-    /// in the heap. Starts at 0; advances by one for every
-    /// term of this reducer popped off the heap.
-    pub index: usize,
+    /// Cursor into `poly` positioned at the next term not yet
+    /// queued in the heap. Built from `poly.cursor()` (optionally
+    /// pre-advanced, e.g. when a freshly added divisor skips its
+    /// leading term — see the `index = 1` trick in
+    /// [`ReducerHeap::reduce_to_normal_form`]). Advances by one
+    /// for every term of this reducer popped off the heap.
+    ///
+    /// Replaces the pre-cursor `index: usize` field — see ADR-014.
+    /// Using a cursor instead of a random-access index makes the
+    /// reducer oblivious to `Poly`'s backing storage (parallel
+    /// vectors vs. linked list).
+    pub cursor: PolyCursor<'a>,
     /// Sugar contribution: `g_i.lm_deg() + multiplier.total_deg()`.
     /// Used to compute the LObject's running sugar as the
     /// max over all in-flight reducers (plus the initial sugar).
@@ -295,10 +303,10 @@ impl<'a> ReducerHeap<'a> {
     /// "panic on overflow" enhancement.
     fn push_current_term(&mut self, reducer_idx: usize) {
         let r = &self.reducers[reducer_idx];
-        if r.index >= r.poly.len() {
+        let Some((_c, m)) = r.cursor.term() else {
             return;
-        }
-        let Some(term_mono) = r.multiplier.mul(&r.poly.terms()[r.index], &self.ring) else {
+        };
+        let Some(term_mono) = r.multiplier.mul(m, &self.ring) else {
             // Overflow: drop this term (and effectively truncate
             // the reducer at this index). Caller is responsible
             // for ensuring this doesn't happen for correctness;
@@ -320,7 +328,7 @@ impl<'a> ReducerHeap<'a> {
     /// Advance the named reducer past its current term and queue
     /// the next term onto the heap (if any).
     fn advance_reducer(&mut self, reducer_idx: usize) {
-        self.reducers[reducer_idx].index += 1;
+        self.reducers[reducer_idx].cursor.advance();
         self.push_current_term(reducer_idx);
     }
 
@@ -375,29 +383,32 @@ impl<'a> ReducerHeap<'a> {
                     let coeff = f.neg(c);
                     let m_deg = multiplier.total_deg();
                     let new_sugar = g_sugar.saturating_add(m_deg);
-                    // **Index = 1**, not 0: the divisor's leading
-                    // term is implicitly cancelled by the act of
-                    // emitting `(c, m)` from pop_with_cancellation
-                    // and then choosing to reduce by g. The leading
-                    // term `coeff * multiplier * g.terms[0]` would
-                    // equal `-c * m`, exactly the inverse of the
-                    // popped leader. Pushing `index = 0` and letting
-                    // the heap cancel it would require us to NOT
-                    // have popped the leader in the first place,
-                    // which is incompatible with the streaming
-                    // pop-emit semantics. Instead, we skip the
-                    // implicit-cancellation leading term and only
-                    // queue the divisor's tail contribution
+                    // **Cursor pre-advanced by one**, not at leading:
+                    // the divisor's leading term is implicitly
+                    // cancelled by the act of emitting `(c, m)` from
+                    // pop_with_cancellation and then choosing to
+                    // reduce by g. The leading term
+                    // `coeff * multiplier * g.terms[0]` would equal
+                    // `-c * m`, exactly the inverse of the popped
+                    // leader. Starting the cursor at the leading
+                    // term and letting the heap cancel it would
+                    // require us to NOT have popped the leader in
+                    // the first place, which is incompatible with
+                    // the streaming pop-emit semantics. Instead, we
+                    // skip the implicit-cancellation leading term
+                    // and only queue the divisor's tail contribution
                     // `coeff * multiplier * g.terms[1..]`. This is
                     // the same trick FLINT uses in
                     // `divrem_monagan_pearce.c` (the new heap node
                     // for a freshly-found divisor is inserted with
                     // `j = 1`, not `j = 0`).
+                    let mut tail_cursor = g.cursor();
+                    tail_cursor.advance();
                     self.push_reducer(Reducer {
                         poly: g,
                         multiplier,
                         coeff,
-                        index: 1,
+                        cursor: tail_cursor,
                         sugar: new_sugar,
                     });
                     // Loop continues with the divisor's tail merged
@@ -440,16 +451,17 @@ impl<'a> ReducerHeap<'a> {
             let chain_key = max_node.cmp_key;
             let max_idx = max_node.reducer_idx;
             let r = &self.reducers[max_idx];
-            // Recover the actual monomial. Could rebuild from the
-            // multiplier and source term, but the cmp_key is the
-            // XOR'd packed bytes, so unpacking gets us back. Easier
-            // to just recompute from the reducer state.
+            // Recover the actual monomial and its coefficient from the
+            // reducer's cursor. The cmp_key is the XOR'd packed bytes,
+            // so unpacking could get us back, but reading through the
+            // cursor is simpler and works on both Poly backends.
+            let (r_c, r_m) = r.cursor.term().expect("just pushed; live cursor");
             let mono = r
                 .multiplier
-                .mul(&r.poly.terms()[r.index], &self.ring)
+                .mul(r_m, &self.ring)
                 .expect("just pushed; overflow already checked");
             let f = self.ring.field();
-            let mut total_coeff = f.mul(r.coeff, r.poly.coeffs()[r.index]);
+            let mut total_coeff = f.mul(r.coeff, r_c);
 
             // Advance the max contributor.
             let mut to_advance: Vec<usize> = Vec::with_capacity(2);
@@ -462,7 +474,8 @@ impl<'a> ReducerHeap<'a> {
                 }
                 let next_node = self.heap.pop().unwrap();
                 let nr = &self.reducers[next_node.reducer_idx];
-                let next_coeff = f.mul(nr.coeff, nr.poly.coeffs()[nr.index]);
+                let (nr_c, _nr_m) = nr.cursor.term().expect("just pushed; live cursor");
+                let next_coeff = f.mul(nr.coeff, nr_c);
                 total_coeff = f.add(total_coeff, next_coeff);
                 to_advance.push(next_node.reducer_idx);
             }
@@ -759,7 +772,7 @@ mod tests {
             poly: &p,
             multiplier: one.clone(),
             coeff: 1,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 3,
         });
         assert_eq!(h.sugar(), 3);
@@ -797,14 +810,14 @@ mod tests {
             poly: &p,
             multiplier: one.clone(),
             coeff: 1,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 2,
         });
         h.push_reducer(Reducer {
             poly: &p,
             multiplier: one,
             coeff: neg_one,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 2,
         });
 
@@ -836,14 +849,14 @@ mod tests {
             poly: &p,
             multiplier: one.clone(),
             coeff: 1,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 2,
         });
         h.push_reducer(Reducer {
             poly: &q,
             multiplier: one,
             coeff: 1,
-            index: 0,
+            cursor: q.cursor(),
             sugar: 2,
         });
         let out = drain_with_cancellation(&mut h);
@@ -917,14 +930,14 @@ mod tests {
                 poly: &p,
                 multiplier: one.clone(),
                 coeff: 1,
-                index: 0,
+                cursor: p.cursor(),
                 sugar: 0,
             });
             h.push_reducer(Reducer {
                 poly: &q,
                 multiplier: one,
                 coeff: 1,
-                index: 0,
+                cursor: q.cursor(),
                 sugar: 0,
             });
             let got = drain_with_cancellation(&mut h);
@@ -1014,7 +1027,7 @@ mod tests {
             poly: f,
             multiplier: one,
             coeff: 1,
-            index: 0,
+            cursor: f.cursor(),
             sugar: f.lm_deg(),
         });
         let basis_owned: Vec<&Poly> = basis.iter().collect();
@@ -1221,7 +1234,7 @@ mod tests {
             poly: &p,
             multiplier: one.clone(),
             coeff: 1,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 3,
         });
         // 7 still wins over 3.
@@ -1230,7 +1243,7 @@ mod tests {
             poly: &p,
             multiplier: one,
             coeff: 1,
-            index: 0,
+            cursor: p.cursor(),
             sugar: 12,
         });
         // 12 takes over.

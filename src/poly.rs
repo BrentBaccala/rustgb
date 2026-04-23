@@ -327,6 +327,22 @@ impl Poly {
         &self.terms[self.head..]
     }
 
+    /// A cursor positioned at the leading term (or at end if zero).
+    ///
+    /// Both the `Vec`-backed and the future `List`-backed `Poly`
+    /// expose the same cursor API so callers can walk a polynomial
+    /// in descending order without assuming random access. The
+    /// cursor is cheap (`Copy`) and carries only a reference to the
+    /// underlying storage plus its position; the reducer stores one
+    /// per in-flight reducer.
+    #[inline]
+    pub fn cursor(&self) -> PolyCursor<'_> {
+        PolyCursor {
+            poly: self,
+            idx: self.head,
+        }
+    }
+
     /// Return a new polynomial with the leading term removed. If `self`
     /// is zero or a single term, returns the zero polynomial.
     ///
@@ -631,6 +647,54 @@ impl Poly {
 impl Default for Poly {
     fn default() -> Self {
         Self::zero()
+    }
+}
+
+/// A cursor walking a [`Poly`]'s terms in descending order.
+///
+/// Obtain one with [`Poly::cursor`]. The cursor is `Copy` and cheap;
+/// it holds a reference to the polynomial and a position. Both
+/// `Vec`-backed and `List`-backed `Poly` back-ends expose this same
+/// cursor shape, so consumers (notably [`crate::reducer::Reducer`])
+/// work uniformly regardless of storage choice.
+///
+/// On the `Vec` backend the position is an index into the parallel
+/// arrays; on the `List` backend it is an `Option<&Node>`. Callers
+/// never observe the difference: [`term`](Self::term) always returns
+/// `Some((coeff, &monomial))` when live and `None` once exhausted,
+/// [`advance`](Self::advance) steps one term forward, and
+/// [`is_done`](Self::is_done) reports exhaustion.
+#[derive(Clone, Copy, Debug)]
+pub struct PolyCursor<'a> {
+    poly: &'a Poly,
+    /// Index into the parallel-array storage. Always in `[head, terms.len()]`;
+    /// equality with `terms.len()` means exhausted.
+    idx: usize,
+}
+
+impl<'a> PolyCursor<'a> {
+    /// Current term `(coeff, &monomial)`, or `None` if exhausted.
+    #[inline]
+    pub fn term(&self) -> Option<(Coeff, &'a Monomial)> {
+        if self.idx < self.poly.terms.len() {
+            Some((self.poly.coeffs[self.idx], &self.poly.terms[self.idx]))
+        } else {
+            None
+        }
+    }
+
+    /// Advance one term. No-op once exhausted (`is_done` stays true).
+    #[inline]
+    pub fn advance(&mut self) {
+        if self.idx < self.poly.terms.len() {
+            self.idx += 1;
+        }
+    }
+
+    /// True once all terms have been walked.
+    #[inline]
+    pub fn is_done(&self) -> bool {
+        self.idx >= self.poly.terms.len()
     }
 }
 
