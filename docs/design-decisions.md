@@ -1812,6 +1812,125 @@ the L-set sweep emerges as a clear bottleneck in a future profile.
 
 ---
 
+## ADR-013: Basis readout FFI — iterator handle rather than random-access index
+
+**Status:** Accepted
+**Date:** 2026-04-23
+
+### Context
+
+The rustgb C FFI exposed one function for reading a term out of a
+computed basis:
+
+```c
+int rustgb_basis_term(const rustgb_basis* b,
+                      size_t poly_idx,
+                      size_t term_idx,
+                      int32_t* exps_out,
+                      uint32_t* coeff_out);
+```
+
+Random-access `(poly_idx, term_idx)`. With the current flat-array
+`Poly` (see ADR-001) this is an O(1) index into
+`terms[head + term_idx]` — trivially cheap. But the only external
+caller — `~/Singular-rustgb/Singular/dyn_modules/singrust/singrust.cc`
+— walks terms strictly sequentially (`for ti in 0..nt`).
+
+We are evaluating a future linked-list-backed `Poly` (offline
+discussion; ADR to follow). A linked list cannot answer
+`terms()[term_idx]` in O(1) — the naive implementation would be
+O(term_idx) per call, turning a sequential readout of an `n`-term
+poly into O(n²). The FFI surface shouldn't choose between "keep the
+current backend forever" and "slow down every readout".
+
+### Singular's approach
+
+Singular's own polys are linked-list `spolyrec` nodes
+(`~/Singular/libpolys/polys/monomials/p_polys.h`). Term traversal
+is done through `pIter(p)` / `pNext(p)` — inherently cursor-based,
+no random access. That matches the shape of our future linked-list
+backend exactly: there is no `p_kBucketGetTerm(idx)` in Singular's
+public API because it would be a trap for this very reason.
+
+### FLINT's approach
+
+FLINT's `nmod_mpoly` stores terms as flat parallel arrays
+(`coeffs[i]`, `exps[i]`), so random access is native and cheap,
+same as our current rustgb `Poly`. But FLINT has no FFI clients of
+the shape we're dealing with — its consumers are either other
+FLINT library code that reads the arrays directly, or Python
+bindings that iterate in a tight loop. **N/A — FLINT has no FFI
+consumer that would drive this choice.**
+
+### Decision
+
+Replace `rustgb_basis_term` with an opaque iterator handle:
+
+```c
+typedef struct rustgb_term_iter rustgb_term_iter;
+
+rustgb_term_iter* rustgb_term_iter_open(const rustgb_basis* b, size_t poly_idx);
+int               rustgb_term_iter_next(rustgb_term_iter* it,
+                                        int32_t* exps_out,
+                                        uint32_t* coeff_out);
+void              rustgb_term_iter_close(rustgb_term_iter* it);
+```
+
+`_next` returns 0 on a yielded term, 1 on exhaustion (output
+untouched), 2 on error. The iterator borrows the basis; the caller
+must not destroy or mutate the basis while an iterator is
+outstanding.
+
+The iterator's internal shape is opaque to C. For the current
+Vec-backed `Poly` it holds `(basis_ptr, poly_idx, cursor: usize)`
+and increments `cursor` on each `_next`. A future linked-list
+`Poly` would hold `(basis_ptr, poly_idx, next_node: *const Node)`
+instead, with `_next` doing `self.next_node = (*node).next`. Both
+achieve O(1)-per-term readout on their respective backends without
+changing the C surface.
+
+`rustgb_basis_poly_count` and `rustgb_basis_term_count` stay —
+they're O(1) on either backend (a length count per poly is cheap
+to maintain) and the caller uses them for `Vec::with_capacity`-
+style preallocation, not for random access.
+
+The old `rustgb_basis_term` is removed outright. Pre-merge audit:
+grep across `~/Singular-rustgb` and `~/rustgb` showed
+`singrust.cc` as the only external caller; no deprecation period
+needed.
+
+### Consequences
+
+- Caller contract grows by one rule: the iterator must be closed
+  before the basis is destroyed. `singrust.cc`'s error paths close
+  the iterator before `rustgb_basis_destroy` / `rustgb_ring_destroy`
+  accordingly.
+- Error returns gain a three-way code (0 = term, 1 = exhausted,
+  2 = error) where `rustgb_basis_term` had a two-way code. Callers
+  distinguish "clean end of poly" from "something went wrong" by
+  checking `rc != 1` before treating `rc != 0` as an error.
+- The future linked-list `Poly` ADR is not blocked by the FFI
+  surface. When (if) that backend lands, the iterator's internal
+  shape changes; the C header and singrust.cc don't.
+- `singrust.cc`'s inner loop is a hair shorter: no more
+  `rustgb_basis_term_count` call per poly (kept only as a
+  `with_capacity` hint in the Rust integration test, not in the
+  Singular caller).
+
+### References
+
+- `~/rustgb/src/ffi.rs` (iterator implementation)
+- `~/rustgb/include/rustgb.h` (C surface)
+- `~/rustgb/tests/ffi.rs` (`compute_via_ffi` now walks via iterator)
+- `~/Singular-rustgb/Singular/dyn_modules/singrust/singrust.cc`
+  (updated caller; random-access read loop replaced)
+- ADR-001 (flat-array `Poly`; the iterator's current internal
+  shape — `(ref, cursor)` — is the natural fit for that backend)
+- Singular's `pIter` / `pNext` discipline:
+  `~/Singular/libpolys/polys/monomials/p_polys.h`
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

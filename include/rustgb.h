@@ -153,18 +153,47 @@ size_t rustgb_basis_poly_count(const rustgb_basis* b);
 /* Number of terms in polynomial `poly_idx` (0-based). */
 size_t rustgb_basis_term_count(const rustgb_basis* b, size_t poly_idx);
 
-/*
- * Read term `term_idx` of polynomial `poly_idx`. Writes the
- * exponent vector into `exps_out` (length `nvars`) and the
- * coefficient into `*coeff_out`.
+/* ------------------------------------------------------------------
+ *  Term iterator
  *
- * Returns 0 on success, nonzero on error (out-of-bounds indices).
+ *  Per-term readout is done through an opaque cursor handle. The
+ *  internal shape is backend-specific (the current Vec-backed Poly
+ *  uses (basis_ref, cursor); a future linked-list backend would
+ *  use a node pointer), but the C surface stays stable.
+ *
+ *  Caller contract: the basis (and its ring) must outlive the
+ *  iterator, and must not be destroyed or mutated while the
+ *  iterator is live. Every `rustgb_term_iter_open` must be paired
+ *  with a `rustgb_term_iter_close`.
+ * ------------------------------------------------------------------ */
+
+typedef struct rustgb_term_iter rustgb_term_iter;
+
+/*
+ * Open an iterator over the terms of polynomial `poly_idx` in `b`.
+ * Terms are yielded in descending ring order. Returns NULL on
+ * error (e.g. NULL basis, out-of-range poly_idx) with
+ * `rustgb_last_error()` set.
  */
-int rustgb_basis_term(const rustgb_basis* b,
-                      size_t poly_idx,
-                      size_t term_idx,
-                      int32_t* exps_out,
-                      uint32_t* coeff_out);
+rustgb_term_iter* rustgb_term_iter_open(const rustgb_basis* b,
+                                        size_t poly_idx);
+
+/*
+ * Read the next term from `it`. On success writes the exponent
+ * vector (length `nvars`) into `exps_out` and the coefficient into
+ * `*coeff_out`, then advances the cursor.
+ *
+ *   Returns 0 — a term was written.
+ *   Returns 1 — iterator exhausted; output buffers untouched.
+ *   Returns 2 — error (NULL pointer, torn iterator, etc.);
+ *               `rustgb_last_error()` is set.
+ */
+int rustgb_term_iter_next(rustgb_term_iter* it,
+                          int32_t* exps_out,
+                          uint32_t* coeff_out);
+
+/* Release an iterator handle. Passing NULL is a no-op. */
+void rustgb_term_iter_close(rustgb_term_iter* it);
 
 #ifdef __cplusplus
 } /* extern "C" */

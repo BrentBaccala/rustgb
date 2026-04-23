@@ -468,65 +468,167 @@ pub unsafe extern "C" fn rustgb_basis_term_count(b: *const rustgb_basis, poly_id
     b.polys[poly_idx].len()
 }
 
-/// Read a single term of the basis.
+// ---------------------------------------------------------------
+//  Term iterator
+// ---------------------------------------------------------------
+//
+// The iterator is an opaque boxed struct that borrows the basis
+// behind a raw pointer. The caller contract (documented in the C
+// header) is: the basis (and its ring) must outlive the iterator,
+// and must not be mutated while the iterator is live.
+//
+// Internal shape is backend-specific. For the current `Vec`-backed
+// `Poly` we store a borrowed reference to the basis plus a cursor;
+// a future linked-list backend would swap this for a node pointer.
+// The C surface does not expose any of this.
+
+/// Opaque term-iterator handle. See the C header for the caller
+/// contract; do not rely on the field layout.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct rustgb_term_iter {
+    /// Borrowed pointer to the basis the iterator was opened against.
+    /// The basis must outlive this iterator (caller contract).
+    basis: *const rustgb_basis,
+    /// Which polynomial in the basis we're walking.
+    poly_idx: usize,
+    /// Cursor into that polynomial's live term region; advances on
+    /// each successful `_next` call.
+    cursor: usize,
+}
+
+/// Open an iterator over the terms of polynomial `poly_idx` in `b`.
+///
+/// Returns `NULL` on error (see `rustgb_last_error()`). Terms are
+/// yielded in the ring's descending order (same order as the
+/// underlying `Poly`).
 ///
 /// # Safety
-/// `b` must be a live handle; `exps_out` must be writable for
-/// `nvars` `i32` slots; `coeff_out` must be a valid pointer.
+/// `b` must be a live handle, and must outlive the returned
+/// iterator. The basis must not be destroyed or mutated while the
+/// iterator is outstanding. The caller must release the iterator
+/// with [`rustgb_term_iter_close`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustgb_basis_term(
+pub unsafe extern "C" fn rustgb_term_iter_open(
     b: *const rustgb_basis,
     poly_idx: usize,
-    term_idx: usize,
+) -> *mut rustgb_term_iter {
+    clear_last_error();
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        if b.is_null() {
+            set_last_error("rustgb_term_iter_open: b is NULL");
+            return std::ptr::null_mut();
+        }
+        // SAFETY: caller contract.
+        let basis_ref = unsafe { &*b };
+        if poly_idx >= basis_ref.polys.len() {
+            set_last_error(&format!(
+                "rustgb_term_iter_open: poly_idx {poly_idx} out of range (nel={})",
+                basis_ref.polys.len()
+            ));
+            return std::ptr::null_mut();
+        }
+        let handle = Box::new(rustgb_term_iter {
+            basis: b,
+            poly_idx,
+            cursor: 0,
+        });
+        Box::into_raw(handle)
+    }));
+    match r {
+        Ok(p) => p,
+        Err(_) => {
+            set_last_error("rustgb_term_iter_open: panic");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Read the next term from an iterator.
+///
+/// On success (return 0) writes `ring.nvars()` exponents into
+/// `exps_out` and the coefficient into `*coeff_out`, then advances
+/// the cursor. When the iterator is exhausted returns 1 and leaves
+/// the output buffers untouched. Returns 2 on error (with
+/// `rustgb_last_error` set).
+///
+/// # Safety
+/// `it` must be a live iterator handle (or NULL — treated as
+/// error). `exps_out` must be writable for `nvars` `i32` slots;
+/// `coeff_out` must be a valid pointer to a `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustgb_term_iter_next(
+    it: *mut rustgb_term_iter,
     exps_out: *mut i32,
     coeff_out: *mut u32,
 ) -> i32 {
     clear_last_error();
     let r = catch_unwind(AssertUnwindSafe(|| {
-        if b.is_null() {
-            set_last_error("rustgb_basis_term: b is NULL");
-            return 1;
+        if it.is_null() {
+            set_last_error("rustgb_term_iter_next: it is NULL");
+            return 2;
         }
         if exps_out.is_null() || coeff_out.is_null() {
-            set_last_error("rustgb_basis_term: output pointer is NULL");
-            return 1;
+            set_last_error("rustgb_term_iter_next: output pointer is NULL");
+            return 2;
         }
         // SAFETY: caller contract.
-        let b = unsafe { &*b };
-        if poly_idx >= b.polys.len() {
-            set_last_error(&format!(
-                "rustgb_basis_term: poly_idx {poly_idx} out of range"
-            ));
+        let iter = unsafe { &mut *it };
+        if iter.basis.is_null() {
+            set_last_error("rustgb_term_iter_next: iterator has NULL basis");
+            return 2;
+        }
+        // SAFETY: caller promised the basis outlives the iterator.
+        let basis_ref = unsafe { &*iter.basis };
+        if iter.poly_idx >= basis_ref.polys.len() {
+            set_last_error("rustgb_term_iter_next: poly_idx out of range");
+            return 2;
+        }
+        let poly = &basis_ref.polys[iter.poly_idx];
+        if iter.cursor >= poly.len() {
+            // Exhausted: leave output untouched.
             return 1;
         }
-        let poly = &b.polys[poly_idx];
-        if term_idx >= poly.len() {
-            set_last_error(&format!(
-                "rustgb_basis_term: term_idx {term_idx} out of range"
-            ));
-            return 1;
-        }
-        let mono = &poly.terms()[term_idx];
-        let coeff = poly.coeffs()[term_idx];
-        let nvars = b.ring.nvars() as usize;
+        let mono = &poly.terms()[iter.cursor];
+        let coeff = poly.coeffs()[iter.cursor];
+        let nvars = basis_ref.ring.nvars() as usize;
         // SAFETY: caller contract.
         let slice = unsafe { std::slice::from_raw_parts_mut(exps_out, nvars) };
         for (i, slot) in slice.iter_mut().enumerate() {
-            *slot = mono.exponent(&b.ring, i as u32).expect("i < nvars") as i32;
+            *slot = mono.exponent(&basis_ref.ring, i as u32).expect("i < nvars") as i32;
         }
         // SAFETY: caller contract.
         unsafe {
             *coeff_out = coeff;
         }
+        iter.cursor += 1;
         0
     }));
     match r {
         Ok(code) => code,
         Err(_) => {
-            set_last_error("rustgb_basis_term: panic");
-            1
+            set_last_error("rustgb_term_iter_next: panic");
+            2
         }
     }
+}
+
+/// Release an iterator handle. Passing NULL is a no-op.
+///
+/// # Safety
+/// `it` must have been obtained from [`rustgb_term_iter_open`] or
+/// be NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustgb_term_iter_close(it: *mut rustgb_term_iter) {
+    if it.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract.
+        unsafe {
+            drop(Box::from_raw(it));
+        }
+    }));
 }
 
 // ---------------------------------------------------------------

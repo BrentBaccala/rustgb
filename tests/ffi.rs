@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use rustgb::ffi::{
     last_error_string, rustgb_basis, rustgb_basis_destroy, rustgb_basis_poly_count,
-    rustgb_basis_term, rustgb_basis_term_count, rustgb_compute, rustgb_input,
-    rustgb_input_begin, rustgb_input_destroy, rustgb_input_poly_begin, rustgb_input_poly_end,
-    rustgb_input_term, rustgb_last_error, rustgb_ring, rustgb_ring_create, rustgb_ring_destroy,
-    rustgb_version,
+    rustgb_basis_term_count, rustgb_compute, rustgb_input, rustgb_input_begin,
+    rustgb_input_destroy, rustgb_input_poly_begin, rustgb_input_poly_end, rustgb_input_term,
+    rustgb_last_error, rustgb_ring, rustgb_ring_create, rustgb_ring_destroy,
+    rustgb_term_iter_close, rustgb_term_iter_next, rustgb_term_iter_open, rustgb_version,
 };
 use rustgb::{Field, MonoOrder, Monomial, Poly, Ring, compute_gb};
 
@@ -69,21 +69,33 @@ fn compute_via_ffi(
     let basis = unsafe { rustgb_compute(input) };
     assert!(!basis.is_null(), "compute failed: {}", last_error_string());
 
-    // Read out the basis.
+    // Read out the basis through the opaque term iterator. We use
+    // `rustgb_basis_term_count` only for preallocation; the walk
+    // itself is driven by the iterator's exhaustion signal.
     let npoly = unsafe { rustgb_basis_poly_count(basis) };
     let mut ffi_out: FfiBasis = Vec::with_capacity(npoly);
     for pi in 0..npoly {
         let nt = unsafe { rustgb_basis_term_count(basis, pi) };
         let mut terms: FfiPoly = Vec::with_capacity(nt);
-        for ti in 0..nt {
+        let it = unsafe { rustgb_term_iter_open(basis, pi) };
+        assert!(
+            !it.is_null(),
+            "term_iter_open failed: {}",
+            last_error_string()
+        );
+        loop {
             let mut exps = vec![0i32; nvars as usize];
             let mut coeff: u32 = 0;
             let rc = unsafe {
-                rustgb_basis_term(basis, pi, ti, exps.as_mut_ptr(), &mut coeff as *mut u32)
+                rustgb_term_iter_next(it, exps.as_mut_ptr(), &mut coeff as *mut u32)
             };
-            assert_eq!(rc, 0);
+            if rc == 1 {
+                break;
+            }
+            assert_eq!(rc, 0, "term_iter_next error: {}", last_error_string());
             terms.push((coeff, exps));
         }
+        unsafe { rustgb_term_iter_close(it) };
         ffi_out.push(terms);
     }
     unsafe { rustgb_basis_destroy(basis) };
