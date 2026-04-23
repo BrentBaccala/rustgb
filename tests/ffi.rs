@@ -131,13 +131,15 @@ fn polys_match(ffi_out: &[FfiPoly], rust_out: &[Poly], ring: &Ring) -> bool {
         if ffi_p.len() != rust_p.len() {
             return false;
         }
-        for (ti, (c, exps)) in ffi_p.iter().enumerate() {
-            if *c != rust_p.coeffs()[ti] {
+        // Walk the rust Poly via its cursor-based iter() (no slice
+        // accessors — those are private to the backend per ADR-014).
+        for ((c_ffi, exps), (c_rust, m_rust)) in ffi_p.iter().zip(rust_p.iter()) {
+            if *c_ffi != c_rust {
                 return false;
             }
             let uexps: Vec<u32> = exps.iter().map(|&e| e as u32).collect();
             let m = Monomial::from_exponents(ring, &uexps).unwrap();
-            if m != rust_p.terms()[ti] {
+            if &m != m_rust {
                 return false;
             }
         }

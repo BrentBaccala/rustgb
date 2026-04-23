@@ -477,9 +477,15 @@ pub unsafe extern "C" fn rustgb_basis_term_count(b: *const rustgb_basis, poly_id
 // header) is: the basis (and its ring) must outlive the iterator,
 // and must not be mutated while the iterator is live.
 //
-// Internal shape is backend-specific. For the current `Vec`-backed
-// `Poly` we store a borrowed reference to the basis plus a cursor;
-// a future linked-list backend would swap this for a node pointer.
+// Internal shape is backend-specific but hidden: we hold a
+// `PolyCursor<'static>` obtained from the basis's poly and lifetime-
+// extended to `'static` at the FFI boundary. The caller's
+// basis-outlives-iterator contract justifies the extension — the
+// cursor is never dereferenced after the basis is freed because
+// the caller must close the iterator first. Both the `Vec`-backed
+// and linked-list-backed `Poly` produce a `PolyCursor` of the same
+// opaque shape, so this handle is backend-agnostic.
+//
 // The C surface does not expose any of this.
 
 /// Opaque term-iterator handle. See the C header for the caller
@@ -488,13 +494,21 @@ pub unsafe extern "C" fn rustgb_basis_term_count(b: *const rustgb_basis, poly_id
 #[repr(C)]
 pub struct rustgb_term_iter {
     /// Borrowed pointer to the basis the iterator was opened against.
-    /// The basis must outlive this iterator (caller contract).
+    /// Retained for defensive null / index re-validation on the next
+    /// call; the actual read goes through `cursor`.
     basis: *const rustgb_basis,
-    /// Which polynomial in the basis we're walking.
+    /// Which polynomial in the basis we're walking. Retained for
+    /// diagnostics on the error path.
     poly_idx: usize,
-    /// Cursor into that polynomial's live term region; advances on
-    /// each successful `_next` call.
-    cursor: usize,
+    /// Cursor into that polynomial, lifetime-extended to `'static`.
+    /// Must not be dereferenced after the basis is freed (caller
+    /// contract: the basis outlives the iterator). The reader
+    /// re-validates `basis` / `poly_idx` on each `_next` call so a
+    /// corrupt handle reports an error rather than dereferencing a
+    /// stale pointer into the cursor — but once that validation
+    /// passes, `cursor.term()` is the sole source of truth for the
+    /// current term.
+    cursor: crate::poly::PolyCursor<'static>,
 }
 
 /// Open an iterator over the terms of polynomial `poly_idx` in `b`.
@@ -528,10 +542,21 @@ pub unsafe extern "C" fn rustgb_term_iter_open(
             ));
             return std::ptr::null_mut();
         }
+        // SAFETY: We extend the cursor's lifetime to `'static`. The
+        // caller's contract (basis outlives the iterator, not mutated
+        // while live) is what makes this sound; the cursor is closed
+        // by `rustgb_term_iter_close` (or dropped if the caller
+        // forgets — still safe because `PolyCursor` holds only
+        // references, no owned resources).
+        let cursor_static: crate::poly::PolyCursor<'static> = unsafe {
+            std::mem::transmute::<crate::poly::PolyCursor<'_>, crate::poly::PolyCursor<'static>>(
+                basis_ref.polys[poly_idx].cursor(),
+            )
+        };
         let handle = Box::new(rustgb_term_iter {
             basis: b,
             poly_idx,
-            cursor: 0,
+            cursor: cursor_static,
         });
         Box::into_raw(handle)
     }));
@@ -584,13 +609,10 @@ pub unsafe extern "C" fn rustgb_term_iter_next(
             set_last_error("rustgb_term_iter_next: poly_idx out of range");
             return 2;
         }
-        let poly = &basis_ref.polys[iter.poly_idx];
-        if iter.cursor >= poly.len() {
+        let Some((coeff, mono)) = iter.cursor.term() else {
             // Exhausted: leave output untouched.
             return 1;
-        }
-        let mono = &poly.terms()[iter.cursor];
-        let coeff = poly.coeffs()[iter.cursor];
+        };
         let nvars = basis_ref.ring.nvars() as usize;
         // SAFETY: caller contract.
         let slice = unsafe { std::slice::from_raw_parts_mut(exps_out, nvars) };
@@ -601,7 +623,7 @@ pub unsafe extern "C" fn rustgb_term_iter_next(
         unsafe {
             *coeff_out = coeff;
         }
-        iter.cursor += 1;
+        iter.cursor.advance();
         0
     }));
     match r {

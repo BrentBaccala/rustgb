@@ -22,6 +22,16 @@ crate-type = ["cdylib", "rlib"]
 # tests in `bba` always exercise both regardless of flag state.
 heap_reducer = []
 
+# Switch the `Poly` type from the default flat-array backend
+# (`poly_vec`) to the singly-linked-list backend (`poly_list`).
+# Off by default — ADR-001's staging-5101449 profile evidence
+# still favours flat arrays. Enable with
+# `cargo build --features linked_list_poly` to A/B test the
+# linked-list shape against the flat-array shape, or to exercise
+# the second backend through the same test suite. See ADR-014
+# for the rationale behind keeping both backends available.
+linked_list_poly = []
+
 [dev-dependencies]
 proptest = "1"
 

@@ -1,4 +1,12 @@
-//! Polynomials as parallel `Vec<Coeff>` + `Vec<Monomial>`.
+//! Flat-array backend for [`Poly`]: parallel `Vec<Coeff>` +
+//! `Vec<Monomial>` with an internal `head` cursor.
+//!
+//! This is the default backend selected when the `linked_list_poly`
+//! Cargo feature is **off** (ADR-001, ADR-014). The parent module
+//! [`crate::poly`] re-exports this backend's `Poly` and `PolyCursor`
+//! under those names; the feature flag decides at compile time whether
+//! `Poly` means `poly_vec::Poly` (this file) or `poly_list::Poly`
+//! (the linked-list backend).
 //!
 //! Invariants (checked by [`Poly::assert_canonical`]):
 //!
@@ -6,7 +14,7 @@
 //! 2. All coefficients are in canonical form `0 < c < p` (zeros excluded).
 //! 3. Monomials are strictly descending under the ring's ordering (no
 //!    duplicates, no unsorted runs).
-//! 4. `lm_*` fields match `terms[0]` / `coeffs[0]` when nonempty.
+//! 4. `lm_*` fields match `terms[head]` / `coeffs[head]` when nonempty.
 //!
 //! Mathicgb's `Poly.hpp` is the structural template (parallel arrays,
 //! leading-term at index 0). This implementation does not copy mathicgb
@@ -315,15 +323,23 @@ impl Poly {
         self.lm_deg
     }
 
-    /// Borrow the coefficient slice (descending order).
+    /// Private helper: live-region view of coefficients. Exists so
+    /// the in-module implementations (merge, sub_mul_term, eq, the
+    /// canonicality check, and a handful of tests) can work on the
+    /// active tail without going through a public slice API. The
+    /// previous public `coeffs()` / `terms()` methods were dropped
+    /// when the cursor API landed (ADR-014) — they can't be
+    /// implemented by the linked-list backend without materialising
+    /// the whole poly.
     #[inline]
-    pub fn coeffs(&self) -> &[Coeff] {
+    fn live_coeffs(&self) -> &[Coeff] {
         &self.coeffs[self.head..]
     }
 
-    /// Borrow the monomial slice (descending order).
+    /// Private helper: live-region view of monomials. See
+    /// [`Self::live_coeffs`] for the rationale.
     #[inline]
-    pub fn terms(&self) -> &[Monomial] {
+    fn live_terms(&self) -> &[Monomial] {
         &self.terms[self.head..]
     }
 
@@ -523,10 +539,10 @@ impl Poly {
         }
         let f = ring.field();
 
-        let s_c = self.coeffs();
-        let s_m = self.terms();
-        let q_c = q.coeffs();
-        let q_m = q.terms();
+        let s_c = self.live_coeffs();
+        let s_m = self.live_terms();
+        let q_c = q.live_coeffs();
+        let q_m = q.live_terms();
 
         // Walk `self` and `c * m * q` with a two-pointer merge.
         let mut out_c: Vec<Coeff> = Vec::with_capacity(s_c.len() + q_c.len());
@@ -618,8 +634,8 @@ impl Poly {
             self.terms.len()
         );
         let p = ring.field().p();
-        let live_c = self.coeffs();
-        let live_m = self.terms();
+        let live_c = self.live_coeffs();
+        let live_m = self.live_terms();
         for (k, (&c, m)) in live_c.iter().zip(live_m.iter()).enumerate() {
             assert!(c > 0 && c < p, "live coeff[{k}] = {c} not in 1..{p}");
             m.assert_canonical(ring);
@@ -702,7 +718,7 @@ impl PartialEq for Poly {
     fn eq(&self, other: &Self) -> bool {
         // Compare the live regions only — `head` may differ between
         // two algebraically equal polys depending on their drop history.
-        self.coeffs() == other.coeffs() && self.terms() == other.terms()
+        self.live_coeffs() == other.live_coeffs() && self.live_terms() == other.live_terms()
     }
 }
 impl Eq for Poly {}
@@ -720,10 +736,10 @@ impl Eq for Poly {}
 /// `_nmod_mpoly_add` (`~/flint/src/nmod_mpoly/add.c:16-124`).
 fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
     let f = ring.field();
-    let a_c = a.coeffs();
-    let a_m = a.terms();
-    let b_c = b.coeffs();
-    let b_m = b.terms();
+    let a_c = a.live_coeffs();
+    let a_m = a.live_terms();
+    let b_c = b.live_coeffs();
+    let b_m = b.live_terms();
     let cap = a_c.len() + b_c.len();
     let mut out_c: Vec<Coeff> = Vec::with_capacity(cap);
     let mut out_m: Vec<Monomial> = Vec::with_capacity(cap);
@@ -846,8 +862,8 @@ mod tests {
         assert_eq!(c0, 5);
         assert_eq!(*m0, mono(&r, &[0, 2, 0]));
         // The non-leading term has the combined coefficient 10.
-        assert_eq!(p.coeffs()[1], 10);
-        assert_eq!(p.terms()[1], mono(&r, &[1, 0, 0]));
+        assert_eq!(p.live_coeffs()[1], 10);
+        assert_eq!(p.live_terms()[1], mono(&r, &[1, 0, 0]));
     }
 
     #[test]
@@ -990,8 +1006,8 @@ mod tests {
 
         // Logical equality across the head boundary.
         assert_eq!(peeled, fresh);
-        assert_eq!(peeled.coeffs(), fresh.coeffs());
-        assert_eq!(peeled.terms(), fresh.terms());
+        assert_eq!(peeled.live_coeffs(), fresh.live_coeffs());
+        assert_eq!(peeled.live_terms(), fresh.live_terms());
         assert_eq!(peeled.lm_coeff(), fresh.lm_coeff());
         assert_eq!(peeled.lm_sev(), fresh.lm_sev());
         assert_eq!(peeled.lm_deg(), fresh.lm_deg());
@@ -1010,7 +1026,7 @@ mod tests {
         let cloned = peeled.clone();
         cloned.assert_canonical(&r);
         assert_eq!(cloned, peeled);
-        assert_eq!(cloned.coeffs().len(), cloned.len());
+        assert_eq!(cloned.live_coeffs().len(), cloned.len());
 
         // Drop the rest one at a time; final state is zero with cache
         // cleared.
@@ -1043,9 +1059,9 @@ mod tests {
             ],
         );
         let fast = p.drop_leading();
-        let slow_tail: Vec<(Coeff, Monomial)> = p.coeffs()[1..]
+        let slow_tail: Vec<(Coeff, Monomial)> = p.live_coeffs()[1..]
             .iter()
-            .zip(p.terms()[1..].iter())
+            .zip(p.live_terms()[1..].iter())
             .map(|(&c, m)| (c, m.clone()))
             .collect();
         let slow = Poly::from_terms(&r, slow_tail);
