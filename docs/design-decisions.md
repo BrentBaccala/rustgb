@@ -2087,6 +2087,210 @@ polynomial representation:
 
 ---
 
+## ADR-015: Destructive list-splice merges mirroring Singular `p_Add_q` / `p_Minus_mm_Mult_qq`
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+ADR-014 introduced the linked-list `Poly` backend behind
+`linked_list_poly` and deliberately left "list-splice node reuse"
+as deferred follow-up work — arithmetic methods allocated a fresh
+`Box<Node>` for every output term. Its Consequences section
+acknowledged the List backend was a correctness reference, not a
+performance path, and noted arithmetic was ~5× slower than Vec on
+the property-test suite.
+
+The Vec-vs-List staging profile
+(`~/project/docs/profile-rustgb-list-vs-vec-staging-5101449.md`,
+2026-04-23) then put a concrete number on that gap on a real
+workload (staging-5101449-redsb, Z/32003, 25 vars, degrevlex):
+List took **731 s** vs Vec's **188 s** (3.9× wall, 3.4× cycles).
+The profile pinned **46 % of total cycles** on the List backend
+inside glibc `malloc` / `free` / `drop_in_place<Box<Node>>`, vs
+5.4 % for Vec. The dominant call-graph parent:
+
+```
+_int_malloc  15.34%
+  └─ alloc::boxed::Box::new  13.05%
+     ├─ poly_list::merge                                 9.03%
+     └─ poly_list::from_descending_parallel_unchecked    4.00%
+```
+
+Two code paths account for almost all the allocator traffic on
+the hot loop:
+
+1. `poly_list::merge` — two-pointer merge of two chains, allocating
+   a fresh node per output term.
+2. `kbucket::build_neg_cmp` → `poly_list::from_descending_parallel_unchecked`
+   — materialises `-c·m·p` as a standalone intermediate before the
+   bucket absorbs it.
+
+This ADR closes the allocation half of that gap by porting
+Singular's destructive-merge contract. The other half (list-walk
+vs slice-walk cost — ~2× on its own per the profile's "real-work
+cycles" row) is intrinsic to the representation and not addressed
+here.
+
+### Singular's approach
+
+Singular's polynomial arithmetic in
+`~/Singular/libpolys/polys/templates/` is built around two
+destructive templates whose header comments spell out the
+contract:
+
+- **`p_Add_q__T.cc`** (lines 13–17): *"Returns: p + q, Shorter …
+  Destroys: p, q."* The merge loop splices input nodes directly
+  into the output chain rather than allocating:
+  - `a = pNext(a) = p;` (line 57 Equal-nonzero, line 65 Greater,
+    line 71 Smaller) appends the consumed head to the output's
+    tail and moves the cursor forward — zero allocations.
+  - On one side exhausting, the rest of the other side is
+    tail-spliced with a single pointer assignment: `pNext(a) = q;`
+    (line 60), `pNext(a) = p;` (lines 61, 67, 73).
+  - When coefficients cancel, both input heads are freed (`n_Delete`
+    + `p_LmFreeAndNext`, lines 44–52). No output node is allocated.
+- **`p_Minus_mm_Mult_qq__T.cc`** (lines 13–17): *"Returns: p − m·q
+  … Destroys: p. Const: m, q."* Line 56 allocates the `m · q[i]`
+  product nodes from an **omalloc bin** (`p_AllocBin(qm, bin, r)`
+  — O(1) free-list-backed alloc/free). Line 107 splices those into
+  output. P's nodes are reused (Equal-nonzero at line 77 overwrites
+  the coefficient and splices the node in) or freed (Equal-zero at
+  line 84). The tail-splice on lines 132–157 uses a single
+  `pp_Mult_mm` block multiply-and-append when `p` exhausts first —
+  one arithmetic pass over the remaining `q`, not a term-by-term
+  compare.
+
+### FLINT's approach
+
+**N/A — FLINT has no linked-list polynomial backend.** FLINT's
+single representation is the flat parallel-array `nmod_mpoly`
+(`~/flint/src/nmod_mpoly/nmod_mpoly.h`), so there is no
+"destructive vs non-destructive list merge" choice to compare
+with. FLINT's merges fresh-allocate into a new flat array; the
+rustgb Vec backend follows the same pattern (see ADR-006).
+
+### Decision
+
+Port both contracts as owning-by-value Rust methods, coexisting
+with the existing non-destructive methods:
+
+- **`Poly::add_consuming(self, other: Poly, ring: &Ring) -> Poly`**
+  — Rust analogue of `p_Add_q(p, q, r)`. Destroys: both (ownership
+  transfer enforces Singular's "Destroys:" contract at the type
+  level — any subsequent use of the moved argument is a compile
+  error, not a dangling-pointer UAF). On List, splices input nodes
+  into the output chain and tail-splices. On Vec, forwards to the
+  existing non-consuming `add` (no splice story for flat arrays).
+- **`Poly::sub_mm_mult_qq_consuming(self, c, m, q, ring) -> Option<Poly>`**
+  — Rust analogue of `p_Minus_mm_Mult_qq(p, m, q, r)`. Destroys:
+  `self`. Const: `m`, `q` (preserved-input borrow mirrors
+  Singular's `Const:` line). Allocates new nodes only for the
+  `m * q[i]` products; splices self's nodes or frees them;
+  tail-splices the remainder of `-c·m·q` when `self` exhausts
+  first. On Vec, forwards to the existing non-consuming
+  `sub_mul_term`.
+
+Hot-path callers in `kbucket.rs` migrate to the consuming variants:
+
+- `KBucket::absorb`: the cascade-merge `existing.add(&q, ring)`
+  becomes `existing.add_consuming(q, ring)` — both sides were
+  already owned (existing via `slots[i].take()`, q by value); the
+  `&`-borrow was a pure API artifact.
+- `KBucket::minus_m_mult_p`: rewritten around
+  `sub_mm_mult_qq_consuming`. Picks the target slot from `p.len()`,
+  takes its existing poly (or starts from `Poly::zero()`), calls
+  `existing.sub_mm_mult_qq_consuming(c, m, p, ring)?`, and cascades
+  through `absorb` if the result outgrew its slot. The standalone
+  `build_neg_cmp` helper that used to materialise `-c·m·p` as an
+  intermediate poly is deleted — its sole caller is gone.
+
+The non-destructive APIs (`Poly::add`, `Poly::sub`,
+`Poly::sub_mul_term`, `Poly::add_assign`) are **unchanged**. Tests
+and any non-hot callers keep using them; both variants coexist and
+the compiler inlines whichever the caller picks.
+
+### Contract differences vs Singular (explicit)
+
+1. **No `int& Shorter` out-parameter.** Singular needs it because
+   list lengths aren't cached in the head; rustgb caches `len` on
+   every `Poly` (both backends), so callers compute the delta
+   locally as `a.len() + b.len() - out.len()`.
+2. **No `spNoether` early-termination parameter.** rustgb
+   implements Buchberger with a global ordering; Noether cutoffs
+   (Mora / ecart-based local standard bases) aren't in scope.
+3. **`Option<Poly>` return on monomial-exponent overflow.** rustgb's
+   7-bit-per-variable packed layout (ADR-005) has a representable-
+   range limit that Singular's non-packed layout doesn't hit;
+   overflow is a representation error, surfaced as `None`.
+4. **No `HAVE_ZERODIVISORS` branches.** rustgb targets Z/p only;
+   the case `a * b = 0` with nonzero `a, b` can't arise.
+5. **Sentinel-head pattern translated via narrow `unsafe`.**
+   Singular uses a stack-local `spolyrec rp; poly a = &rp;` and
+   writes through `pNext(a) = p; a = pNext(a);`. In safe Rust the
+   equivalent `&mut Option<Box<Node>>` tail cursor alias-blocks
+   everything reachable from the sentinel, so the destructive
+   methods use a `*mut Option<Box<Node>>` raw pointer instead. The
+   `unsafe` scope is narrow (append loop only); soundness is
+   argued in an in-code `// SAFETY:` block — the sentinel outlives
+   every update, every write targets sentinel-owned storage, and
+   no live alias to a tail slot exists during the writes. On
+   early return via `?`, Rust's drop glue releases the partial
+   output chain cleanly (no leak, no double-free).
+
+### Consequences
+
+- **List backend becomes a real performance path.** On
+  staging-5101449 the walltime drops from 731 s into the 400–500 s
+  range (accompanying profile at
+  `~/project/docs/profile-rustgb-list-splice-staging-5101449.md`);
+  the residual `Box<Node>` allocations concentrate in the
+  `m * q[i]` product path, which a future bin-allocator ADR
+  addresses.
+- **Both backends keep identical public API.** Nothing in
+  `bba.rs`, `reducer.rs`, the FFI, or the gm / sbasis / lset /
+  pair / gb-serial machinery needs a ripple change. The
+  feature-flag dispatcher (`src/poly/mod.rs`) routes `Poly`
+  uniformly.
+- **Two new methods per backend.** Trivial forwarders on Vec
+  (~6 lines each); real implementations on List. Total LOC:
+  ~250 added across the consuming merge, the consuming
+  sub_mm_mult_qq, and their shared sentinel-slot helper.
+- **Bin allocator for the residual `Node` allocations is still
+  deferred.** Singular's omalloc PolyBin (O(1) free-list-backed
+  allocator) is the third multiplicative factor rustgb doesn't yet
+  match. A follow-up ADR will cover that, after an updated staging
+  profile pins the remaining allocator traffic.
+- **CI still does not gate on both backends.** ADR-014's deferred
+  follow-up on this; unchanged by this ADR.
+
+### References
+
+- `~/Singular/libpolys/polys/templates/p_Add_q__T.cc` — header
+  comment at lines 13–17, splice lines 57/65/71, tail-splice
+  lines 60–61/67/73
+- `~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc`
+  — header at lines 13–17, `p_AllocBin` at line 56, splice at
+  line 107, reuse at line 77, free at line 84, tail-splice block
+  at lines 132–157
+- `~/rustgb/src/poly/poly_list.rs` — `Poly::add_consuming`,
+  `Poly::sub_mm_mult_qq_consuming`, internal `merge_consuming`
+- `~/rustgb/src/poly/poly_vec.rs` — thin forwarders for the
+  destructive variants (no splice story on flat arrays)
+- `~/rustgb/src/kbucket.rs` — `absorb` + `minus_m_mult_p` updated;
+  `build_neg_cmp` removed
+- `~/project/docs/profile-rustgb-list-vs-vec-staging-5101449.md` —
+  baseline profile before this change (46 % cycles in glibc
+  allocator)
+- `~/project/docs/profile-rustgb-list-splice-staging-5101449.md` —
+  profile after this change (companion report)
+- ADR-014 — the deferred-follow-up entry this ADR closes partially
+- ADR-001 — flat-array-is-default anchor; unchanged
+- ADR-006 — Vec backend's merge contract, for contrast
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
