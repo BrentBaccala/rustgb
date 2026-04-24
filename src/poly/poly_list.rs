@@ -466,6 +466,23 @@ impl Poly {
         merge(ring, self, other, false)
     }
 
+    /// Destructive addition: `self + other`, reusing both inputs' list
+    /// nodes in the output chain rather than allocating fresh ones.
+    /// Mirrors Singular's `p_Add_q` template
+    /// (`~/Singular/libpolys/polys/templates/p_Add_q__T.cc`) — see
+    /// ADR-015 for the contract mapping. Both operands are consumed
+    /// (ownership transfer enforces Singular's "Destroys: p, q"
+    /// comment at the Rust type level).
+    pub fn add_consuming(self, other: Poly, ring: &Ring) -> Poly {
+        if other.is_zero() {
+            return self;
+        }
+        if self.is_zero() {
+            return other;
+        }
+        merge_consuming(ring, self, other, false)
+    }
+
     /// Out-of-place subtraction.
     pub fn sub(&self, other: &Poly, ring: &Ring) -> Poly {
         if other.is_zero() {
@@ -689,6 +706,171 @@ impl Poly {
         Some(out)
     }
 
+    /// Destructive variant of [`sub_mul_term`](Self::sub_mul_term):
+    /// `self - c * m * q`, destroying `self` and reusing its list nodes
+    /// in the output chain. `m` and `q` are read-only (const in
+    /// Singular's terminology).
+    ///
+    /// Mirrors Singular's `p_Minus_mm_Mult_qq` template
+    /// (`~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc`).
+    /// See ADR-015 for the contract mapping. Returns `None` if any
+    /// `m * q[i]` product overflows the 7-bit-per-variable exponent
+    /// budget.
+    ///
+    /// Includes the tail-splice fast path: when `self` exhausts before
+    /// `q`, the remainder of `-c * m * q` is produced in a single pass
+    /// and appended, rather than going through the compare loop.
+    pub fn sub_mm_mult_qq_consuming(
+        mut self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+    ) -> Option<Poly> {
+        debug_assert!(c < ring.field().p());
+        if c == 0 || q.is_zero() {
+            return Some(self);
+        }
+        let f = ring.field();
+
+        // Sentinel-slot pattern: `sentinel_slot` is a stack-local
+        // `Option<Box<Node>>` that will end up containing the output
+        // chain's head. The `tail_slot` raw pointer tracks the
+        // `Option<Box<Node>>` slot where the next node attaches (starts
+        // at &mut sentinel_slot, moves to &mut new_node.next after each
+        // append). Safe Rust can't express this append-to-tail pattern
+        // directly because each `&mut Option<Box<Node>>` alias-blocks
+        // everything else reachable from the sentinel; see ADR-015 for
+        // the soundness argument.
+        let mut sentinel_slot: Option<Box<Node>> = None;
+        let mut tail_slot: *mut Option<Box<Node>> = &mut sentinel_slot;
+        let mut out_len: usize = 0;
+
+        // Take ownership of self's chain. From here on, `self` is not
+        // used until we reconstruct a Poly at the end.
+        let mut left: Option<Box<Node>> = self.head.take();
+        let mut right = q.head.as_deref();
+
+        // SAFETY: Every write through `tail_slot` targets an
+        // `Option<Box<Node>>` that belongs to either `sentinel_slot`
+        // (on the first iteration) or the `next` field of the node
+        // most recently appended (which `sentinel_slot` transitively
+        // owns). `sentinel_slot` is a stack-local that outlives every
+        // `tail_slot` update in this function. No other live reference
+        // to any tail slot exists during the writes: the input chains
+        // (`left`, `right`) are walked separately, and on each
+        // iteration we transfer ownership of any spliced input node
+        // into the output before dereferencing `tail_slot`. At the
+        // end, `sentinel_slot.take()` moves the chain out.
+        //
+        // On early-return via `?` (monomial overflow), Rust's drop
+        // glue runs: `sentinel_slot` drops the partial output chain,
+        // `left` drops the unvisited self-tail, and `self` drops with
+        // `head = None`. No leak, no double-free.
+        unsafe {
+            loop {
+                let (l_ref, r_node) = match (left.as_ref(), right) {
+                    (Some(l), Some(r)) => (l, r),
+                    _ => break,
+                };
+                let r_mono = m.mul(&r_node.mono, ring)?;
+                match l_ref.mono.cmp(&r_mono, ring) {
+                    std::cmp::Ordering::Greater => {
+                        // Splice left's head into the output tail.
+                        let mut node = left.take().unwrap();
+                        left = node.next.take();
+                        // Install `node` at *tail_slot and advance
+                        // `tail_slot` to point at `node.next`.
+                        *tail_slot = Some(node);
+                        let next_slot: *mut Option<Box<Node>> =
+                            &mut (*tail_slot).as_mut().unwrap().next;
+                        tail_slot = next_slot;
+                        out_len += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        // Emit a fresh node for `-c * q_coeff * (m * q_mono)`.
+                        // `r_mono` is already the product.
+                        let neg = f.neg(f.mul(c, r_node.coeff));
+                        right = r_node.next.as_deref();
+                        if neg != 0 {
+                            let fresh = Box::new(Node {
+                                coeff: neg,
+                                mono: r_mono,
+                                next: None,
+                            });
+                            *tail_slot = Some(fresh);
+                            let next_slot: *mut Option<Box<Node>> =
+                                &mut (*tail_slot).as_mut().unwrap().next;
+                            tail_slot = next_slot;
+                            out_len += 1;
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Reuse left's node if the difference is
+                        // nonzero; otherwise free it.
+                        let cmq = f.mul(c, r_node.coeff);
+                        let diff = f.sub(l_ref.coeff, cmq);
+                        right = r_node.next.as_deref();
+                        let mut node = left.take().unwrap();
+                        left = node.next.take();
+                        if diff != 0 {
+                            node.coeff = diff;
+                            *tail_slot = Some(node);
+                            let next_slot: *mut Option<Box<Node>> =
+                                &mut (*tail_slot).as_mut().unwrap().next;
+                            tail_slot = next_slot;
+                            out_len += 1;
+                        }
+                        // else: `node` drops here (freed).
+                    }
+                }
+            }
+
+            // Tail splices. At most one of `left` / `right` is nonempty.
+            if let Some(l_head) = left.take() {
+                // Self still has terms; q is exhausted. Splice the
+                // entire remaining chain in one assignment and count
+                // its length by walking.
+                let mut remaining_len = 1usize;
+                let mut node = l_head.next.as_deref();
+                while let Some(x) = node {
+                    remaining_len += 1;
+                    node = x.next.as_deref();
+                }
+                *tail_slot = Some(l_head);
+                out_len += remaining_len;
+                // `tail_slot` is no longer used after this point.
+            } else {
+                // Self exhausted; q may still have terms. Build the
+                // remainder of `-c * m * q` fresh.
+                while let Some(r_node) = right {
+                    let neg = f.neg(f.mul(c, r_node.coeff));
+                    right = r_node.next.as_deref();
+                    if neg == 0 {
+                        continue;
+                    }
+                    let prod_m = m.mul(&r_node.mono, ring)?;
+                    let fresh = Box::new(Node {
+                        coeff: neg,
+                        mono: prod_m,
+                        next: None,
+                    });
+                    *tail_slot = Some(fresh);
+                    let next_slot: *mut Option<Box<Node>> =
+                        &mut (*tail_slot).as_mut().unwrap().next;
+                    tail_slot = next_slot;
+                    out_len += 1;
+                }
+            }
+        }
+
+        // Move the chain out of the sentinel slot.
+        self.head = sentinel_slot.take();
+        self.len = out_len;
+        self.refresh_cache();
+        Some(self)
+    }
+
     /// Scale so the leading coefficient becomes 1.
     pub fn monic(&self, ring: &Ring) -> Option<Poly> {
         if self.is_zero() {
@@ -811,6 +993,149 @@ impl PartialEq for Poly {
     }
 }
 impl Eq for Poly {}
+
+/// Destructive merge: walk both chains, splicing input nodes
+/// directly into the output chain rather than allocating fresh
+/// ones. Mirrors Singular's `p_Add_q` node-splice pattern (see
+/// `~/Singular/libpolys/polys/templates/p_Add_q__T.cc` lines 57,
+/// 65, 71, 60-61, 67, 73). Both operands are consumed; `subtract`
+/// flag chooses add vs sub semantics on the second operand's
+/// coefficients.
+///
+/// Both inputs must be nonempty (callers guard zero operands).
+fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
+    debug_assert!(!a.is_zero());
+    debug_assert!(!b.is_zero());
+    let f = ring.field();
+
+    // Sentinel-slot pattern (see `sub_mm_mult_qq_consuming` for the
+    // soundness argument).
+    let mut sentinel_slot: Option<Box<Node>> = None;
+    let mut tail_slot: *mut Option<Box<Node>> = &mut sentinel_slot;
+    let mut out_len: usize = 0;
+
+    // Move both input chains into local owned variables. We can't
+    // destructure Poly because it has a custom Drop; `head.take()`
+    // leaves the Poly with `head = None`, so the subsequent implicit
+    // drop of `a` / `b` is O(1).
+    let mut a = a;
+    let mut b = b;
+    let mut left: Option<Box<Node>> = a.head.take();
+    let mut right: Option<Box<Node>> = b.head.take();
+
+    // SAFETY: Identical argument to `sub_mm_mult_qq_consuming`. Every
+    // write through `tail_slot` targets an `Option<Box<Node>>` that
+    // belongs to the sentinel chain. `sentinel_slot` outlives every
+    // update. Input nodes are moved into the output before any
+    // dereference of `tail_slot`.
+    unsafe {
+        loop {
+            let (l_ref, r_ref) = match (left.as_ref(), right.as_ref()) {
+                (Some(l), Some(r)) => (l, r),
+                _ => break,
+            };
+            match l_ref.mono.cmp(&r_ref.mono, ring) {
+                std::cmp::Ordering::Greater => {
+                    // Splice `left`'s head.
+                    let mut node = left.take().unwrap();
+                    left = node.next.take();
+                    *tail_slot = Some(node);
+                    let next_slot: *mut Option<Box<Node>> =
+                        &mut (*tail_slot).as_mut().unwrap().next;
+                    tail_slot = next_slot;
+                    out_len += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    // Splice `right`'s head (negating coeff if subtracting).
+                    let mut node = right.take().unwrap();
+                    right = node.next.take();
+                    if subtract {
+                        node.coeff = f.neg(node.coeff);
+                    }
+                    *tail_slot = Some(node);
+                    let next_slot: *mut Option<Box<Node>> =
+                        &mut (*tail_slot).as_mut().unwrap().next;
+                    tail_slot = next_slot;
+                    out_len += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Combine coefficients; reuse left's node if the
+                    // sum is nonzero, otherwise free both.
+                    let bc = if subtract {
+                        f.neg(r_ref.coeff)
+                    } else {
+                        r_ref.coeff
+                    };
+                    let s = f.add(l_ref.coeff, bc);
+                    // Consume both heads.
+                    let mut l_node = left.take().unwrap();
+                    left = l_node.next.take();
+                    let mut r_node = right.take().unwrap();
+                    right = r_node.next.take();
+                    if s != 0 {
+                        l_node.coeff = s;
+                        *tail_slot = Some(l_node);
+                        let next_slot: *mut Option<Box<Node>> =
+                            &mut (*tail_slot).as_mut().unwrap().next;
+                        tail_slot = next_slot;
+                        out_len += 1;
+                    }
+                    // `l_node` (if dropped here) and `r_node` are freed.
+                    // Drop `r_node` explicitly to make the intent clear.
+                    drop(r_node);
+                }
+            }
+        }
+
+        // Tail splices: one side is exhausted. Splice the remainder
+        // of the other side in a single pointer assignment.
+        if let Some(l_head) = left.take() {
+            let mut remaining_len = 1usize;
+            let mut node = l_head.next.as_deref();
+            while let Some(x) = node {
+                remaining_len += 1;
+                node = x.next.as_deref();
+            }
+            *tail_slot = Some(l_head);
+            out_len += remaining_len;
+        } else if let Some(r_head) = right.take() {
+            // If subtracting, every node's coeff must be negated.
+            // Otherwise the remainder can be spliced as-is.
+            if subtract {
+                let mut cur: Option<Box<Node>> = Some(r_head);
+                while let Some(mut node) = cur {
+                    let next = node.next.take();
+                    node.coeff = f.neg(node.coeff);
+                    *tail_slot = Some(node);
+                    let next_slot: *mut Option<Box<Node>> =
+                        &mut (*tail_slot).as_mut().unwrap().next;
+                    tail_slot = next_slot;
+                    out_len += 1;
+                    cur = next;
+                }
+            } else {
+                let mut remaining_len = 1usize;
+                let mut node = r_head.next.as_deref();
+                while let Some(x) = node {
+                    remaining_len += 1;
+                    node = x.next.as_deref();
+                }
+                *tail_slot = Some(r_head);
+                out_len += remaining_len;
+            }
+        }
+    }
+
+    let mut out = Poly {
+        head: sentinel_slot.take(),
+        len: out_len,
+        lm_sev: 0,
+        lm_coeff: 0,
+        lm_deg: 0,
+    };
+    out.refresh_cache();
+    out
+}
 
 /// Merge two polynomials into one via a splice-style two-pointer
 /// walk along both chains. If `subtract` is true, the second
@@ -1093,6 +1418,279 @@ mod tests {
         // advance past end is a no-op.
         c.advance();
         assert!(c.is_done());
+    }
+
+    #[test]
+    fn add_consuming_matches_add() {
+        // Round-trip: destructive add matches non-destructive add on
+        // the same inputs.
+        let r = mk_ring(3, 13);
+        let a = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[2, 0, 0])),
+                (5, mono(&r, &[1, 1, 0])),
+                (1, mono(&r, &[0, 0, 2])),
+            ],
+        );
+        let b = Poly::from_terms(
+            &r,
+            vec![
+                (2, mono(&r, &[1, 1, 0])),
+                (4, mono(&r, &[0, 2, 0])),
+                (9, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let expected = a.add(&b, &r);
+        let got = a.clone().add_consuming(b.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn add_consuming_cancellation_middle() {
+        // Middle-of-chain cancellation: a has x^2 + x + 1, b has -x.
+        // Output should be x^2 + 1.
+        let r = mk_ring(1, 13);
+        let a = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[2])),
+                (1, mono(&r, &[1])),
+                (1, mono(&r, &[0])),
+            ],
+        );
+        let b = Poly::from_terms(&r, vec![(12, mono(&r, &[1]))]); // -1
+        let expected = a.add(&b, &r);
+        let got = a.clone().add_consuming(b.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn add_consuming_full_cancellation() {
+        // f + (-f) = 0.
+        let r = mk_ring(3, 13);
+        let f = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[1, 0, 0])),
+                (5, mono(&r, &[0, 2, 0])),
+                (1, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let neg_f = f.neg(&r);
+        let got = f.clone().add_consuming(neg_f, &r);
+        got.assert_canonical(&r);
+        assert!(got.is_zero());
+    }
+
+    #[test]
+    fn add_consuming_tail_splice_left_longer() {
+        // Left has more terms past the last b-term, exercising the
+        // tail-splice path for `left`.
+        let r = mk_ring(3, 13);
+        let a = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[3, 0, 0])),
+                (5, mono(&r, &[2, 0, 0])),
+                (7, mono(&r, &[1, 0, 0])),
+                (2, mono(&r, &[0, 1, 0])),
+                (4, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let b = Poly::from_terms(&r, vec![(1, mono(&r, &[3, 0, 0]))]);
+        let expected = a.add(&b, &r);
+        let got = a.clone().add_consuming(b.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn add_consuming_tail_splice_right_longer() {
+        // Right has more terms past the last a-term.
+        let r = mk_ring(3, 13);
+        let a = Poly::from_terms(&r, vec![(3, mono(&r, &[3, 0, 0]))]);
+        let b = Poly::from_terms(
+            &r,
+            vec![
+                (5, mono(&r, &[2, 0, 0])),
+                (7, mono(&r, &[1, 0, 0])),
+                (2, mono(&r, &[0, 1, 0])),
+                (4, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let expected = a.add(&b, &r);
+        let got = a.clone().add_consuming(b.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn add_consuming_single_terms() {
+        let r = mk_ring(2, 7);
+        let a = Poly::monomial(&r, 3, mono(&r, &[1, 0]));
+        let b = Poly::monomial(&r, 4, mono(&r, &[0, 1]));
+        let expected = a.add(&b, &r);
+        let got = a.clone().add_consuming(b.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn add_consuming_zero_operands() {
+        let r = mk_ring(2, 7);
+        let f = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
+        let z = Poly::zero();
+        // f + 0 = f.
+        let got = f.clone().add_consuming(z.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, f);
+        // 0 + f = f.
+        let got = Poly::zero().add_consuming(f.clone(), &r);
+        got.assert_canonical(&r);
+        assert_eq!(got, f);
+        // 0 + 0 = 0.
+        let got = Poly::zero().add_consuming(Poly::zero(), &r);
+        assert!(got.is_zero());
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_matches_sub_mul_term() {
+        // Round-trip: destructive equals non-destructive on the same
+        // inputs.
+        let r = mk_ring(3, 13);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[2, 1, 0])),
+                (7, mono(&r, &[1, 0, 1])),
+                (1, mono(&r, &[0, 0, 2])),
+            ],
+        );
+        let q = Poly::from_terms(
+            &r,
+            vec![(4, mono(&r, &[1, 1, 0])), (5, mono(&r, &[0, 0, 1]))],
+        );
+        let m = mono(&r, &[1, 0, 0]);
+        let c: Coeff = 2;
+
+        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_cancellation() {
+        // Choose inputs so a specific term cancels.
+        let r = mk_ring(2, 13);
+        // p = x^2 + xy + y^2. q = x + y. m = x, c = 1.
+        // p - 1 * x * (x + y) = p - (x^2 + xy) = y^2.
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[2, 0])),
+                (1, mono(&r, &[1, 1])),
+                (1, mono(&r, &[0, 2])),
+            ],
+        );
+        let q = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0])), (1, mono(&r, &[0, 1]))]);
+        let m = mono(&r, &[1, 0]);
+        let got = p.clone().sub_mm_mult_qq_consuming(1, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        let expected = p.sub_mul_term(1, &m, &q, &r).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_tail_splice_self_exhausts() {
+        // `p` exhausts before `q*m*c` does — exercises the
+        // "self exhausts; q may still have terms" path.
+        let r = mk_ring(2, 13);
+        // p = x^3 (leading only). q has many smaller terms after
+        // matching x^2 via m = x.
+        let p = Poly::from_terms(&r, vec![(3, mono(&r, &[3, 0]))]);
+        let q = Poly::from_terms(
+            &r,
+            vec![
+                (1, mono(&r, &[2, 0])),
+                (2, mono(&r, &[1, 1])),
+                (4, mono(&r, &[0, 2])),
+                (5, mono(&r, &[0, 0])),
+            ],
+        );
+        let m = mono(&r, &[1, 0]);
+        let c: Coeff = 1;
+        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_tail_splice_q_exhausts() {
+        // `q*m*c` exhausts before `p` does.
+        let r = mk_ring(2, 13);
+        let p = Poly::from_terms(
+            &r,
+            vec![
+                (3, mono(&r, &[5, 0])),
+                (2, mono(&r, &[4, 0])),
+                (1, mono(&r, &[3, 0])),
+                (4, mono(&r, &[0, 1])),
+                (5, mono(&r, &[0, 0])),
+            ],
+        );
+        let q = Poly::from_terms(&r, vec![(1, mono(&r, &[4, 0]))]);
+        let m = mono(&r, &[1, 0]);
+        let c: Coeff = 1;
+        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_zero_coeff() {
+        // c = 0 returns self unchanged.
+        let r = mk_ring(2, 13);
+        let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
+        let q = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0]))]);
+        let m = mono(&r, &[0, 1]);
+        let got = p.clone().sub_mm_mult_qq_consuming(0, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, p);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_zero_q() {
+        // q = 0 returns self unchanged.
+        let r = mk_ring(2, 13);
+        let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
+        let q = Poly::zero();
+        let m = mono(&r, &[0, 1]);
+        let got = p.clone().sub_mm_mult_qq_consuming(2, &m, &q, &r).unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, p);
+    }
+
+    #[test]
+    fn sub_mm_mult_qq_consuming_self_zero() {
+        // self = 0; result is -c*m*q, same as Poly::zero().sub_mul_term(...).
+        let r = mk_ring(2, 13);
+        let q = Poly::from_terms(&r, vec![(3, mono(&r, &[1, 0])), (2, mono(&r, &[0, 1]))]);
+        let m = mono(&r, &[1, 0]);
+        let c: Coeff = 2;
+        let expected = Poly::zero().sub_mul_term(c, &m, &q, &r).unwrap();
+        let got = Poly::zero()
+            .sub_mm_mult_qq_consuming(c, &m, &q, &r)
+            .unwrap();
+        got.assert_canonical(&r);
+        assert_eq!(got, expected);
     }
 
     #[test]

@@ -430,6 +430,18 @@ impl Poly {
         merge(ring, self, other, false)
     }
 
+    /// Consuming addition. Equivalent to `self.add(&other, ring)` on the
+    /// Vec backend — there is no splice story for flat arrays, so the
+    /// by-value inputs are simply dropped after the non-destructive
+    /// merge produces its output. The method exists so callers (notably
+    /// `kbucket::absorb`) can use the same API regardless of backend;
+    /// on the List backend (ADR-015) this variant splices input nodes
+    /// directly into the output chain. See `p_Add_q` in
+    /// `~/Singular/libpolys/polys/templates/p_Add_q__T.cc`.
+    pub fn add_consuming(self, other: Poly, ring: &Ring) -> Poly {
+        self.add(&other, ring)
+    }
+
     /// Out-of-place subtraction.
     pub fn sub(&self, other: &Poly, ring: &Ring) -> Poly {
         if other.is_zero() {
@@ -605,6 +617,25 @@ impl Poly {
         };
         out.refresh_cache();
         Some(out)
+    }
+
+    /// Consuming variant of [`sub_mul_term`](Self::sub_mul_term). Same
+    /// semantics as `self.sub_mul_term(c, m, &q, ring)` on the Vec
+    /// backend — the by-value `self` is dropped after the result is
+    /// produced. Exists so callers (notably `kbucket::minus_m_mult_p`)
+    /// can use the same API regardless of backend; on the List backend
+    /// (ADR-015) this variant destructively reuses `self`'s nodes, and
+    /// allocates new nodes only for the `m * q[i]` products it needs
+    /// to emit. See `p_Minus_mm_Mult_qq` in
+    /// `~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc`.
+    pub fn sub_mm_mult_qq_consuming(
+        self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+    ) -> Option<Poly> {
+        self.sub_mul_term(c, m, q, ring)
     }
 
     /// Return a scalar multiple that makes the leading coefficient 1.
