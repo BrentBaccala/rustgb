@@ -2811,6 +2811,166 @@ change.
 
 ---
 
+## ADR-018: Drop per-mul overflow check (implementing ADR-017 Option 2)
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+Post-ADR-017 profiling on c200-1 (`/tmp/c200-perf.log`,
+`/tmp/c200-bench.log`, 2026-04-24) placed `sub_mm_mult_qq_consuming`
+at ~47 % of total cycles on staging-5101449, vs Singular's
+ring-specialised `p_Minus_mm_Mult_mm_Mult_qq__FieldZp_LengthEight_OrdPosNomogZero`
+at ~1.7 % for the same algorithmic work. The overwhelming portion
+of that gap is Singular's construction-time specialisation (length-
+dispatched `p_Minus_mm_Mult_qq__T.cc` instantiations with the ring's
+monomial-comparison function inlined), which is architectural and
+out of scope here. The single biggest same-shape difference that
+remains is the per-mul overflow check: rustgb's `Monomial::mul`
+tests the divmask guard bits on every monomial product, while
+Singular's `p_ExpVectorAdd` / `p_MemAdd_LengthGeneral` is a bare
+scalar add loop in release builds (`~/Singular/libpolys/polys/monomials/p_polys.h:1432`
+and `~/Singular/libpolys/polys/templates/p_MemAdd.h:173`).
+
+ADR-017 introduced this as **Option 2 — drop the per-mul overflow
+check; mirror Singular**, but deferred it on the grounds that it
+touches ADR-005's "check every op" invariant. ADR-017 Option 1
+(split the add from the overflow check) was landed instead, and
+post-that-change profiling confirmed `Monomial::mul` is still
+significant enough that Option 2 is now worth pursuing. This ADR
+implements Option 2.
+
+### Singular precedent
+
+`~/Singular/libpolys/polys/monomials/p_polys.h:1432`:
+
+```c
+static inline void p_ExpVectorAdd(poly p1, poly p2, const ring r) {
+    p_LmCheckPolyRing1(p1, r);
+    p_LmCheckPolyRing1(p2, r);
+#if PDEBUG >= 1
+    for (int i=1; i<=r->N; i++)
+        pAssume1((unsigned long) (p_GetExp(p1, i, r)
+                                 + p_GetExp(p2, i, r)) <= r->bitmask);
+#endif
+    p_MemAdd_LengthGeneral(p1->exp, p2->exp, r->ExpL_Size);
+    p_MemAdd_NegWeightAdjust(p1, r);
+}
+```
+
+The per-variable-sum check is compiled only under `PDEBUG >= 1`.
+Release builds perform the bare `p_MemAdd_LengthGeneral`
+scalar-loop add. Overflow is prevented at ring construction: the
+caller (ultimately `rComplete` in
+`~/Singular/libpolys/polys/monomials/ring.cc`) sizes `r->bitmask`
+so the requested per-variable bound + all bba-step products fit in
+the packed exponent width. Violating the contract produces silent
+exponent corruption, not a detected error.
+
+FLINT (`~/flint/src/mpoly.h:233,374`, `mpoly_monomial_add` /
+`mpoly_monomial_overflows`) is different: it does the overflow
+check in a separate `FLINT_FORCE_INLINE` pass that the caller
+invokes only when needed. On the bba hot path we care about,
+FLINT has no GB engine to compare, so FLINT is an imperfect
+reference for this specific decision.
+
+### Decision
+
+Match Singular's contract. Specifically:
+
+1. `Monomial::mul` is infallible. Signature
+   `fn mul(&self, &Self, &Ring) -> Self` (was `-> Option<Self>`).
+   Release builds do not check per-byte or u32-total-degree overflow.
+2. Debug builds retain both checks via `debug_assert!` (guard-bit
+   divmask OR-reduce, and `u32::checked_add` on total degree).
+   Debug panics mirror Singular's `pAssume1` behaviour under
+   `PDEBUG >= 1`.
+3. Ring construction (`Ring::new`) documents the caller's
+   obligation: no bba-step product in the intended computation
+   may exceed `MAX_VAR_EXP` (= 127) per variable or `u32::MAX` in
+   total degree. This matches Singular's `rComplete` / `bitmask`
+   sizing model. The contract is descriptive, not enforced (no
+   runtime check at ring-construction time either; matching
+   Singular).
+4. The Singular dispatch shim (`Singular-rustgb`'s
+   `rustgb-dispatch.lib`) already filters by ≤31 vars / Z/p /
+   degrevlex. Those filters remain adequate for current staging
+   workloads. If a future FFI caller admits rings whose bba-step
+   products could overflow, the dispatch filter must tighten
+   before the ring reaches `Ring::new` — out of scope here.
+
+### Consequences
+
+Caller-side simplifications landed in commit `e173584`:
+
+- `Poly::sub_mul_term` → `Poly`, not `Option<Poly>`. Drops the
+  `on_overflow!` macro, the `release_partial` helper, and both
+  per-word `return None` sites.
+- `Poly::sub_mm_mult_qq_consuming` → `Poly`. Drops the
+  `Option<()>` outcome wrapper, the outer `None` branch with
+  its `release_partial` calls, and both `None => return None`
+  arms inside the merge and tail-splice loops. The sentinel-slot
+  drop path on normal return is unchanged.
+- `Poly::mul`, `Poly::shift` → `Poly`, not `Option<Poly>`. Same
+  simplification (drop `?` after the monomial mul).
+- `KBucket::minus_m_mult_p`: the `match ... { Some, None }` on
+  `sub_mm_mult_qq_consuming` becomes a direct `let`-binding. The
+  silent-noop-on-overflow fallback is gone.
+- `ReducerHeap::push_current_term` and `pop_with_cancellation`:
+  both `r.multiplier.mul(m, &self.ring)` sites become direct
+  `let`-bindings with no `match`.
+- Example binaries and the bba/kbucket/monomial/poly property
+  tests all simplify accordingly.
+
+All three test configurations (default / `linked_list_poly` /
+`linked_list_poly linked_list_poly_pool`) pass with the same test
+counts as before this ADR (195 / 209 / 210).
+
+### What this does NOT do
+
+ADR-017 listed a four-stage plan for `Monomial::mul` cost
+reduction. This ADR implements **Stage A only**. The remaining
+stages are separate, each a future ADR if pursued:
+
+- **Stage B — drop `sev: u64` from `Monomial`.** The SEV bloom
+  filter is a bba-sweep divisibility pre-filter (ADR-005, ADR-009);
+  removing it from `Monomial` would require recomputing SEV at the
+  sweep boundary instead of caching it per-monomial. Not in scope
+  here.
+- **Stage C — drop `total_deg: u32` from `Monomial`.** The byte-31
+  cap (min(total, 255)) would need a different recovery path for
+  saturated-cap comparisons (currently falls back on the u32
+  cache). Not in scope here.
+- **Stage D — hand-specialised `_zp_degrevlex_len4` shape
+  mirroring Singular's length-8 ring-specialised inline.** This
+  is the architectural gap that explains most of the 47 % vs 1.7 %
+  discrepancy; it is a major restructuring (ring-indexed dispatch
+  table, per-length instantiations). Not in scope here.
+
+### References
+
+- Commit `c7e8a94` — `monomial: Monomial::mul becomes infallible`
+  (signature change, debug-only `debug_assert!`, Ring::new doc
+  contract).
+- Commit `e173584` — `poly/kbucket/reducer: drop overflow
+  propagation from mul-using sites` (caller simplifications).
+- `~/project/docs/profile-rustgb-no-overflow-check-staging-5101449.md`
+  — c200-1 pre/post wall-clock and call-graph for this ADR.
+- `~/project/docs/profile-rustgb-monomial-mul-fix-staging-5101449.md`
+  — post-ADR-017 baseline.
+- ADR-017 Option 2 deferral text.
+- ADR-005 — packed direct exponents + the original per-op
+  overflow invariant this ADR relaxes.
+- `~/Singular/libpolys/polys/monomials/p_polys.h:1432` —
+  `p_ExpVectorAdd`.
+- `~/Singular/libpolys/polys/templates/p_MemAdd.h:173` —
+  `p_MemAdd_LengthGeneral`.
+- `~/Singular/libpolys/polys/monomials/ring.cc` — `rComplete` /
+  bitmask sizing.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
