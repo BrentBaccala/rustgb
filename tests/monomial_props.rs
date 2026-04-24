@@ -67,30 +67,30 @@ proptest! {
     #[test]
     fn mul_associative((r, a, b, c) in ring_mono3_strategy()) {
         // Exponents capped at 20 to keep products in range.
-        let ab = a.mul(&b, &r).unwrap();
-        let ab_c = ab.mul(&c, &r).unwrap();
-        let bc = b.mul(&c, &r).unwrap();
-        let a_bc = a.mul(&bc, &r).unwrap();
+        let ab = a.mul(&b, &r);
+        let ab_c = ab.mul(&c, &r);
+        let bc = b.mul(&c, &r);
+        let a_bc = a.mul(&bc, &r);
         prop_assert_eq!(ab_c, a_bc);
     }
 
     #[test]
     fn mul_commutative((r, a, b) in ring_mono2_strategy()) {
-        let ab = a.mul(&b, &r).unwrap();
-        let ba = b.mul(&a, &r).unwrap();
+        let ab = a.mul(&b, &r);
+        let ba = b.mul(&a, &r);
         prop_assert_eq!(ab, ba);
     }
 
     #[test]
     fn a_divides_ab((r, a, b) in ring_mono2_strategy()) {
-        let ab = a.mul(&b, &r).unwrap();
+        let ab = a.mul(&b, &r);
         prop_assert!(a.divides(&ab, &r));
         prop_assert!(b.divides(&ab, &r));
     }
 
     #[test]
     fn div_after_mul_recovers((r, a, b) in ring_mono2_strategy()) {
-        let ab = a.mul(&b, &r).unwrap();
+        let ab = a.mul(&b, &r);
         prop_assert_eq!(ab.div(&b, &r).unwrap(), a);
     }
 
@@ -110,13 +110,13 @@ proptest! {
 
     #[test]
     fn total_deg_is_sum((r, a, b) in ring_mono2_strategy()) {
-        let ab = a.mul(&b, &r).unwrap();
+        let ab = a.mul(&b, &r);
         prop_assert_eq!(ab.total_deg(), a.total_deg() + b.total_deg());
     }
 
     #[test]
     fn sev_of_product_is_or((r, a, b) in ring_mono2_strategy()) {
-        let ab = a.mul(&b, &r).unwrap();
+        let ab = a.mul(&b, &r);
         prop_assert_eq!(ab.sev(), a.sev() | b.sev());
     }
 
@@ -161,7 +161,7 @@ proptest! {
     fn assert_canonical_after_ops((r, a, b) in ring_mono2_strategy()) {
         a.assert_canonical(&r);
         b.assert_canonical(&r);
-        let ab = a.mul(&b, &r).unwrap();
+        let ab = a.mul(&b, &r);
         ab.assert_canonical(&r);
         let l = a.lcm(&b, &r);
         l.assert_canonical(&r);

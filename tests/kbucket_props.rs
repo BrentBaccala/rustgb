@@ -67,15 +67,15 @@ fn bucket_workload_strategy()
 }
 
 /// Slow-path fold: start with `p`, then for each `(m, c, q)` set
-/// `p ← p - c*m*q` via `Poly::sub_mul_term`. Skip reducers whose
-/// product overflows the 8-bit budget (those are infeasible for both
-/// paths).
-fn slow_fold(ring: &Ring, seed: Poly, ops: &[(Monomial, Coeff, Poly)]) -> Option<Poly> {
+/// `p ← p - c*m*q` via `Poly::sub_mul_term`. Per ADR-018,
+/// `sub_mul_term` is infallible in release; the workload strategies
+/// keep exponents well within the 7-bit budget.
+fn slow_fold(ring: &Ring, seed: Poly, ops: &[(Monomial, Coeff, Poly)]) -> Poly {
     let mut acc = seed;
     for (m, c, q) in ops {
-        acc = acc.sub_mul_term(*c, m, q, ring)?;
+        acc = acc.sub_mul_term(*c, m, q, ring);
     }
-    Some(acc)
+    acc
 }
 
 /// Bucket-path fold.
@@ -95,10 +95,7 @@ proptest! {
     fn bucket_fold_matches_slow_path(
         (r, seed, ops) in bucket_workload_strategy()
     ) {
-        let slow = match slow_fold(&r, seed.clone(), &ops) {
-            Some(p) => p,
-            None => return Ok(()), // monomial overflow; skip
-        };
+        let slow = slow_fold(&r, seed.clone(), &ops);
         let fast = bucket_fold(Arc::clone(&r), seed, &ops);
         slow.assert_canonical(&r);
         fast.assert_canonical(&r);
@@ -118,10 +115,7 @@ proptest! {
     fn leading_matches_poly_leading(
         (r, seed, ops) in bucket_workload_strategy()
     ) {
-        let slow = match slow_fold(&r, seed.clone(), &ops) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let slow = slow_fold(&r, seed.clone(), &ops);
 
         let mut b = KBucket::from_poly(Arc::clone(&r), seed);
         for (m, c, q) in &ops {
@@ -144,10 +138,7 @@ proptest! {
     fn is_zero_matches_poly_is_zero(
         (r, seed, ops) in bucket_workload_strategy()
     ) {
-        let slow = match slow_fold(&r, seed.clone(), &ops) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let slow = slow_fold(&r, seed.clone(), &ops);
         let mut b = KBucket::from_poly(Arc::clone(&r), seed);
         for (m, c, q) in &ops {
             b.minus_m_mult_p(m, *c, q);
@@ -161,10 +152,7 @@ proptest! {
     fn extract_leading_then_into_poly_matches_tail(
         (r, seed, ops) in bucket_workload_strategy()
     ) {
-        let slow = match slow_fold(&r, seed.clone(), &ops) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let slow = slow_fold(&r, seed.clone(), &ops);
 
         let mut b = KBucket::from_poly(Arc::clone(&r), seed);
         for (m, c, q) in &ops {
@@ -271,7 +259,7 @@ fn small_bba_like_workload_matches() {
         ),
     ];
 
-    let slow = slow_fold(&r, seed.clone(), &ops).expect("no overflow on fixed fixture");
+    let slow = slow_fold(&r, seed.clone(), &ops);
     let fast = bucket_fold(r.clone(), seed, &ops);
     slow.assert_canonical(&r);
     fast.assert_canonical(&r);

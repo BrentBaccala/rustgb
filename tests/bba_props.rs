@@ -99,9 +99,7 @@ fn normal_form(p: &Poly, gb: &[Poly], ring: &Ring) -> Poly {
                 let f = ring.field();
                 let inv = f.inv(s_c).expect("invertible");
                 let coeff = f.mul(c, inv);
-                cur = cur
-                    .sub_mul_term(coeff, &mult, s, ring)
-                    .expect("no overflow");
+                cur = cur.sub_mul_term(coeff, &mult, s, ring);
                 continue 'outer;
             }
         }
@@ -122,7 +120,7 @@ fn normal_form(p: &Poly, gb: &[Poly], ring: &Ring) -> Poly {
                     let coeff = f.mul(c, inv);
                     // single-term working poly
                     let t = Poly::monomial(ring, c, m.clone());
-                    let r = t.sub_mul_term(coeff, &mult, s, ring).expect("no overflow");
+                    let r = t.sub_mul_term(coeff, &mult, s, ring);
                     for (rc, rm) in r.iter() {
                         rebuilt.push((rc, rm.clone()));
                     }

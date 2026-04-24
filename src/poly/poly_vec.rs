@@ -492,15 +492,16 @@ impl Poly {
         out
     }
 
-    /// Multiply every monomial by `m` (no scalar scaling). Requires
-    /// that all products fit in the 8-bit exponent range.
-    pub fn shift(&self, m: &Monomial, ring: &Ring) -> Option<Poly> {
+    /// Multiply every monomial by `m` (no scalar scaling). Per ADR-018,
+    /// the caller's ring construction must ensure no product overflows
+    /// the 7-bit per-variable budget; release builds do not check.
+    pub fn shift(&self, m: &Monomial, ring: &Ring) -> Poly {
         if self.is_zero() {
-            return Some(Self::zero());
+            return Self::zero();
         }
         let mut terms = Vec::with_capacity(self.len());
         for t in &self.terms[self.head..] {
-            terms.push(t.mul(m, ring)?);
+            terms.push(t.mul(m, ring));
         }
         // Descending order is preserved: monomial multiplication by a
         // fixed m is monotone in degrevlex.
@@ -513,28 +514,29 @@ impl Poly {
             lm_deg: 0,
         };
         out.refresh_cache();
-        Some(out)
+        out
     }
 
     /// Standard multiplication. Straightforward O(|f|·|g|) using a
     /// merge-based accumulator; fine for tests. A heap-based Johnson
-    /// multiplication is future work.
-    pub fn mul(&self, other: &Poly, ring: &Ring) -> Option<Poly> {
+    /// multiplication is future work. Per ADR-018, the caller must
+    /// ensure no product overflows.
+    pub fn mul(&self, other: &Poly, ring: &Ring) -> Poly {
         if self.is_zero() || other.is_zero() {
-            return Some(Self::zero());
+            return Self::zero();
         }
         let f = ring.field();
         let mut acc: Vec<(Coeff, Monomial)> = Vec::with_capacity(self.len() * other.len());
         for (ca, ma) in self.iter() {
             for (cb, mb) in other.iter() {
-                let m = ma.mul(mb, ring)?;
+                let m = ma.mul(mb, ring);
                 let c = f.mul(ca, cb);
                 if c != 0 {
                     acc.push((c, m));
                 }
             }
         }
-        Some(Self::from_terms(ring, acc))
+        Self::from_terms(ring, acc)
     }
 
     /// The inner reduction step `p - c * m * q`.
@@ -544,10 +546,13 @@ impl Poly {
     /// `~/Singular/libpolys/polys/pInline2.h`) and of mathicgb's
     /// `Poly::combineInto`. We materialise `m*q` lazily during the
     /// merge so no intermediate polynomial is allocated.
-    pub fn sub_mul_term(&self, c: Coeff, m: &Monomial, q: &Poly, ring: &Ring) -> Option<Poly> {
+    ///
+    /// Per ADR-018, the caller's ring construction must ensure every
+    /// `m * q[i]` product stays in-range; release builds do not check.
+    pub fn sub_mul_term(&self, c: Coeff, m: &Monomial, q: &Poly, ring: &Ring) -> Poly {
         debug_assert!(c < ring.field().p());
         if c == 0 || q.is_zero() {
-            return Some(self.clone());
+            return self.clone();
         }
         let f = ring.field();
 
@@ -565,7 +570,7 @@ impl Poly {
 
         while i < s_m.len() && j < q_m.len() {
             // Next term from `c*m*q` is (c * q_c[j], m * q_m[j]).
-            let mq_term_mon = m.mul(&q_m[j], ring)?;
+            let mq_term_mon = m.mul(&q_m[j], ring);
             match s_m[i].cmp(&mq_term_mon, ring) {
                 std::cmp::Ordering::Greater => {
                     out_c.push(s_c[i]);
@@ -602,7 +607,7 @@ impl Poly {
             let neg = f.neg(f.mul(c, q_c[j]));
             if neg != 0 {
                 out_c.push(neg);
-                out_m.push(m.mul(&q_m[j], ring)?);
+                out_m.push(m.mul(&q_m[j], ring));
             }
             j += 1;
         }
@@ -616,7 +621,7 @@ impl Poly {
             lm_deg: 0,
         };
         out.refresh_cache();
-        Some(out)
+        out
     }
 
     /// Consuming variant of [`sub_mul_term`](Self::sub_mul_term). Same
@@ -634,7 +639,7 @@ impl Poly {
         m: &Monomial,
         q: &Poly,
         ring: &Ring,
-    ) -> Option<Poly> {
+    ) -> Poly {
         self.sub_mul_term(c, m, q, ring)
     }
 
@@ -932,9 +937,9 @@ mod tests {
         let c: Coeff = 2;
 
         // Slow path.
-        let mq = q.shift(&m, &r).unwrap().scale(c, &r);
+        let mq = q.shift(&m, &r).scale(c, &r);
         let slow = p.sub(&mq, &r);
-        let fast = p.sub_mul_term(c, &m, &q, &r).unwrap();
+        let fast = p.sub_mul_term(c, &m, &q, &r);
         slow.assert_canonical(&r);
         fast.assert_canonical(&r);
         assert_eq!(slow, fast);

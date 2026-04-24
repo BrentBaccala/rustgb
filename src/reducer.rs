@@ -295,28 +295,15 @@ impl<'a> ReducerHeap<'a> {
     /// XOR'd against the ring's cmp_flip_mask) and push a HeapNode
     /// for it. No-op if the reducer is exhausted (`index >= poly.len`).
     ///
-    /// In the unusual case where the multiplier × term product
-    /// would overflow the 7-bit-per-variable budget (ADR-005),
-    /// the term is dropped and the reducer is effectively
-    /// truncated. This matches the existing `KBucket::minus_m_mult_p`
-    /// silent-noop-on-overflow semantics; see ADR-005's deferred
-    /// "panic on overflow" enhancement.
+    /// Per ADR-018, the caller's ring construction must ensure
+    /// `multiplier * poly.terms[index]` products stay in-range;
+    /// release builds of `Monomial::mul` do not check.
     fn push_current_term(&mut self, reducer_idx: usize) {
         let r = &self.reducers[reducer_idx];
         let Some((_c, m)) = r.cursor.term() else {
             return;
         };
-        let Some(term_mono) = r.multiplier.mul(m, &self.ring) else {
-            // Overflow: drop this term (and effectively truncate
-            // the reducer at this index). Caller is responsible
-            // for ensuring this doesn't happen for correctness;
-            // see ADR-005.
-            debug_assert!(
-                false,
-                "monomial product overflowed during heap reduction"
-            );
-            return;
-        };
+        let term_mono = r.multiplier.mul(m, &self.ring);
         let mask = self.ring.cmp_flip_mask();
         let cmp_key = std::array::from_fn(|i| term_mono.packed()[i] ^ mask[i]);
         self.heap.push(HeapNode {
@@ -456,10 +443,7 @@ impl<'a> ReducerHeap<'a> {
             // so unpacking could get us back, but reading through the
             // cursor is simpler and works on both Poly backends.
             let (r_c, r_m) = r.cursor.term().expect("just pushed; live cursor");
-            let mono = r
-                .multiplier
-                .mul(r_m, &self.ring)
-                .expect("just pushed; overflow already checked");
+            let mono = r.multiplier.mul(r_m, &self.ring);
             let f = self.ring.field();
             let mut total_coeff = f.mul(r.coeff, r_c);
 
@@ -990,7 +974,7 @@ mod tests {
                         let multiplier = lm2.div(g_lm, ring).unwrap();
                         debug_assert_eq!(g.lm_coeff(), 1, "basis must be monic");
                         // working -= lc2 * multiplier * g
-                        working = working.sub_mul_term(lc2, &multiplier, g, ring).unwrap();
+                        working = working.sub_mul_term(lc2, &multiplier, g, ring);
                         continue 'outer;
                     } else {
                         // Move head to survivor and continue with tail.
@@ -1009,7 +993,7 @@ mod tests {
             let g_lm = g.leading().unwrap().1;
             let multiplier = lm.div(g_lm, ring).unwrap();
             debug_assert_eq!(g.lm_coeff(), 1, "basis must be monic");
-            current = current.sub_mul_term(lc, &multiplier, g, ring).unwrap();
+            current = current.sub_mul_term(lc, &multiplier, g, ring);
         }
     }
 

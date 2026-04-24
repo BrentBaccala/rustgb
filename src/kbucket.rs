@@ -258,10 +258,11 @@ impl KBucket {
     /// This is the bucket's bba-hot-path operation. It is the
     /// equivalent of Singular's `kBucket_Minus_m_Mult_p`.
     ///
-    /// In debug builds, a monomial overflow (`m * p_i` exceeding the
-    /// 8-bit exponent budget) triggers a panic. In release builds the
-    /// operation silently no-ops; callers who care must have already
-    /// validated the monomial arithmetic.
+    /// Per ADR-018, the caller's ring construction must ensure
+    /// `m * p_i` products stay in-range. Debug builds catch violations
+    /// via `debug_assert!` inside `Monomial::mul`; release builds
+    /// silently corrupt the monomial (matching Singular's
+    /// `p_ExpVectorAdd` release-mode contract).
     pub fn minus_m_mult_p(&mut self, m: &Monomial, c: Coeff, p: &Poly) {
         debug_assert!(c < self.ring.field().p());
         if c == 0 || p.is_zero() {
@@ -286,13 +287,11 @@ impl KBucket {
         debug_assert!(i < NUM_SLOTS, "slot overflow: p.len() = {}", p.len());
 
         let existing = self.slots[i].take().unwrap_or_else(Poly::zero);
-        let merged = match existing.sub_mm_mult_qq_consuming(c, m, p, &self.ring) {
-            Some(v) => v,
-            None => {
-                debug_assert!(false, "monomial product overflowed 8-bit exponent budget");
-                return;
-            }
-        };
+        // Per ADR-018, the caller's ring construction must ensure
+        // that `m * p[i]` products stay in-range; release builds
+        // do not check. Debug builds catch violations inside
+        // `Monomial::mul` via `debug_assert!`.
+        let merged = existing.sub_mm_mult_qq_consuming(c, m, p, &self.ring);
         self.mark_dirty(i);
         if merged.is_zero() {
             // Sum cancelled at this slot; no further work.
@@ -582,7 +581,7 @@ mod tests {
         b.minus_m_mult_p(&m, c, &q);
         b.assert_canonical();
 
-        let slow = Poly::zero().sub_mul_term(c, &m, &q, &r).unwrap();
+        let slow = Poly::zero().sub_mul_term(c, &m, &q, &r);
         let fast = b.into_poly();
         slow.assert_canonical(&r);
         fast.assert_canonical(&r);

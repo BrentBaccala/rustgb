@@ -641,11 +641,12 @@ impl Poly {
         })
     }
 
-    /// Multiply every monomial by `m`. Requires the products fit in
-    /// the exponent range.
-    pub fn shift(&self, m: &Monomial, ring: &Ring) -> Option<Poly> {
+    /// Multiply every monomial by `m`. Per ADR-018, the caller's ring
+    /// construction must ensure no product overflows the 7-bit
+    /// per-variable budget; release builds do not check.
+    pub fn shift(&self, m: &Monomial, ring: &Ring) -> Poly {
         if self.is_zero() {
-            return Some(Self::zero());
+            return Self::zero();
         }
         POOL.with(|pool_cell| {
             let mut pool = pool_cell.borrow_mut();
@@ -654,29 +655,7 @@ impl Poly {
             let mut node = self.head;
             while let Some(n) = node {
                 let n_ref = unsafe { n.as_ref() };
-                let new_mono = match n_ref.mono.mul(m, ring) {
-                    Some(v) => v,
-                    None => {
-                        // Early return: let the partial chain `out_head`
-                        // drop via `Poly`'s iterative Drop below. We
-                        // assemble a `Poly` shell with the chain's
-                        // partial state so the standard Drop path
-                        // releases it back to the pool.
-                        let partial = Poly {
-                            head: out_head,
-                            // `len` may be wrong here (we haven't been
-                            // counting), but Drop doesn't read it; it
-                            // walks the chain.
-                            len: 0,
-                            lm_sev: 0,
-                            lm_coeff: 0,
-                            lm_deg: 0,
-                        };
-                        drop(pool); // release borrow before `drop` touches POOL
-                        drop(partial);
-                        return None;
-                    }
-                };
+                let new_mono = n_ref.mono.mul(m, ring);
                 let fresh = pool.alloc(n_ref.coeff, new_mono, None);
                 unsafe {
                     *tail = Some(fresh);
@@ -694,59 +673,45 @@ impl Poly {
                 lm_deg: 0,
             };
             out.refresh_cache();
-            Some(out)
+            out
         })
     }
 
     /// Standard multiplication via an accumulator (same strategy as
-    /// the Vec backend).
-    pub fn mul(&self, other: &Poly, ring: &Ring) -> Option<Poly> {
+    /// the Vec backend). Per ADR-018, the caller must ensure no
+    /// product overflows.
+    pub fn mul(&self, other: &Poly, ring: &Ring) -> Poly {
         if self.is_zero() || other.is_zero() {
-            return Some(Self::zero());
+            return Self::zero();
         }
         let f = ring.field();
         let mut acc: Vec<(Coeff, Monomial)> = Vec::with_capacity(self.len * other.len);
         for (ca, ma) in self.iter() {
             for (cb, mb) in other.iter() {
-                let m = ma.mul(mb, ring)?;
+                let m = ma.mul(mb, ring);
                 let c = f.mul(ca, cb);
                 if c != 0 {
                     acc.push((c, m));
                 }
             }
         }
-        Some(Self::from_terms(ring, acc))
+        Self::from_terms(ring, acc)
     }
 
     /// The inner reduction step `self - c * m * q`. Splice-style
     /// two-pointer merge along both inputs' linked chains.
-    pub fn sub_mul_term(&self, c: Coeff, m: &Monomial, q: &Poly, ring: &Ring) -> Option<Poly> {
+    ///
+    /// Per ADR-018, the caller's ring construction must guarantee
+    /// that every `m * q[i]` product stays in-range; release builds
+    /// do not check.
+    pub fn sub_mul_term(&self, c: Coeff, m: &Monomial, q: &Poly, ring: &Ring) -> Poly {
         debug_assert!(c < ring.field().p());
         if c == 0 || q.is_zero() {
-            return Some(self.clone());
+            return self.clone();
         }
         let f = ring.field();
 
-        // Local helper: on early return, drop a partial chain via the
-        // pool without constructing a `Poly` shell (which would run
-        // `refresh_cache` on torn state).
-        fn release_partial(mut head: Option<NonNull<Node>>) {
-            if head.is_none() {
-                return;
-            }
-            POOL.with(|pool_cell| {
-                let mut pool = pool_cell.borrow_mut();
-                while let Some(h) = head {
-                    unsafe {
-                        let n = h.as_ptr();
-                        head = (*n).next.take();
-                        pool.dealloc(h);
-                    }
-                }
-            });
-        }
-
-        let result = POOL.with(|pool_cell| -> Option<Poly> {
+        POOL.with(|pool_cell| -> Poly {
             let mut pool = pool_cell.borrow_mut();
             let mut out_head: Option<NonNull<Node>> = None;
             let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
@@ -755,22 +720,11 @@ impl Poly {
             let mut left = self.head;
             let mut right = q.head;
 
-            macro_rules! on_overflow {
-                ($partial:expr) => {{
-                    drop(pool);
-                    release_partial($partial);
-                    return None;
-                }};
-            }
-
             while let (Some(l), Some(r)) = (left, right) {
                 // SAFETY: live nodes from `self` / `q`.
                 let l_ref = unsafe { l.as_ref() };
                 let r_ref = unsafe { r.as_ref() };
-                let r_mono = match m.mul(&r_ref.mono, ring) {
-                    Some(v) => v,
-                    None => on_overflow!(out_head),
-                };
+                let r_mono = m.mul(&r_ref.mono, ring);
                 match l_ref.mono.cmp(&r_mono, ring) {
                     std::cmp::Ordering::Greater => {
                         let fresh =
@@ -826,10 +780,7 @@ impl Poly {
                 let r_ref = unsafe { r.as_ref() };
                 let neg = f.neg(f.mul(c, r_ref.coeff));
                 if neg != 0 {
-                    let prod_m = match m.mul(&r_ref.mono, ring) {
-                        Some(v) => v,
-                        None => on_overflow!(out_head),
-                    };
+                    let prod_m = m.mul(&r_ref.mono, ring);
                     let fresh = pool.alloc(neg, prod_m, None);
                     unsafe {
                         *tail = Some(fresh);
@@ -848,9 +799,8 @@ impl Poly {
                 lm_deg: 0,
             };
             out.refresh_cache();
-            Some(out)
-        });
-        result
+            out
+        })
     }
 
     /// Destructive variant of [`sub_mul_term`](Self::sub_mul_term):
@@ -860,9 +810,10 @@ impl Poly {
     ///
     /// Mirrors Singular's `p_Minus_mm_Mult_qq` template
     /// (`~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc`).
-    /// See ADR-015 for the contract mapping. Returns `None` if any
-    /// `m * q[i]` product overflows the 7-bit-per-variable exponent
-    /// budget.
+    /// See ADR-015 for the contract mapping. Per ADR-018, the caller's
+    /// ring construction must ensure no `m * q[i]` product overflows
+    /// the 7-bit-per-variable exponent budget; release builds do not
+    /// check.
     ///
     /// Includes the tail-splice fast path: when `self` exhausts before
     /// `q`, the remainder of `-c * m * q` is produced in a single pass
@@ -873,10 +824,10 @@ impl Poly {
         m: &Monomial,
         q: &Poly,
         ring: &Ring,
-    ) -> Option<Poly> {
+    ) -> Poly {
         debug_assert!(c < ring.field().p());
         if c == 0 || q.is_zero() {
-            return Some(self);
+            return self;
         }
         let f = ring.field();
 
@@ -895,26 +846,7 @@ impl Poly {
         let mut left: Option<NonNull<Node>> = self.head.take();
         let mut right: Option<NonNull<Node>> = q.head;
 
-        // Helper to release a partial chain on early return. We avoid
-        // constructing a `Poly` around the partial state because that
-        // would run `refresh_cache` on a potentially torn head.
-        fn release_partial(mut head: Option<NonNull<Node>>) {
-            if head.is_none() {
-                return;
-            }
-            POOL.with(|pool_cell| {
-                let mut pool = pool_cell.borrow_mut();
-                while let Some(h) = head {
-                    unsafe {
-                        let n = h.as_ptr();
-                        head = (*n).next.take();
-                        pool.dealloc(h);
-                    }
-                }
-            });
-        }
-
-        let outcome = POOL.with(|pool_cell| -> Option<()> {
+        POOL.with(|pool_cell| {
             let mut pool = pool_cell.borrow_mut();
             // SAFETY: Every write through `tail_slot` targets an
             // `Option<NonNull<Node>>` that belongs to either
@@ -936,10 +868,7 @@ impl Poly {
                     };
                     let l_ref = l.as_ref();
                     let r_ref = r.as_ref();
-                    let r_mono = match m.mul(&r_ref.mono, ring) {
-                        Some(v) => v,
-                        None => return None,
-                    };
+                    let r_mono = m.mul(&r_ref.mono, ring);
                     match l_ref.mono.cmp(&r_mono, ring) {
                         std::cmp::Ordering::Greater => {
                             // Splice left's head into the output tail.
@@ -1004,10 +933,7 @@ impl Poly {
                         if neg == 0 {
                             continue;
                         }
-                        let prod_m = match m.mul(&r_ref.mono, ring) {
-                            Some(v) => v,
-                            None => return None,
-                        };
+                        let prod_m = m.mul(&r_ref.mono, ring);
                         let fresh = pool.alloc(neg, prod_m, None);
                         *tail_slot = Some(fresh);
                         tail_slot = &mut (*fresh.as_ptr()).next;
@@ -1015,23 +941,13 @@ impl Poly {
                     }
                 }
             }
-            Some(())
         });
-
-        if outcome.is_none() {
-            // Overflow during the merge. Release any work-in-progress.
-            release_partial(sentinel_slot.take());
-            release_partial(left.take());
-            // `self.head` was already taken above; `self` will drop
-            // with head = None. `right`/`q` is borrowed and untouched.
-            return None;
-        }
 
         // Move the chain out of the sentinel slot.
         self.head = sentinel_slot.take();
         self.len = out_len;
         self.refresh_cache();
-        Some(self)
+        self
     }
 
     /// Scale so the leading coefficient becomes 1.
@@ -1491,9 +1407,9 @@ mod tests {
         let m = mono(&r, &[1, 0, 0]);
         let c: Coeff = 2;
 
-        let mq = q.shift(&m, &r).unwrap().scale(c, &r);
+        let mq = q.shift(&m, &r).scale(c, &r);
         let slow = p.sub(&mq, &r);
-        let fast = p.sub_mul_term(c, &m, &q, &r).unwrap();
+        let fast = p.sub_mul_term(c, &m, &q, &r);
         slow.assert_canonical(&r);
         fast.assert_canonical(&r);
         assert_eq!(slow, fast);
@@ -1759,8 +1675,8 @@ mod tests {
         let m = mono(&r, &[1, 0, 0]);
         let c: Coeff = 2;
 
-        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
-        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        let expected = p.sub_mul_term(c, &m, &q, &r);
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, expected);
     }
@@ -1781,9 +1697,9 @@ mod tests {
         );
         let q = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0])), (1, mono(&r, &[0, 1]))]);
         let m = mono(&r, &[1, 0]);
-        let got = p.clone().sub_mm_mult_qq_consuming(1, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(1, &m, &q, &r);
         got.assert_canonical(&r);
-        let expected = p.sub_mul_term(1, &m, &q, &r).unwrap();
+        let expected = p.sub_mul_term(1, &m, &q, &r);
         assert_eq!(got, expected);
         assert_eq!(got.len(), 1);
     }
@@ -1807,8 +1723,8 @@ mod tests {
         );
         let m = mono(&r, &[1, 0]);
         let c: Coeff = 1;
-        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
-        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        let expected = p.sub_mul_term(c, &m, &q, &r);
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, expected);
     }
@@ -1830,8 +1746,8 @@ mod tests {
         let q = Poly::from_terms(&r, vec![(1, mono(&r, &[4, 0]))]);
         let m = mono(&r, &[1, 0]);
         let c: Coeff = 1;
-        let expected = p.sub_mul_term(c, &m, &q, &r).unwrap();
-        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r).unwrap();
+        let expected = p.sub_mul_term(c, &m, &q, &r);
+        let got = p.clone().sub_mm_mult_qq_consuming(c, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, expected);
     }
@@ -1843,7 +1759,7 @@ mod tests {
         let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
         let q = Poly::from_terms(&r, vec![(1, mono(&r, &[1, 0]))]);
         let m = mono(&r, &[0, 1]);
-        let got = p.clone().sub_mm_mult_qq_consuming(0, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(0, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, p);
     }
@@ -1855,7 +1771,7 @@ mod tests {
         let p = Poly::from_terms(&r, vec![(3, mono(&r, &[2, 0])), (4, mono(&r, &[1, 1]))]);
         let q = Poly::zero();
         let m = mono(&r, &[0, 1]);
-        let got = p.clone().sub_mm_mult_qq_consuming(2, &m, &q, &r).unwrap();
+        let got = p.clone().sub_mm_mult_qq_consuming(2, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, p);
     }
@@ -1867,10 +1783,8 @@ mod tests {
         let q = Poly::from_terms(&r, vec![(3, mono(&r, &[1, 0])), (2, mono(&r, &[0, 1]))]);
         let m = mono(&r, &[1, 0]);
         let c: Coeff = 2;
-        let expected = Poly::zero().sub_mul_term(c, &m, &q, &r).unwrap();
-        let got = Poly::zero()
-            .sub_mm_mult_qq_consuming(c, &m, &q, &r)
-            .unwrap();
+        let expected = Poly::zero().sub_mul_term(c, &m, &q, &r);
+        let got = Poly::zero().sub_mm_mult_qq_consuming(c, &m, &q, &r);
         got.assert_canonical(&r);
         assert_eq!(got, expected);
     }

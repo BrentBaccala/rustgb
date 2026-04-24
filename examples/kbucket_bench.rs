@@ -86,22 +86,13 @@ fn main() {
         reducers.push((m, c, q));
     }
 
-    // Quick sanity check that both paths succeed before we time them.
+    // Quick sanity pass before we time them. Per ADR-018,
+    // sub_mul_term is infallible in release; the benchmark workload
+    // picks max_exp conservatively so products stay in the budget.
     {
         let mut acc = seed.clone();
-        let mut overflowed = false;
         for (m, c, q) in &reducers {
-            match acc.sub_mul_term(*c, m, q, &ring) {
-                Some(p) => acc = p,
-                None => {
-                    overflowed = true;
-                    break;
-                }
-            }
-        }
-        if overflowed {
-            eprintln!("warning: workload overflows 8-bit budget; adjust max_exp in the benchmark");
-            std::process::exit(1);
+            acc = acc.sub_mul_term(*c, m, q, &ring);
         }
         println!(
             "seed terms: {}, final slow-path terms: {}",
@@ -114,7 +105,7 @@ fn main() {
     let t0 = Instant::now();
     let mut slow_acc = seed.clone();
     for (m, c, q) in &reducers {
-        slow_acc = slow_acc.sub_mul_term(*c, m, q, &ring).expect("no overflow");
+        slow_acc = slow_acc.sub_mul_term(*c, m, q, &ring);
     }
     let slow_elapsed = t0.elapsed();
     let slow_terms = slow_acc.len();

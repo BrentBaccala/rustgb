@@ -123,26 +123,26 @@ proptest! {
     #[test]
     fn mul_zero_is_zero((r, f) in ring_poly1_strategy()) {
         let z = Poly::zero();
-        prop_assert!(f.mul(&z, &r).unwrap().is_zero());
-        prop_assert!(z.mul(&f, &r).unwrap().is_zero());
+        prop_assert!(f.mul(&z, &r).is_zero());
+        prop_assert!(z.mul(&f, &r).is_zero());
     }
 
     #[test]
     fn mul_one_is_identity((r, f) in ring_poly1_strategy()) {
         let one_mono = Monomial::one(&r);
         let one = Poly::monomial(&r, 1, one_mono);
-        prop_assert_eq!(f.mul(&one, &r).unwrap(), f.clone());
+        prop_assert_eq!(f.mul(&one, &r), f.clone());
     }
 
     #[test]
     fn mul_distributes_over_add((r, f, g, h) in ring_poly3_strategy()) {
+        // ADR-018: Poly::mul is infallible; ring_poly3_strategy's
+        // per-var cap (8) keeps all product exponents ≤ 16 < 127.
         let lhs = f.mul(&g.add(&h, &r), &r);
         let rhs_g = f.mul(&g, &r);
         let rhs_h = f.mul(&h, &r);
-        if let (Some(lhs), Some(rg), Some(rh)) = (lhs, rhs_g, rhs_h) {
-            let rhs = rg.add(&rh, &r);
-            prop_assert_eq!(lhs, rhs);
-        }
+        let rhs = rhs_g.add(&rhs_h, &r);
+        prop_assert_eq!(lhs, rhs);
     }
 
     #[test]
@@ -161,9 +161,8 @@ proptest! {
         s.assert_canonical(&r);
         let d = f.sub(&g, &r);
         d.assert_canonical(&r);
-        if let Some(p) = f.mul(&g, &r) {
-            p.assert_canonical(&r);
-        }
+        let p = f.mul(&g, &r);
+        p.assert_canonical(&r);
         if let Some(mf) = f.monic(&r) {
             mf.assert_canonical(&r);
         }
@@ -172,10 +171,13 @@ proptest! {
     #[test]
     fn leading_of_product_is_product_of_leadings((r, f, g) in ring_poly2_strategy()) {
         if f.is_zero() || g.is_zero() { return Ok(()); }
-        let prod = match f.mul(&g, &r) { Some(p) => p, None => return Ok(()) };
+        // ADR-018: Poly::mul and Monomial::mul are infallible in
+        // release; ring_poly2_strategy's per-var cap (10) keeps sums
+        // well within the 7-bit budget.
+        let prod = f.mul(&g, &r);
         let (fc, fm) = f.leading().unwrap();
         let (gc, gm) = g.leading().unwrap();
-        let expected_m = fm.mul(gm, &r).unwrap();
+        let expected_m = fm.mul(gm, &r);
         let expected_c = r.field().mul(fc, gc);
         if prod.is_zero() {
             // Only possible if expected_c == 0, which needs a zero
@@ -190,14 +192,16 @@ proptest! {
 
     #[test]
     fn sub_mul_term_matches_slow_path((r, p, q, c, m) in ring_poly_term_strategy()) {
+        // ADR-018: release-build sub_mul_term is infallible. Strategy
+        // parameters are bounded (ring_poly_term_strategy keeps
+        // per-var exponents well below the 7-bit cap) so no overflow
+        // can arise.
         let fast = p.sub_mul_term(c, &m, &q, &r);
-        let scaled_m = match q.shift(&m, &r) { Some(v) => v, None => return Ok(()) };
+        let scaled_m = q.shift(&m, &r);
         let slow = p.sub(&scaled_m.scale(c, &r), &r);
-        if let Some(fast) = fast {
-            fast.assert_canonical(&r);
-            slow.assert_canonical(&r);
-            prop_assert_eq!(fast, slow);
-        }
+        fast.assert_canonical(&r);
+        slow.assert_canonical(&r);
+        prop_assert_eq!(fast, slow);
     }
 
     #[test]

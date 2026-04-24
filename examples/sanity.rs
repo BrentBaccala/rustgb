@@ -66,7 +66,7 @@ fn main() {
     let t0 = Instant::now();
     let mut acc = p0.clone();
     for _ in 0..iters {
-        acc = acc.sub_mul_term(c, &m, &q, &ring).unwrap();
+        acc = acc.sub_mul_term(c, &m, &q, &ring);
         if acc.len() > 2000 {
             acc = p0.clone();
         }
