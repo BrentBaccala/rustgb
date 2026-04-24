@@ -6,11 +6,20 @@
 //! rationale behind keeping this second backend available.
 //!
 //! The shape here is close to Singular's `spolyrec` storage: each
-//! node owns a coefficient, a monomial, and a `Box<Node>` pointing
+//! node owns a coefficient, a monomial, and a `NonNull<Node>` pointing
 //! at the next node (or `None` at the tail). `drop_leading_in_place`
-//! is O(1) via a take-and-replace on the head slot. A custom
+//! is O(1) via a take-and-deallocate on the head slot. A custom
 //! [`Drop`] impl walks the chain iteratively so a million-term poly
 //! doesn't overflow the stack.
+//!
+//! All node allocations and deallocations route through
+//! [`node_pool::POOL`](super::node_pool::POOL), a thread-local
+//! `NodePool`. Whether that pool is a free-list-backed reuse cache or
+//! a plain `Box::new` / `Box::from_raw` forwarder depends on the
+//! `linked_list_poly_pool` Cargo feature — this file does not
+//! `#[cfg]` on that flag anywhere, which keeps the pool-on vs
+//! pool-off A/B comparison scoped to the allocator path only. See
+//! ADR-016.
 //!
 //! Invariants (checked by [`Poly::assert_canonical`]):
 //!
@@ -21,22 +30,54 @@
 //! 4. `lm_*` fields match the head node's coefficient / monomial / deg
 //!    when nonempty.
 
+use std::ptr::NonNull;
+
 use crate::field::Coeff;
 use crate::monomial::Monomial;
 use crate::ring::Ring;
 
+use super::node_pool::POOL;
+
 /// A sparse polynomial in a [`Ring`], stored as a singly linked list.
 ///
-/// See module documentation for invariants. `Send + Sync`: the
-/// recursive `Box<Node>` chain contains only `Coeff` (u32) and
-/// `Monomial` (POD struct) plus pointer fields, all of which are
-/// themselves `Send + Sync`.
+/// See module documentation for invariants. The head node is the
+/// leading term; descendants are in strictly-descending order under
+/// the ring's monomial ordering.
 ///
-/// The head node is the leading term; descendants are in strictly-
-/// descending order under the ring's monomial ordering.
+/// # `Send + Sync` safety
+///
+/// `Poly` contains a raw [`NonNull<Node>`], which is `!Send` and
+/// `!Sync` by default. We manually opt in:
+///
+/// * **`Send`**: a `Poly` can be moved to another thread because its
+///   `Node`s hold only POD data (`Coeff = u32`, `Monomial`, another
+///   raw pointer). The pool-owning thread distinction matters only
+///   at allocation / deallocation time — reading the chain on a
+///   different thread is sound.
+/// * **`Sync`**: a `&Poly` can be shared across threads because all
+///   read paths (`iter`, `cursor`, `leading`, field accessors) treat
+///   the chain as immutable; no interior mutation happens behind a
+///   shared reference.
+///
+/// There is, however, a one-way rule the caller must respect: **a
+/// `Poly` must be dropped on a thread whose `NodePool` contains its
+/// nodes**. The thread-local pool is per-thread; dropping a `Poly`
+/// on a foreign thread pushes its node storage onto that foreign
+/// thread's free list, which then hands it out on a later `alloc` as
+/// though it had originated there. With the current pool-backed
+/// variant this is still sound (all `Node`s are POD-equivalent;
+/// reusing storage across threads does not corrupt state) **and**
+/// single-thread safe (rustgb's bba driver is single-threaded per
+/// `compute_gb` invocation), but it silently leaks capacity from the
+/// originating thread's pool. Tests that spawn threads and share
+/// `Poly`s should be aware of this.
+///
+/// If rustgb's parallel story changes (`SINGULAR_THREADS>1`; cf.
+/// `~/Singular-parallel-bba`), the pool design has to be revisited;
+/// this is tracked as follow-up work in ADR-016.
 pub struct Poly {
     /// First node (the leading term), or `None` for the zero poly.
-    head: Option<Box<Node>>,
+    head: Option<NonNull<Node>>,
     /// Number of live nodes reachable from `head`. Maintained on
     /// every mutation so `len()` stays O(1).
     len: usize,
@@ -49,11 +90,22 @@ pub struct Poly {
     lm_deg: u32,
 }
 
+// SAFETY: See the `Send + Sync` safety section on `Poly` above. The
+// inner `NonNull<Node>` is the only reason these auto-traits don't
+// apply automatically.
+unsafe impl Send for Poly {}
+unsafe impl Sync for Poly {}
+
 /// One term's worth of storage in the linked list.
-struct Node {
-    coeff: Coeff,
-    mono: Monomial,
-    next: Option<Box<Node>>,
+///
+/// `pub(super)` because [`super::node_pool`] constructs and destroys
+/// these through a thread-local allocator. The field layout is
+/// deliberate: `Coeff` first (hot cache line for arithmetic), then
+/// `Monomial`, then the `next` pointer.
+pub(super) struct Node {
+    pub(super) coeff: Coeff,
+    pub(super) mono: Monomial,
+    pub(super) next: Option<NonNull<Node>>,
 }
 
 impl std::fmt::Debug for Poly {
@@ -65,68 +117,87 @@ impl std::fmt::Debug for Poly {
             .field("lm_deg", &self.lm_deg);
         // Walk and collect terms for debugging.
         let mut terms: Vec<(Coeff, &Monomial)> = Vec::with_capacity(self.len);
-        let mut node = self.head.as_deref();
+        let mut node = self.head;
         while let Some(n) = node {
-            terms.push((n.coeff, &n.mono));
-            node = n.next.as_deref();
+            // SAFETY: nodes reachable from `head` are live by the
+            // canonical invariant.
+            let n_ref = unsafe { n.as_ref() };
+            terms.push((n_ref.coeff, &n_ref.mono));
+            node = n_ref.next;
         }
         dbg.field("terms", &terms).finish()
     }
 }
 
 impl Drop for Poly {
-    /// Iterative drop so a very long chain does not blow the stack
-    /// via the default recursive `Box<Node>` destructor. Mirrors the
-    /// canonical pattern from the Rust nomicon's linked-list exercise.
+    /// Iterative drop so a very long chain does not blow the stack.
+    /// Every node is handed back to the thread-local [`POOL`]; the
+    /// caller takes each node's `next` before releasing it so the
+    /// pool's `dealloc` never has to walk a chain.
+    ///
+    /// Regression-guarded by
+    /// `tests::iterative_drop_survives_long_chain` (100 000-term
+    /// poly; recursive drop would overflow the stack).
     fn drop(&mut self) {
         let mut cur = self.head.take();
-        while let Some(mut boxed) = cur {
-            // Detach `boxed.next` into `cur` before the outer drop
-            // runs, so the boxed node we are about to release no
-            // longer owns its successor.
-            cur = boxed.next.take();
-            // `boxed` is dropped here with `next == None`, so its
-            // destructor is O(1) and non-recursive.
+        if cur.is_none() {
+            return;
         }
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            while let Some(node_ptr) = cur {
+                // SAFETY: `node_ptr` is a live node from this `Poly`'s
+                // chain. We take its `next` before releasing it so
+                // `dealloc`'s caller contract (no dangling children)
+                // holds.
+                unsafe {
+                    let node = node_ptr.as_ptr();
+                    cur = (*node).next.take();
+                    pool.dealloc(node_ptr);
+                }
+            }
+        });
     }
 }
 
 impl Clone for Poly {
-    /// Deep clone: walks the chain, allocating fresh nodes.
+    /// Deep clone: walks the source chain, allocating fresh nodes
+    /// through the pool. The sentinel-slot / tail-cursor pattern
+    /// matches `merge_consuming` and friends so `Poly::clone` keeps
+    /// the same alloc profile as the destructive paths.
     fn clone(&self) -> Self {
-        // Build in reverse from a tail-first construction pattern?
-        // Simpler: collect the terms into a temporary Vec so we can
-        // reconstruct head-to-tail via tail-append. But we want to
-        // avoid the Vec allocation. Instead, we do a forward walk
-        // and maintain a pointer to the tail's `next` slot so each
-        // new node attaches there.
-        let mut out_head: Option<Box<Node>> = None;
-        // `tail_slot` is the `&mut Option<Box<Node>>` where the next
-        // fresh node should land. We start by pointing it at
-        // `out_head`; after each insert we reborrow through the new
-        // node's `next` field.
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        let mut node = self.head.as_deref();
-        while let Some(n) = node {
-            let fresh = Box::new(Node {
-                coeff: n.coeff,
-                mono: n.mono.clone(),
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            // Reborrow: move `tail_slot` to point at the new node's
-            // `next` slot. `as_mut()` gives us `&mut Box<Node>`, and
-            // `&mut box.next` gives the slot we want.
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            node = n.next.as_deref();
+        if self.head.is_none() {
+            return Self::zero();
         }
-        Poly {
-            head: out_head,
-            len: self.len,
-            lm_sev: self.lm_sev,
-            lm_coeff: self.lm_coeff,
-            lm_deg: self.lm_deg,
-        }
+        // SAFETY: both the write-through-raw-pointer pattern used on
+        // the output tail and the dereference of source-chain pointers
+        // below are bounded to this function. The output chain is
+        // built head-to-tail, each freshly allocated node immediately
+        // linked from the previous node's `next`. Source-chain reads
+        // use immutable references through `NonNull::as_ref` on live
+        // nodes reachable from `self.head`.
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            let mut head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut head;
+            let mut node = self.head;
+            while let Some(n) = node {
+                let n_ref = unsafe { n.as_ref() };
+                let fresh = pool.alloc(n_ref.coeff, n_ref.mono.clone(), None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                node = n_ref.next;
+            }
+            Poly {
+                head,
+                len: self.len,
+                lm_sev: self.lm_sev,
+                lm_coeff: self.lm_coeff,
+                lm_deg: self.lm_deg,
+            }
+        })
     }
 }
 
@@ -153,12 +224,9 @@ impl Poly {
         }
         let lm_sev = m.sev();
         let lm_deg = m.total_deg();
+        let head = POOL.with(|p| p.borrow_mut().alloc(c, m, None));
         Self {
-            head: Some(Box::new(Node {
-                coeff: c,
-                mono: m,
-                next: None,
-            })),
+            head: Some(head),
             len: 1,
             lm_sev,
             lm_coeff: c,
@@ -179,61 +247,51 @@ impl Poly {
         }
         let p = ring.field().p();
         let len = terms.len();
-        // Build head-to-tail by walking forward and reborrowing the
-        // tail slot (same pattern as `Clone`).
-        let mut head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut head;
-        let mut prev_mono: Option<&Monomial> = None;
-        let mut first_coeff: Coeff = 0;
-        let mut first_mono_sev: u64 = 0;
-        let mut first_mono_deg: u32 = 0;
-        let mut first = true;
-        for (c, m) in terms.iter() {
-            debug_assert!(
-                *c != 0,
-                "from_descending_terms_unchecked: zero coeff"
-            );
-            debug_assert!(
-                *c < p,
-                "from_descending_terms_unchecked: unreduced coeff"
-            );
-            if let Some(prev) = prev_mono {
-                debug_assert!(
-                    prev.cmp(m, ring).is_gt(),
-                    "from_descending_terms_unchecked: not strictly descending"
-                );
+
+        // Debug-only validation pass. Separate from the construction
+        // pass because the borrow checker gets confused if we both
+        // hold `prev_mono: &Monomial` and append into the chain in the
+        // same loop.
+        #[cfg(debug_assertions)]
+        {
+            let mut prev_mono: Option<&Monomial> = None;
+            for (c, m) in terms.iter() {
+                debug_assert!(*c != 0, "from_descending_terms_unchecked: zero coeff");
+                debug_assert!(*c < p, "from_descending_terms_unchecked: unreduced coeff");
+                if let Some(prev) = prev_mono {
+                    debug_assert!(
+                        prev.cmp(m, ring).is_gt(),
+                        "from_descending_terms_unchecked: not strictly descending"
+                    );
+                }
+                prev_mono = Some(m);
             }
-            let _ = prev_mono; // consumed below when re-bound
-            if first {
-                first_coeff = *c;
-                first_mono_sev = m.sev();
-                first_mono_deg = m.total_deg();
-                first = false;
-            }
-            prev_mono = Some(m);
         }
-        // Second pass: actually construct the nodes. (We could have
-        // built them in the first pass, but the borrow-checker gets
-        // confused if we both hold `prev_mono: &Monomial` and push
-        // into the chain in the same loop. Two passes is fine for a
-        // path that's not on the hot loop.)
         let _ = p;
-        for (c, m) in terms {
-            let fresh = Box::new(Node {
-                coeff: c,
-                mono: m,
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-        }
-        Poly {
-            head,
-            len,
-            lm_sev: first_mono_sev,
-            lm_coeff: first_coeff,
-            lm_deg: first_mono_deg,
-        }
+
+        let lm_coeff = terms[0].0;
+        let lm_sev = terms[0].1.sev();
+        let lm_deg = terms[0].1.total_deg();
+
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut head;
+            for (c, m) in terms {
+                let fresh = pool.alloc(c, m, None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+            }
+            Poly {
+                head,
+                len,
+                lm_sev,
+                lm_coeff,
+                lm_deg,
+            }
+        })
     }
 
     /// Build from parallel vectors in descending order. Mirrors the
@@ -264,24 +322,25 @@ impl Poly {
         let lm_sev = terms[0].sev();
         let lm_deg = terms[0].total_deg();
 
-        let mut head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut head;
-        for (c, m) in coeffs.into_iter().zip(terms) {
-            let fresh = Box::new(Node {
-                coeff: c,
-                mono: m,
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-        }
-        Poly {
-            head,
-            len,
-            lm_sev,
-            lm_coeff,
-            lm_deg,
-        }
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut head;
+            for (c, m) in coeffs.into_iter().zip(terms) {
+                let fresh = pool.alloc(c, m, None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+            }
+            Poly {
+                head,
+                len,
+                lm_sev,
+                lm_coeff,
+                lm_deg,
+            }
+        })
     }
 
     /// Build from unsorted terms. Sorts descending, de-dupes via sum,
@@ -324,10 +383,12 @@ impl Poly {
     // ----- Cache maintenance -----
 
     fn refresh_cache(&mut self) {
-        if let Some(h) = self.head.as_deref() {
-            self.lm_sev = h.mono.sev();
-            self.lm_deg = h.mono.total_deg();
-            self.lm_coeff = h.coeff;
+        if let Some(h) = self.head {
+            // SAFETY: `h` points to a live leading node.
+            let h_ref = unsafe { h.as_ref() };
+            self.lm_sev = h_ref.mono.sev();
+            self.lm_deg = h_ref.mono.total_deg();
+            self.lm_coeff = h_ref.coeff;
         } else {
             self.lm_sev = 0;
             self.lm_coeff = 0;
@@ -352,17 +413,24 @@ impl Poly {
 
     /// Iterate over `(coeff, &monomial)` pairs in descending order.
     pub fn iter(&self) -> impl Iterator<Item = (Coeff, &Monomial)> + '_ {
-        let mut node = self.head.as_deref();
+        let mut node = self.head;
         std::iter::from_fn(move || {
             let n = node?;
-            node = n.next.as_deref();
-            Some((n.coeff, &n.mono))
+            // SAFETY: `n` is a live node reachable from `self.head`;
+            // the returned reference is bounded by `self`'s lifetime.
+            let n_ref = unsafe { n.as_ref() };
+            node = n_ref.next;
+            Some((n_ref.coeff, &n_ref.mono))
         })
     }
 
     /// Leading term `(coeff, &monomial)`, or `None` if zero.
     pub fn leading(&self) -> Option<(Coeff, &Monomial)> {
-        self.head.as_deref().map(|n| (n.coeff, &n.mono))
+        self.head.map(|h| {
+            // SAFETY: `h` is a live leading node bounded by `self`.
+            let r = unsafe { h.as_ref() };
+            (r.coeff, &r.mono)
+        })
     }
 
     /// Leading short exponent vector. 0 when zero.
@@ -389,7 +457,8 @@ impl Poly {
     #[inline]
     pub fn cursor(&self) -> PolyCursor<'_> {
         PolyCursor {
-            node: self.head.as_deref(),
+            node: self.head,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -401,42 +470,53 @@ impl Poly {
         if self.len <= 1 {
             return Self::zero();
         }
-        // New head is the first node of self.head.next.
-        let mut out_head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        // Skip the leading node.
-        let mut node = self.head.as_deref().and_then(|n| n.next.as_deref());
-        while let Some(n) = node {
-            let fresh = Box::new(Node {
-                coeff: n.coeff,
-                mono: n.mono.clone(),
-                next: None,
+        // Walk source starting from self.head.next; clone each node
+        // into a fresh output chain.
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut out_head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+            // Skip the leading node.
+            let mut node = self.head.and_then(|h| {
+                // SAFETY: `h` is live.
+                let r = unsafe { h.as_ref() };
+                r.next
             });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            node = n.next.as_deref();
-        }
-        let mut out = Poly {
-            head: out_head,
-            len: self.len - 1,
-            lm_sev: 0,
-            lm_coeff: 0,
-            lm_deg: 0,
-        };
-        out.refresh_cache();
-        out
+            while let Some(n) = node {
+                // SAFETY: live node.
+                let n_ref = unsafe { n.as_ref() };
+                let fresh = pool.alloc(n_ref.coeff, n_ref.mono.clone(), None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                node = n_ref.next;
+            }
+            let mut out = Poly {
+                head: out_head,
+                len: self.len - 1,
+                lm_sev: 0,
+                lm_coeff: 0,
+                lm_deg: 0,
+            };
+            out.refresh_cache();
+            out
+        })
     }
 
     /// In-place leading-term drop. O(1): takes the head, replaces it
-    /// with `head.next`, drops the detached node.
+    /// with `head.next`, deallocates the detached node.
     pub fn drop_leading_in_place(&mut self) {
-        if let Some(mut boxed) = self.head.take() {
-            // Detach `next` before the old box drops, so the
-            // detached head's destructor is non-recursive even if a
-            // custom Node::drop is added later.
-            self.head = boxed.next.take();
+        if let Some(h) = self.head.take() {
+            // SAFETY: `h` is the live leading node. We take its `next`
+            // before returning it to the pool so `dealloc`'s no-chain
+            // contract holds.
+            unsafe {
+                let node = h.as_ptr();
+                self.head = (*node).next.take();
+                POOL.with(|p| p.borrow_mut().dealloc(h));
+            }
             self.len -= 1;
-            // `boxed` is dropped here with next already None.
         }
         self.refresh_cache();
     }
@@ -496,30 +576,35 @@ impl Poly {
 
     /// Negation (flip every coefficient).
     pub fn neg(&self, ring: &Ring) -> Poly {
-        let f = ring.field();
-        // Build head-to-tail by walking and cloning with negated coeffs.
-        let mut out_head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        let mut node = self.head.as_deref();
-        while let Some(n) = node {
-            let fresh = Box::new(Node {
-                coeff: f.neg(n.coeff),
-                mono: n.mono.clone(),
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            node = n.next.as_deref();
+        if self.is_zero() {
+            return Self::zero();
         }
-        let mut out = Poly {
-            head: out_head,
-            len: self.len,
-            lm_sev: 0,
-            lm_coeff: 0,
-            lm_deg: 0,
-        };
-        out.refresh_cache();
-        out
+        let f = ring.field();
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut out_head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+            let mut node = self.head;
+            while let Some(n) = node {
+                // SAFETY: `n` is a live node from `self`.
+                let n_ref = unsafe { n.as_ref() };
+                let fresh = pool.alloc(f.neg(n_ref.coeff), n_ref.mono.clone(), None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                node = n_ref.next;
+            }
+            let mut out = Poly {
+                head: out_head,
+                len: self.len,
+                lm_sev: 0,
+                lm_coeff: 0,
+                lm_deg: 0,
+            };
+            out.refresh_cache();
+            out
+        })
     }
 
     /// Multiply every coefficient by a scalar. Returns zero if
@@ -530,28 +615,30 @@ impl Poly {
         if c == 0 || self.is_zero() {
             return Self::zero();
         }
-        let mut out_head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        let mut node = self.head.as_deref();
-        while let Some(n) = node {
-            let fresh = Box::new(Node {
-                coeff: f.mul(n.coeff, c),
-                mono: n.mono.clone(),
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            node = n.next.as_deref();
-        }
-        let mut out = Poly {
-            head: out_head,
-            len: self.len,
-            lm_sev: 0,
-            lm_coeff: 0,
-            lm_deg: 0,
-        };
-        out.refresh_cache();
-        out
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut out_head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+            let mut node = self.head;
+            while let Some(n) = node {
+                let n_ref = unsafe { n.as_ref() };
+                let fresh = pool.alloc(f.mul(n_ref.coeff, c), n_ref.mono.clone(), None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                node = n_ref.next;
+            }
+            let mut out = Poly {
+                head: out_head,
+                len: self.len,
+                lm_sev: 0,
+                lm_coeff: 0,
+                lm_deg: 0,
+            };
+            out.refresh_cache();
+            out
+        })
     }
 
     /// Multiply every monomial by `m`. Requires the products fit in
@@ -560,31 +647,55 @@ impl Poly {
         if self.is_zero() {
             return Some(Self::zero());
         }
-        let mut out_head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        let mut node = self.head.as_deref();
-        while let Some(n) = node {
-            let new_mono = n.mono.mul(m, ring)?;
-            let fresh = Box::new(Node {
-                coeff: n.coeff,
-                mono: new_mono,
-                next: None,
-            });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            node = n.next.as_deref();
-        }
-        // Descending order preserved by degrevlex monotonicity, same
-        // as the Vec backend.
-        let mut out = Poly {
-            head: out_head,
-            len: self.len,
-            lm_sev: 0,
-            lm_coeff: 0,
-            lm_deg: 0,
-        };
-        out.refresh_cache();
-        Some(out)
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            let mut out_head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+            let mut node = self.head;
+            while let Some(n) = node {
+                let n_ref = unsafe { n.as_ref() };
+                let new_mono = match n_ref.mono.mul(m, ring) {
+                    Some(v) => v,
+                    None => {
+                        // Early return: let the partial chain `out_head`
+                        // drop via `Poly`'s iterative Drop below. We
+                        // assemble a `Poly` shell with the chain's
+                        // partial state so the standard Drop path
+                        // releases it back to the pool.
+                        let partial = Poly {
+                            head: out_head,
+                            // `len` may be wrong here (we haven't been
+                            // counting), but Drop doesn't read it; it
+                            // walks the chain.
+                            len: 0,
+                            lm_sev: 0,
+                            lm_coeff: 0,
+                            lm_deg: 0,
+                        };
+                        drop(pool); // release borrow before `drop` touches POOL
+                        drop(partial);
+                        return None;
+                    }
+                };
+                let fresh = pool.alloc(n_ref.coeff, new_mono, None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                node = n_ref.next;
+            }
+            // Descending order preserved by degrevlex monotonicity,
+            // same as the Vec backend.
+            let mut out = Poly {
+                head: out_head,
+                len: self.len,
+                lm_sev: 0,
+                lm_coeff: 0,
+                lm_deg: 0,
+            };
+            out.refresh_cache();
+            Some(out)
+        })
     }
 
     /// Standard multiplication via an accumulator (same strategy as
@@ -616,94 +727,130 @@ impl Poly {
         }
         let f = ring.field();
 
-        let mut out_head: Option<Box<Node>> = None;
-        let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-        let mut out_len: usize = 0;
-
-        let mut left = self.head.as_deref();
-        let mut right = q.head.as_deref();
-
-        while let (Some(l), Some(r)) = (left, right) {
-            let r_mono = m.mul(&r.mono, ring)?;
-            match l.mono.cmp(&r_mono, ring) {
-                std::cmp::Ordering::Greater => {
-                    let fresh = Box::new(Node {
-                        coeff: l.coeff,
-                        mono: l.mono.clone(),
-                        next: None,
-                    });
-                    *tail_slot = Some(fresh);
-                    tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                    out_len += 1;
-                    left = l.next.as_deref();
-                }
-                std::cmp::Ordering::Less => {
-                    let neg = f.neg(f.mul(c, r.coeff));
-                    if neg != 0 {
-                        let fresh = Box::new(Node {
-                            coeff: neg,
-                            mono: r_mono,
-                            next: None,
-                        });
-                        *tail_slot = Some(fresh);
-                        tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                        out_len += 1;
-                    }
-                    right = r.next.as_deref();
-                }
-                std::cmp::Ordering::Equal => {
-                    let cmq = f.mul(c, r.coeff);
-                    let diff = f.sub(l.coeff, cmq);
-                    if diff != 0 {
-                        let fresh = Box::new(Node {
-                            coeff: diff,
-                            mono: l.mono.clone(),
-                            next: None,
-                        });
-                        *tail_slot = Some(fresh);
-                        tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                        out_len += 1;
-                    }
-                    left = l.next.as_deref();
-                    right = r.next.as_deref();
-                }
+        // Local helper: on early return, drop a partial chain via the
+        // pool without constructing a `Poly` shell (which would run
+        // `refresh_cache` on torn state).
+        fn release_partial(mut head: Option<NonNull<Node>>) {
+            if head.is_none() {
+                return;
             }
-        }
-        while let Some(l) = left {
-            let fresh = Box::new(Node {
-                coeff: l.coeff,
-                mono: l.mono.clone(),
-                next: None,
+            POOL.with(|pool_cell| {
+                let mut pool = pool_cell.borrow_mut();
+                while let Some(h) = head {
+                    unsafe {
+                        let n = h.as_ptr();
+                        head = (*n).next.take();
+                        pool.dealloc(h);
+                    }
+                }
             });
-            *tail_slot = Some(fresh);
-            tail_slot = &mut tail_slot.as_mut().unwrap().next;
-            out_len += 1;
-            left = l.next.as_deref();
-        }
-        while let Some(r) = right {
-            let neg = f.neg(f.mul(c, r.coeff));
-            if neg != 0 {
-                let fresh = Box::new(Node {
-                    coeff: neg,
-                    mono: m.mul(&r.mono, ring)?,
-                    next: None,
-                });
-                *tail_slot = Some(fresh);
-                tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                out_len += 1;
-            }
-            right = r.next.as_deref();
         }
 
-        let mut out = Poly {
-            head: out_head,
-            len: out_len,
-            lm_sev: 0,
-            lm_coeff: 0,
-            lm_deg: 0,
-        };
-        out.refresh_cache();
-        Some(out)
+        let result = POOL.with(|pool_cell| -> Option<Poly> {
+            let mut pool = pool_cell.borrow_mut();
+            let mut out_head: Option<NonNull<Node>> = None;
+            let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+            let mut out_len: usize = 0;
+
+            let mut left = self.head;
+            let mut right = q.head;
+
+            macro_rules! on_overflow {
+                ($partial:expr) => {{
+                    drop(pool);
+                    release_partial($partial);
+                    return None;
+                }};
+            }
+
+            while let (Some(l), Some(r)) = (left, right) {
+                // SAFETY: live nodes from `self` / `q`.
+                let l_ref = unsafe { l.as_ref() };
+                let r_ref = unsafe { r.as_ref() };
+                let r_mono = match m.mul(&r_ref.mono, ring) {
+                    Some(v) => v,
+                    None => on_overflow!(out_head),
+                };
+                match l_ref.mono.cmp(&r_mono, ring) {
+                    std::cmp::Ordering::Greater => {
+                        let fresh =
+                            pool.alloc(l_ref.coeff, l_ref.mono.clone(), None);
+                        unsafe {
+                            *tail = Some(fresh);
+                            tail = &mut (*fresh.as_ptr()).next;
+                        }
+                        out_len += 1;
+                        left = l_ref.next;
+                    }
+                    std::cmp::Ordering::Less => {
+                        let neg = f.neg(f.mul(c, r_ref.coeff));
+                        if neg != 0 {
+                            let fresh = pool.alloc(neg, r_mono, None);
+                            unsafe {
+                                *tail = Some(fresh);
+                                tail = &mut (*fresh.as_ptr()).next;
+                            }
+                            out_len += 1;
+                        }
+                        right = r_ref.next;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let cmq = f.mul(c, r_ref.coeff);
+                        let diff = f.sub(l_ref.coeff, cmq);
+                        if diff != 0 {
+                            let fresh = pool.alloc(diff, l_ref.mono.clone(), None);
+                            unsafe {
+                                *tail = Some(fresh);
+                                tail = &mut (*fresh.as_ptr()).next;
+                            }
+                            out_len += 1;
+                        }
+                        left = l_ref.next;
+                        right = r_ref.next;
+                    }
+                }
+            }
+            while let Some(l) = left {
+                // SAFETY: live node.
+                let l_ref = unsafe { l.as_ref() };
+                let fresh = pool.alloc(l_ref.coeff, l_ref.mono.clone(), None);
+                unsafe {
+                    *tail = Some(fresh);
+                    tail = &mut (*fresh.as_ptr()).next;
+                }
+                out_len += 1;
+                left = l_ref.next;
+            }
+            while let Some(r) = right {
+                // SAFETY: live node.
+                let r_ref = unsafe { r.as_ref() };
+                let neg = f.neg(f.mul(c, r_ref.coeff));
+                if neg != 0 {
+                    let prod_m = match m.mul(&r_ref.mono, ring) {
+                        Some(v) => v,
+                        None => on_overflow!(out_head),
+                    };
+                    let fresh = pool.alloc(neg, prod_m, None);
+                    unsafe {
+                        *tail = Some(fresh);
+                        tail = &mut (*fresh.as_ptr()).next;
+                    }
+                    out_len += 1;
+                }
+                right = r_ref.next;
+            }
+
+            let mut out = Poly {
+                head: out_head,
+                len: out_len,
+                lm_sev: 0,
+                lm_coeff: 0,
+                lm_deg: 0,
+            };
+            out.refresh_cache();
+            Some(out)
+        });
+        result
     }
 
     /// Destructive variant of [`sub_mul_term`](Self::sub_mul_term):
@@ -734,134 +881,150 @@ impl Poly {
         let f = ring.field();
 
         // Sentinel-slot pattern: `sentinel_slot` is a stack-local
-        // `Option<Box<Node>>` that will end up containing the output
-        // chain's head. The `tail_slot` raw pointer tracks the
-        // `Option<Box<Node>>` slot where the next node attaches (starts
-        // at &mut sentinel_slot, moves to &mut new_node.next after each
-        // append). Safe Rust can't express this append-to-tail pattern
-        // directly because each `&mut Option<Box<Node>>` alias-blocks
-        // everything else reachable from the sentinel; see ADR-015 for
+        // `Option<NonNull<Node>>` that will end up containing the
+        // output chain's head. `tail_slot` tracks the slot where the
+        // next node attaches (starts at `&mut sentinel_slot`, moves
+        // to `&mut new_node.next` after each append). See ADR-015 for
         // the soundness argument.
-        let mut sentinel_slot: Option<Box<Node>> = None;
-        let mut tail_slot: *mut Option<Box<Node>> = &mut sentinel_slot;
+        let mut sentinel_slot: Option<NonNull<Node>> = None;
+        let mut tail_slot: *mut Option<NonNull<Node>> = &mut sentinel_slot;
         let mut out_len: usize = 0;
 
-        // Take ownership of self's chain. From here on, `self` is not
-        // used until we reconstruct a Poly at the end.
-        let mut left: Option<Box<Node>> = self.head.take();
-        let mut right = q.head.as_deref();
+        // Take ownership of self's chain. From here on, `self.head`
+        // is None until we reconstruct at the end.
+        let mut left: Option<NonNull<Node>> = self.head.take();
+        let mut right: Option<NonNull<Node>> = q.head;
 
-        // SAFETY: Every write through `tail_slot` targets an
-        // `Option<Box<Node>>` that belongs to either `sentinel_slot`
-        // (on the first iteration) or the `next` field of the node
-        // most recently appended (which `sentinel_slot` transitively
-        // owns). `sentinel_slot` is a stack-local that outlives every
-        // `tail_slot` update in this function. No other live reference
-        // to any tail slot exists during the writes: the input chains
-        // (`left`, `right`) are walked separately, and on each
-        // iteration we transfer ownership of any spliced input node
-        // into the output before dereferencing `tail_slot`. At the
-        // end, `sentinel_slot.take()` moves the chain out.
-        //
-        // On early-return via `?` (monomial overflow), Rust's drop
-        // glue runs: `sentinel_slot` drops the partial output chain,
-        // `left` drops the unvisited self-tail, and `self` drops with
-        // `head = None`. No leak, no double-free.
-        unsafe {
-            loop {
-                let (l_ref, r_node) = match (left.as_ref(), right) {
-                    (Some(l), Some(r)) => (l, r),
-                    _ => break,
-                };
-                let r_mono = m.mul(&r_node.mono, ring)?;
-                match l_ref.mono.cmp(&r_mono, ring) {
-                    std::cmp::Ordering::Greater => {
-                        // Splice left's head into the output tail.
-                        let mut node = left.take().unwrap();
-                        left = node.next.take();
-                        // Install `node` at *tail_slot and advance
-                        // `tail_slot` to point at `node.next`.
-                        *tail_slot = Some(node);
-                        let next_slot: *mut Option<Box<Node>> =
-                            &mut (*tail_slot).as_mut().unwrap().next;
-                        tail_slot = next_slot;
+        // Helper to release a partial chain on early return. We avoid
+        // constructing a `Poly` around the partial state because that
+        // would run `refresh_cache` on a potentially torn head.
+        fn release_partial(mut head: Option<NonNull<Node>>) {
+            if head.is_none() {
+                return;
+            }
+            POOL.with(|pool_cell| {
+                let mut pool = pool_cell.borrow_mut();
+                while let Some(h) = head {
+                    unsafe {
+                        let n = h.as_ptr();
+                        head = (*n).next.take();
+                        pool.dealloc(h);
+                    }
+                }
+            });
+        }
+
+        let outcome = POOL.with(|pool_cell| -> Option<()> {
+            let mut pool = pool_cell.borrow_mut();
+            // SAFETY: Every write through `tail_slot` targets an
+            // `Option<NonNull<Node>>` that belongs to either
+            // `sentinel_slot` (on the first iteration) or the `next`
+            // field of the node most recently appended (which
+            // `sentinel_slot` transitively owns through the chain).
+            // `sentinel_slot` is a stack-local that outlives every
+            // `tail_slot` update. No other live reference to any tail
+            // slot exists during the writes: the input chains
+            // (`left`, `right`) are walked separately, and on each
+            // iteration we either (a) allocate a fresh node and link
+            // it in, or (b) detach a node from `left` and splice it
+            // in, with the detach completing before the write.
+            unsafe {
+                loop {
+                    let (l, r) = match (left, right) {
+                        (Some(l), Some(r)) => (l, r),
+                        _ => break,
+                    };
+                    let l_ref = l.as_ref();
+                    let r_ref = r.as_ref();
+                    let r_mono = match m.mul(&r_ref.mono, ring) {
+                        Some(v) => v,
+                        None => return None,
+                    };
+                    match l_ref.mono.cmp(&r_mono, ring) {
+                        std::cmp::Ordering::Greater => {
+                            // Splice left's head into the output tail.
+                            let l_ptr = l.as_ptr();
+                            left = (*l_ptr).next.take();
+                            (*l_ptr).next = None;
+                            *tail_slot = Some(l);
+                            tail_slot = &mut (*l_ptr).next;
+                            out_len += 1;
+                        }
+                        std::cmp::Ordering::Less => {
+                            let neg = f.neg(f.mul(c, r_ref.coeff));
+                            right = r_ref.next;
+                            if neg != 0 {
+                                let fresh = pool.alloc(neg, r_mono, None);
+                                *tail_slot = Some(fresh);
+                                tail_slot = &mut (*fresh.as_ptr()).next;
+                                out_len += 1;
+                            }
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let cmq = f.mul(c, r_ref.coeff);
+                            let diff = f.sub(l_ref.coeff, cmq);
+                            right = r_ref.next;
+                            let l_ptr = l.as_ptr();
+                            left = (*l_ptr).next.take();
+                            if diff != 0 {
+                                (*l_ptr).coeff = diff;
+                                (*l_ptr).next = None;
+                                *tail_slot = Some(l);
+                                tail_slot = &mut (*l_ptr).next;
+                                out_len += 1;
+                            } else {
+                                // Free the dropped node.
+                                pool.dealloc(l);
+                            }
+                        }
+                    }
+                }
+
+                // Tail splices. At most one of `left` / `right` is nonempty.
+                if let Some(l_head) = left.take() {
+                    // Self still has terms; q is exhausted. Splice
+                    // the entire remaining chain in one assignment
+                    // and count its length by walking.
+                    let mut remaining_len = 1usize;
+                    let mut node = l_head.as_ref().next;
+                    while let Some(x) = node {
+                        remaining_len += 1;
+                        node = x.as_ref().next;
+                    }
+                    *tail_slot = Some(l_head);
+                    out_len += remaining_len;
+                    // `tail_slot` is no longer used after this point.
+                } else {
+                    // Self exhausted; q may still have terms. Build
+                    // the remainder of `-c * m * q` fresh.
+                    while let Some(r) = right {
+                        let r_ref = r.as_ref();
+                        let neg = f.neg(f.mul(c, r_ref.coeff));
+                        right = r_ref.next;
+                        if neg == 0 {
+                            continue;
+                        }
+                        let prod_m = match m.mul(&r_ref.mono, ring) {
+                            Some(v) => v,
+                            None => return None,
+                        };
+                        let fresh = pool.alloc(neg, prod_m, None);
+                        *tail_slot = Some(fresh);
+                        tail_slot = &mut (*fresh.as_ptr()).next;
                         out_len += 1;
                     }
-                    std::cmp::Ordering::Less => {
-                        // Emit a fresh node for `-c * q_coeff * (m * q_mono)`.
-                        // `r_mono` is already the product.
-                        let neg = f.neg(f.mul(c, r_node.coeff));
-                        right = r_node.next.as_deref();
-                        if neg != 0 {
-                            let fresh = Box::new(Node {
-                                coeff: neg,
-                                mono: r_mono,
-                                next: None,
-                            });
-                            *tail_slot = Some(fresh);
-                            let next_slot: *mut Option<Box<Node>> =
-                                &mut (*tail_slot).as_mut().unwrap().next;
-                            tail_slot = next_slot;
-                            out_len += 1;
-                        }
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // Reuse left's node if the difference is
-                        // nonzero; otherwise free it.
-                        let cmq = f.mul(c, r_node.coeff);
-                        let diff = f.sub(l_ref.coeff, cmq);
-                        right = r_node.next.as_deref();
-                        let mut node = left.take().unwrap();
-                        left = node.next.take();
-                        if diff != 0 {
-                            node.coeff = diff;
-                            *tail_slot = Some(node);
-                            let next_slot: *mut Option<Box<Node>> =
-                                &mut (*tail_slot).as_mut().unwrap().next;
-                            tail_slot = next_slot;
-                            out_len += 1;
-                        }
-                        // else: `node` drops here (freed).
-                    }
                 }
             }
+            Some(())
+        });
 
-            // Tail splices. At most one of `left` / `right` is nonempty.
-            if let Some(l_head) = left.take() {
-                // Self still has terms; q is exhausted. Splice the
-                // entire remaining chain in one assignment and count
-                // its length by walking.
-                let mut remaining_len = 1usize;
-                let mut node = l_head.next.as_deref();
-                while let Some(x) = node {
-                    remaining_len += 1;
-                    node = x.next.as_deref();
-                }
-                *tail_slot = Some(l_head);
-                out_len += remaining_len;
-                // `tail_slot` is no longer used after this point.
-            } else {
-                // Self exhausted; q may still have terms. Build the
-                // remainder of `-c * m * q` fresh.
-                while let Some(r_node) = right {
-                    let neg = f.neg(f.mul(c, r_node.coeff));
-                    right = r_node.next.as_deref();
-                    if neg == 0 {
-                        continue;
-                    }
-                    let prod_m = m.mul(&r_node.mono, ring)?;
-                    let fresh = Box::new(Node {
-                        coeff: neg,
-                        mono: prod_m,
-                        next: None,
-                    });
-                    *tail_slot = Some(fresh);
-                    let next_slot: *mut Option<Box<Node>> =
-                        &mut (*tail_slot).as_mut().unwrap().next;
-                    tail_slot = next_slot;
-                    out_len += 1;
-                }
-            }
+        if outcome.is_none() {
+            // Overflow during the merge. Release any work-in-progress.
+            release_partial(sentinel_slot.take());
+            release_partial(left.take());
+            // `self.head` was already taken above; `self` will drop
+            // with head = None. `right`/`q` is borrowed and untouched.
+            return None;
         }
 
         // Move the chain out of the sentinel slot.
@@ -889,26 +1052,28 @@ impl Poly {
     /// Panic if any internal invariant is violated.
     pub fn assert_canonical(&self, ring: &Ring) {
         let p = ring.field().p();
-        let mut node = self.head.as_deref();
+        let mut node = self.head;
         let mut prev: Option<&Monomial> = None;
         let mut count: usize = 0;
         while let Some(n) = node {
+            // SAFETY: live node.
+            let n_ref = unsafe { n.as_ref() };
             assert!(
-                n.coeff > 0 && n.coeff < p,
+                n_ref.coeff > 0 && n_ref.coeff < p,
                 "coeff[{count}] = {} not in 1..{p}",
-                n.coeff
+                n_ref.coeff
             );
-            n.mono.assert_canonical(ring);
+            n_ref.mono.assert_canonical(ring);
             if let Some(p_m) = prev {
-                let ord = p_m.cmp(&n.mono, ring);
+                let ord = p_m.cmp(&n_ref.mono, ring);
                 assert!(
                     ord == std::cmp::Ordering::Greater,
                     "terms not strictly descending at [{count}]: got {ord:?}"
                 );
             }
-            prev = Some(&n.mono);
+            prev = Some(&n_ref.mono);
             count += 1;
-            node = n.next.as_deref();
+            node = n_ref.next;
         }
         assert_eq!(self.len, count, "cached len disagrees with walk");
         if self.is_zero() {
@@ -916,7 +1081,8 @@ impl Poly {
             assert_eq!(self.lm_coeff, 0);
             assert_eq!(self.lm_deg, 0);
         } else {
-            let h = self.head.as_deref().unwrap();
+            // SAFETY: head is live and non-null here.
+            let h = unsafe { self.head.unwrap().as_ref() };
             assert_eq!(self.lm_sev, h.mono.sev());
             assert_eq!(self.lm_coeff, h.coeff);
             assert_eq!(self.lm_deg, h.mono.total_deg());
@@ -933,7 +1099,7 @@ impl Default for Poly {
 /// A cursor walking a [`Poly`]'s terms in descending order.
 ///
 /// Obtain one with [`Poly::cursor`]. Cheap and `Copy`: it holds
-/// a single reference to the current node (or `None` when
+/// a single pointer to the current node (or `None` when
 /// exhausted). On the linked-list backend `advance` chases the
 /// `next` pointer; on the flat-array backend (see
 /// [`super::poly_vec::PolyCursor`]) it bumps an index. The same
@@ -941,7 +1107,8 @@ impl Default for Poly {
 /// uniformly.
 #[derive(Clone, Copy)]
 pub struct PolyCursor<'a> {
-    node: Option<&'a Node>,
+    node: Option<NonNull<Node>>,
+    _marker: std::marker::PhantomData<&'a Node>,
 }
 
 impl<'a> std::fmt::Debug for PolyCursor<'a> {
@@ -956,13 +1123,21 @@ impl<'a> PolyCursor<'a> {
     /// Current term `(coeff, &monomial)`, or `None` if exhausted.
     #[inline]
     pub fn term(&self) -> Option<(Coeff, &'a Monomial)> {
-        self.node.map(|n| (n.coeff, &n.mono))
+        self.node.map(|n| {
+            // SAFETY: the cursor's lifetime `'a` is tied to the
+            // borrowed `Poly`; its chain stays live for `'a`.
+            let r = unsafe { n.as_ref() };
+            (r.coeff, &r.mono)
+        })
     }
 
     /// Advance one term. No-op once exhausted.
     #[inline]
     pub fn advance(&mut self) {
-        self.node = self.node.and_then(|n| n.next.as_deref());
+        self.node = self.node.and_then(|n| {
+            // SAFETY: live node during lifetime `'a`.
+            unsafe { n.as_ref() }.next
+        });
     }
 
     /// True once all terms have been walked.
@@ -980,14 +1155,17 @@ impl PartialEq for Poly {
         if self.len != other.len {
             return false;
         }
-        let mut a = self.head.as_deref();
-        let mut b = other.head.as_deref();
+        let mut a = self.head;
+        let mut b = other.head;
         while let (Some(x), Some(y)) = (a, b) {
-            if x.coeff != y.coeff || x.mono != y.mono {
+            // SAFETY: live nodes.
+            let xr = unsafe { x.as_ref() };
+            let yr = unsafe { y.as_ref() };
+            if xr.coeff != yr.coeff || xr.mono != yr.mono {
                 return false;
             }
-            a = x.next.as_deref();
-            b = y.next.as_deref();
+            a = xr.next;
+            b = yr.next;
         }
         a.is_none() && b.is_none()
     }
@@ -1010,8 +1188,8 @@ fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
 
     // Sentinel-slot pattern (see `sub_mm_mult_qq_consuming` for the
     // soundness argument).
-    let mut sentinel_slot: Option<Box<Node>> = None;
-    let mut tail_slot: *mut Option<Box<Node>> = &mut sentinel_slot;
+    let mut sentinel_slot: Option<NonNull<Node>> = None;
+    let mut tail_slot: *mut Option<NonNull<Node>> = &mut sentinel_slot;
     let mut out_len: usize = 0;
 
     // Move both input chains into local owned variables. We can't
@@ -1020,111 +1198,114 @@ fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
     // drop of `a` / `b` is O(1).
     let mut a = a;
     let mut b = b;
-    let mut left: Option<Box<Node>> = a.head.take();
-    let mut right: Option<Box<Node>> = b.head.take();
+    let mut left: Option<NonNull<Node>> = a.head.take();
+    let mut right: Option<NonNull<Node>> = b.head.take();
 
-    // SAFETY: Identical argument to `sub_mm_mult_qq_consuming`. Every
-    // write through `tail_slot` targets an `Option<Box<Node>>` that
-    // belongs to the sentinel chain. `sentinel_slot` outlives every
-    // update. Input nodes are moved into the output before any
-    // dereference of `tail_slot`.
-    unsafe {
-        loop {
-            let (l_ref, r_ref) = match (left.as_ref(), right.as_ref()) {
-                (Some(l), Some(r)) => (l, r),
-                _ => break,
-            };
-            match l_ref.mono.cmp(&r_ref.mono, ring) {
-                std::cmp::Ordering::Greater => {
-                    // Splice `left`'s head.
-                    let mut node = left.take().unwrap();
-                    left = node.next.take();
-                    *tail_slot = Some(node);
-                    let next_slot: *mut Option<Box<Node>> =
-                        &mut (*tail_slot).as_mut().unwrap().next;
-                    tail_slot = next_slot;
-                    out_len += 1;
-                }
-                std::cmp::Ordering::Less => {
-                    // Splice `right`'s head (negating coeff if subtracting).
-                    let mut node = right.take().unwrap();
-                    right = node.next.take();
-                    if subtract {
-                        node.coeff = f.neg(node.coeff);
-                    }
-                    *tail_slot = Some(node);
-                    let next_slot: *mut Option<Box<Node>> =
-                        &mut (*tail_slot).as_mut().unwrap().next;
-                    tail_slot = next_slot;
-                    out_len += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    // Combine coefficients; reuse left's node if the
-                    // sum is nonzero, otherwise free both.
-                    let bc = if subtract {
-                        f.neg(r_ref.coeff)
-                    } else {
-                        r_ref.coeff
-                    };
-                    let s = f.add(l_ref.coeff, bc);
-                    // Consume both heads.
-                    let mut l_node = left.take().unwrap();
-                    left = l_node.next.take();
-                    let mut r_node = right.take().unwrap();
-                    right = r_node.next.take();
-                    if s != 0 {
-                        l_node.coeff = s;
-                        *tail_slot = Some(l_node);
-                        let next_slot: *mut Option<Box<Node>> =
-                            &mut (*tail_slot).as_mut().unwrap().next;
-                        tail_slot = next_slot;
+    POOL.with(|pool_cell| {
+        let mut pool = pool_cell.borrow_mut();
+        // SAFETY: Identical argument to `sub_mm_mult_qq_consuming`.
+        // Every write through `tail_slot` targets an
+        // `Option<NonNull<Node>>` that belongs to the sentinel chain.
+        // `sentinel_slot` outlives every update. Input nodes are
+        // detached from their source list before any dereference of
+        // `tail_slot` through the spliced pointer.
+        unsafe {
+            loop {
+                let (l, r) = match (left, right) {
+                    (Some(l), Some(r)) => (l, r),
+                    _ => break,
+                };
+                let l_ref = l.as_ref();
+                let r_ref = r.as_ref();
+                match l_ref.mono.cmp(&r_ref.mono, ring) {
+                    std::cmp::Ordering::Greater => {
+                        let l_ptr = l.as_ptr();
+                        left = (*l_ptr).next.take();
+                        (*l_ptr).next = None;
+                        *tail_slot = Some(l);
+                        tail_slot = &mut (*l_ptr).next;
                         out_len += 1;
                     }
-                    // `l_node` (if dropped here) and `r_node` are freed.
-                    // Drop `r_node` explicitly to make the intent clear.
-                    drop(r_node);
+                    std::cmp::Ordering::Less => {
+                        let r_ptr = r.as_ptr();
+                        right = (*r_ptr).next.take();
+                        (*r_ptr).next = None;
+                        if subtract {
+                            (*r_ptr).coeff = f.neg((*r_ptr).coeff);
+                        }
+                        *tail_slot = Some(r);
+                        tail_slot = &mut (*r_ptr).next;
+                        out_len += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Combine coefficients; reuse left's node if
+                        // the sum is nonzero, otherwise free both.
+                        let bc = if subtract {
+                            f.neg(r_ref.coeff)
+                        } else {
+                            r_ref.coeff
+                        };
+                        let s = f.add(l_ref.coeff, bc);
+                        // Consume both heads.
+                        let l_ptr = l.as_ptr();
+                        let r_ptr = r.as_ptr();
+                        left = (*l_ptr).next.take();
+                        right = (*r_ptr).next.take();
+                        if s != 0 {
+                            (*l_ptr).coeff = s;
+                            (*l_ptr).next = None;
+                            *tail_slot = Some(l);
+                            tail_slot = &mut (*l_ptr).next;
+                            out_len += 1;
+                            // Free r_node.
+                            pool.dealloc(r);
+                        } else {
+                            pool.dealloc(l);
+                            pool.dealloc(r);
+                        }
+                    }
                 }
             }
-        }
 
-        // Tail splices: one side is exhausted. Splice the remainder
-        // of the other side in a single pointer assignment.
-        if let Some(l_head) = left.take() {
-            let mut remaining_len = 1usize;
-            let mut node = l_head.next.as_deref();
-            while let Some(x) = node {
-                remaining_len += 1;
-                node = x.next.as_deref();
-            }
-            *tail_slot = Some(l_head);
-            out_len += remaining_len;
-        } else if let Some(r_head) = right.take() {
-            // If subtracting, every node's coeff must be negated.
-            // Otherwise the remainder can be spliced as-is.
-            if subtract {
-                let mut cur: Option<Box<Node>> = Some(r_head);
-                while let Some(mut node) = cur {
-                    let next = node.next.take();
-                    node.coeff = f.neg(node.coeff);
-                    *tail_slot = Some(node);
-                    let next_slot: *mut Option<Box<Node>> =
-                        &mut (*tail_slot).as_mut().unwrap().next;
-                    tail_slot = next_slot;
-                    out_len += 1;
-                    cur = next;
-                }
-            } else {
+            // Tail splices: one side is exhausted. Splice the
+            // remainder of the other side in a single pointer
+            // assignment.
+            if let Some(l_head) = left.take() {
                 let mut remaining_len = 1usize;
-                let mut node = r_head.next.as_deref();
+                let mut node = l_head.as_ref().next;
                 while let Some(x) = node {
                     remaining_len += 1;
-                    node = x.next.as_deref();
+                    node = x.as_ref().next;
                 }
-                *tail_slot = Some(r_head);
+                *tail_slot = Some(l_head);
                 out_len += remaining_len;
+            } else if let Some(r_head) = right.take() {
+                // If subtracting, every node's coeff must be negated.
+                // Otherwise the remainder can be spliced as-is.
+                if subtract {
+                    let mut cur: Option<NonNull<Node>> = Some(r_head);
+                    while let Some(n) = cur {
+                        let n_ptr = n.as_ptr();
+                        let nxt = (*n_ptr).next.take();
+                        (*n_ptr).coeff = f.neg((*n_ptr).coeff);
+                        *tail_slot = Some(n);
+                        tail_slot = &mut (*n_ptr).next;
+                        out_len += 1;
+                        cur = nxt;
+                    }
+                } else {
+                    let mut remaining_len = 1usize;
+                    let mut node = r_head.as_ref().next;
+                    while let Some(x) = node {
+                        remaining_len += 1;
+                        node = x.as_ref().next;
+                    }
+                    *tail_slot = Some(r_head);
+                    out_len += remaining_len;
+                }
             }
         }
-    }
+    });
 
     let mut out = Poly {
         head: sentinel_slot.take(),
@@ -1144,92 +1325,93 @@ fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
 /// optimisation).
 fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
     let f = ring.field();
-    let mut out_head: Option<Box<Node>> = None;
-    let mut tail_slot: &mut Option<Box<Node>> = &mut out_head;
-    let mut out_len: usize = 0;
 
-    let mut left = a.head.as_deref();
-    let mut right = b.head.as_deref();
+    POOL.with(|pool_cell| {
+        let mut pool = pool_cell.borrow_mut();
+        let mut out_head: Option<NonNull<Node>> = None;
+        let mut tail: *mut Option<NonNull<Node>> = &mut out_head;
+        let mut out_len: usize = 0;
 
-    while let (Some(l), Some(r)) = (left, right) {
-        match l.mono.cmp(&r.mono, ring) {
-            std::cmp::Ordering::Greater => {
-                let fresh = Box::new(Node {
-                    coeff: l.coeff,
-                    mono: l.mono.clone(),
-                    next: None,
-                });
-                *tail_slot = Some(fresh);
-                tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                out_len += 1;
-                left = l.next.as_deref();
-            }
-            std::cmp::Ordering::Less => {
-                let c = if subtract { f.neg(r.coeff) } else { r.coeff };
-                // c is nonzero as long as r.coeff is nonzero (which
-                // it always is by the canonical invariant): negating
-                // preserves nonzeroness.
-                let fresh = Box::new(Node {
-                    coeff: c,
-                    mono: r.mono.clone(),
-                    next: None,
-                });
-                *tail_slot = Some(fresh);
-                tail_slot = &mut tail_slot.as_mut().unwrap().next;
-                out_len += 1;
-                right = r.next.as_deref();
-            }
-            std::cmp::Ordering::Equal => {
-                let bc = if subtract { f.neg(r.coeff) } else { r.coeff };
-                let s = f.add(l.coeff, bc);
-                if s != 0 {
-                    let fresh = Box::new(Node {
-                        coeff: s,
-                        mono: l.mono.clone(),
-                        next: None,
-                    });
-                    *tail_slot = Some(fresh);
-                    tail_slot = &mut tail_slot.as_mut().unwrap().next;
+        let mut left = a.head;
+        let mut right = b.head;
+
+        while let (Some(l), Some(r)) = (left, right) {
+            // SAFETY: live nodes from a / b.
+            let l_ref = unsafe { l.as_ref() };
+            let r_ref = unsafe { r.as_ref() };
+            match l_ref.mono.cmp(&r_ref.mono, ring) {
+                std::cmp::Ordering::Greater => {
+                    let fresh = pool.alloc(l_ref.coeff, l_ref.mono.clone(), None);
+                    unsafe {
+                        *tail = Some(fresh);
+                        tail = &mut (*fresh.as_ptr()).next;
+                    }
                     out_len += 1;
+                    left = l_ref.next;
                 }
-                left = l.next.as_deref();
-                right = r.next.as_deref();
+                std::cmp::Ordering::Less => {
+                    let c = if subtract { f.neg(r_ref.coeff) } else { r_ref.coeff };
+                    // c is nonzero as long as r.coeff is nonzero
+                    // (which it always is by the canonical invariant):
+                    // negating preserves nonzeroness.
+                    let fresh = pool.alloc(c, r_ref.mono.clone(), None);
+                    unsafe {
+                        *tail = Some(fresh);
+                        tail = &mut (*fresh.as_ptr()).next;
+                    }
+                    out_len += 1;
+                    right = r_ref.next;
+                }
+                std::cmp::Ordering::Equal => {
+                    let bc = if subtract { f.neg(r_ref.coeff) } else { r_ref.coeff };
+                    let s = f.add(l_ref.coeff, bc);
+                    if s != 0 {
+                        let fresh = pool.alloc(s, l_ref.mono.clone(), None);
+                        unsafe {
+                            *tail = Some(fresh);
+                            tail = &mut (*fresh.as_ptr()).next;
+                        }
+                        out_len += 1;
+                    }
+                    left = l_ref.next;
+                    right = r_ref.next;
+                }
             }
         }
-    }
-    while let Some(l) = left {
-        let fresh = Box::new(Node {
-            coeff: l.coeff,
-            mono: l.mono.clone(),
-            next: None,
-        });
-        *tail_slot = Some(fresh);
-        tail_slot = &mut tail_slot.as_mut().unwrap().next;
-        out_len += 1;
-        left = l.next.as_deref();
-    }
-    while let Some(r) = right {
-        let c = if subtract { f.neg(r.coeff) } else { r.coeff };
-        let fresh = Box::new(Node {
-            coeff: c,
-            mono: r.mono.clone(),
-            next: None,
-        });
-        *tail_slot = Some(fresh);
-        tail_slot = &mut tail_slot.as_mut().unwrap().next;
-        out_len += 1;
-        right = r.next.as_deref();
-    }
+        while let Some(l) = left {
+            // SAFETY: live node.
+            let l_ref = unsafe { l.as_ref() };
+            let fresh = pool.alloc(l_ref.coeff, l_ref.mono.clone(), None);
+            unsafe {
+                *tail = Some(fresh);
+                tail = &mut (*fresh.as_ptr()).next;
+            }
+            out_len += 1;
+            left = l_ref.next;
+        }
+        while let Some(r) = right {
+            // SAFETY: live node.
+            let r_ref = unsafe { r.as_ref() };
+            let c = if subtract { f.neg(r_ref.coeff) } else { r_ref.coeff };
+            let fresh = pool.alloc(c, r_ref.mono.clone(), None);
+            unsafe {
+                *tail = Some(fresh);
+                tail = &mut (*fresh.as_ptr()).next;
+            }
+            out_len += 1;
+            right = r_ref.next;
+        }
 
-    let mut out = Poly {
-        head: out_head,
-        len: out_len,
-        lm_sev: 0,
-        lm_coeff: 0,
-        lm_deg: 0,
-    };
-    out.refresh_cache();
-    out
+        let mut out = Poly {
+            head: out_head,
+            len: out_len,
+            lm_sev: 0,
+            lm_coeff: 0,
+            lm_deg: 0,
+        };
+        out.refresh_cache();
+        out
+    })
 }
 
 #[cfg(test)]
@@ -1695,9 +1877,8 @@ mod tests {
 
     #[test]
     fn iterative_drop_survives_long_chain() {
-        // A recursive Box<Node> destructor would overflow the stack
-        // on a chain of this length. The custom iterative Drop must
-        // handle it.
+        // A recursive drop would overflow the stack on a chain of
+        // this length. The custom iterative Drop must handle it.
         //
         // Exponents must fit the 7-bit-per-variable budget
         // (ADR-005), so we spread the chain across enough variables
@@ -1709,14 +1890,7 @@ mod tests {
         let r = mk_ring(4, 32003);
         let n: usize = 100_000;
 
-        // Generate N distinct monomials in descending degrevlex
-        // order by sweeping exponents. Simplest: take monomials of
-        // the form `x0^a` for a in [0..n). That fits in variable 0
-        // alone if n <= 64 — not enough. So use base-64 digits
-        // across the 4 variables instead, and sort descending.
         let mut distinct: Vec<Monomial> = Vec::with_capacity(n);
-        // Walk (a, b, c, d) in lex order where each is 0..63; stop
-        // after n entries.
         'outer: for d in 0u32..64 {
             for c in 0u32..64 {
                 for b in 0u32..64 {
@@ -1739,5 +1913,75 @@ mod tests {
         // walk the chain without recursing. If this test ever starts
         // overflowing the stack, Drop has regressed to recursive.
         drop(p);
+    }
+
+    /// Pool-backed variant only: prove the free list grows then
+    /// stabilises as polys are constructed and dropped. This is the
+    /// "reuse is happening" regression guard called for in the task
+    /// prompt. Gated on `linked_list_poly_pool` so it doesn't run on
+    /// the forwarder variant (where `free_len()` is always 0 by
+    /// design).
+    #[cfg(feature = "linked_list_poly_pool")]
+    #[test]
+    fn pool_reuses_freed_nodes() {
+        let r = mk_ring(3, 13);
+
+        // Drain the free list first by a quick alloc/drop cycle so
+        // the starting state is well-defined (other tests in the
+        // same process may have populated it).
+        {
+            let p = Poly::from_terms(
+                &r,
+                vec![(3, mono(&r, &[1, 0, 0])), (4, mono(&r, &[0, 1, 0]))],
+            );
+            drop(p);
+        }
+
+        let free_after_warmup =
+            super::POOL.with(|pool_cell| pool_cell.borrow().free_len());
+        assert!(
+            free_after_warmup >= 2,
+            "expected at least 2 nodes on free list after warmup, got {free_after_warmup}"
+        );
+
+        // Allocate a batch larger than the current free list, then
+        // drop them. The free list should grow.
+        let batch_size = free_after_warmup + 50;
+        let mut batch: Vec<Poly> = Vec::with_capacity(batch_size);
+        for i in 0..batch_size as u32 {
+            batch.push(Poly::from_terms(
+                &r,
+                vec![
+                    (3, mono(&r, &[(i % 10) as u32 + 1, 0, 0])),
+                    (1, mono(&r, &[0, 0, 0])),
+                ],
+            ));
+        }
+        drop(batch);
+        let free_after_batch =
+            super::POOL.with(|pool_cell| pool_cell.borrow().free_len());
+        assert!(
+            free_after_batch >= batch_size * 2,
+            "expected free list to grow past 2*batch_size={}, got {free_after_batch}",
+            batch_size * 2
+        );
+
+        // Allocate a smaller batch; the free list should shrink as
+        // nodes are popped (proving reuse), then grow when the
+        // smaller batch is dropped.
+        let before_reuse = free_after_batch;
+        let reuse_batch_size = 10usize;
+        let mut reuse_batch: Vec<Poly> = Vec::with_capacity(reuse_batch_size);
+        for _ in 0..reuse_batch_size {
+            reuse_batch.push(Poly::monomial(&r, 7, mono(&r, &[2, 0, 0])));
+        }
+        let free_during_reuse =
+            super::POOL.with(|pool_cell| pool_cell.borrow().free_len());
+        assert!(
+            free_during_reuse <= before_reuse - reuse_batch_size,
+            "expected free list to shrink by at least {reuse_batch_size} (\
+             before={before_reuse}, during={free_during_reuse})"
+        );
+        drop(reuse_batch);
     }
 }

@@ -20,11 +20,16 @@
 //! identical across both backends (see `poly_vec.rs` / `poly_list.rs`
 //! for the per-backend implementations).
 
+#[cfg(all(feature = "linked_list_poly_pool", not(feature = "linked_list_poly")))]
+compile_error!("feature `linked_list_poly_pool` requires `linked_list_poly`");
+
 #[cfg(not(feature = "linked_list_poly"))]
 mod poly_vec;
 #[cfg(not(feature = "linked_list_poly"))]
 pub use poly_vec::{Poly, PolyCursor};
 
+#[cfg(feature = "linked_list_poly")]
+mod node_pool;
 #[cfg(feature = "linked_list_poly")]
 mod poly_list;
 #[cfg(feature = "linked_list_poly")]

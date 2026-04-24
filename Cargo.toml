@@ -32,6 +32,12 @@ heap_reducer = []
 # for the rationale behind keeping both backends available.
 linked_list_poly = []
 
+# Thread-local free-list-backed Node allocator for the
+# linked_list_poly backend. Requires linked_list_poly. When off,
+# Node allocations forward to Box::new / Box::from_raw. See
+# ADR-016 for the rationale and measured impact.
+linked_list_poly_pool = []
+
 [dev-dependencies]
 proptest = "1"
 
