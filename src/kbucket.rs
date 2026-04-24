@@ -217,7 +217,14 @@ impl KBucket {
                     return;
                 }
                 Some(existing) => {
-                    let merged = existing.add(&q, &self.ring);
+                    // Both operands are already owned here (existing
+                    // via `take()`, q by value), so use the
+                    // destructive variant — on the List backend this
+                    // splices input nodes into the output chain
+                    // instead of allocating a fresh Box<Node> per
+                    // output term (ADR-015). On the Vec backend
+                    // `add_consuming` is a thin forwarder to `add`.
+                    let merged = existing.add_consuming(q, &self.ring);
                     self.mark_dirty(i);
                     if merged.is_zero() {
                         // Accumulated sum cancelled; nothing to place.
@@ -261,17 +268,50 @@ impl KBucket {
             return;
         }
 
-        let neg_cmp = match build_neg_cmp(&self.ring, c, m, p) {
+        // Destination slot: pick the slot for a polynomial of length
+        // `p.len()`. On the List backend, `sub_mm_mult_qq_consuming`
+        // destructively fuses the existing slot's poly with `-c*m*p`
+        // in a single splice-based pass — no fresh `-c*m*p`
+        // intermediate poly is ever built. On the Vec backend, the
+        // call forwards to the non-destructive `sub_mul_term` which
+        // is equivalent to the old `build_neg_cmp` + merge pair.
+        //
+        // If the slot was empty we start from `Poly::zero()`; the
+        // resulting poly is `-c*m*p` (the List variant constructs it
+        // by splicing fresh nodes from `p` one-at-a-time into the
+        // output chain — same allocation budget as the old
+        // `build_neg_cmp`, but skips the intermediate poly's own
+        // drop traversal afterward).
+        let i = slot_for_len(p.len());
+        debug_assert!(i < NUM_SLOTS, "slot overflow: p.len() = {}", p.len());
+
+        let existing = self.slots[i].take().unwrap_or_else(Poly::zero);
+        let merged = match existing.sub_mm_mult_qq_consuming(c, m, p, &self.ring) {
             Some(v) => v,
             None => {
                 debug_assert!(false, "monomial product overflowed 8-bit exponent budget");
                 return;
             }
         };
-        if neg_cmp.is_zero() {
+        self.mark_dirty(i);
+        if merged.is_zero() {
+            // Sum cancelled at this slot; no further work.
             return;
         }
-        self.absorb(neg_cmp);
+        let target = slot_for_len(merged.len());
+        if target == i {
+            self.slots[i] = Some(merged);
+            return;
+        }
+        // `merged` outgrew slot `i`; cascade through `absorb`. The
+        // target slot is strictly larger, so the absorb loop starts
+        // from `target` and proceeds upward (same invariant as the
+        // add_consuming cascade).
+        debug_assert!(
+            target > i,
+            "sub_mm_mult_qq shrank into smaller slot ({target} < {i})"
+        );
+        self.absorb(merged);
     }
 
     // ----- Leading term -----
@@ -480,38 +520,6 @@ impl KBucket {
             );
         }
     }
-}
-
-/// Build `-c * m * p` as a standalone polynomial. Term ordering is
-/// preserved by monomial multiplication being monotone under
-/// `DegRevLex`, so the resulting coefficient/term parallel vectors
-/// are already strictly descending. `c != 0` and `pc != 0` in a
-/// canonical `Poly`, so with `c*pc mod p` potentially zero we filter
-/// it; no duplicates can appear. We therefore take the descending-
-/// parallel fast path in `Poly` and skip the sort.
-///
-/// Returns `None` if any `m * q_terms[j]` overflows the 8-bit
-/// exponent budget.
-fn build_neg_cmp(ring: &Ring, c: Coeff, m: &Monomial, p: &Poly) -> Option<Poly> {
-    debug_assert!(c < ring.field().p());
-    debug_assert!(c != 0);
-    if p.is_zero() {
-        return Some(Poly::zero());
-    }
-    let f = ring.field();
-    let mut coeffs: Vec<Coeff> = Vec::with_capacity(p.len());
-    let mut mons: Vec<Monomial> = Vec::with_capacity(p.len());
-    for (pc, pm) in p.iter() {
-        let prod_c = f.mul(c, pc);
-        let prod_c = f.neg(prod_c);
-        if prod_c == 0 {
-            continue;
-        }
-        let prod_m = pm.mul(m, ring)?;
-        coeffs.push(prod_c);
-        mons.push(prod_m);
-    }
-    Some(Poly::from_descending_parallel_unchecked(ring, coeffs, mons))
 }
 
 #[cfg(test)]
