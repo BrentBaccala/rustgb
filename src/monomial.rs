@@ -217,31 +217,48 @@ impl Monomial {
     /// exceeds [`crate::ring::MAX_VAR_EXP`] (= 127), or the resulting
     /// total degree exceeds `u32::MAX`.
     ///
-    /// Implementation per ADR-005: plain word-wise wrapping-add of the
-    /// four packed u64 words (LLVM auto-vectorises this into a single
-    /// `vpaddq`), followed by a divmask-style overflow check that
-    /// inspects the guard bit of each variable byte. The top byte
-    /// (total-degree cap) is rewritten cleanly from the cached u32
-    /// total rather than relying on the wrap-add result.
+    /// Implementation per ADR-005, with the codegen-motivated split
+    /// in ADR-017: the word-wise wrapping-add is emitted as an
+    /// explicit 4-element array literal (so LLVM sees four
+    /// independent reads+writes with no loop structure and, under
+    /// `-C target-cpu=native` on an AVX2 host, folds the four u64
+    /// adds into one `vpaddq ymm`); the divmask overflow check is
+    /// then a separate OR-reduction over the four words with a
+    /// single final branch, rather than a per-word `any()` early
+    /// exit that would block the vectorizer from batching the adds.
+    /// The top byte (total-degree cap) is rewritten cleanly from
+    /// the cached u32 total rather than relying on the wrap-add
+    /// result.
     pub fn mul(&self, other: &Self, ring: &Ring) -> Option<Self> {
-        // Word-wise add. Auto-vectorises; overflow within a variable
+        // The explicit unroll below assumes exactly four words; if
+        // WORDS_PER_MONO ever changes, update the literal.
+        const _: () = assert!(WORDS_PER_MONO == 4);
+
+        // Word-wise add. Explicit 4-element literal so LLVM sees
+        // four independent reads+writes; overflow within a variable
         // byte sets the guard bit (bit 7) of that byte, no carry can
         // propagate to the neighbouring byte because both inputs are
         // ≤ 127 in their low 7 bits and bit 7 is always 0 in canonical
         // form, so each byte sum is ≤ 254 — always fits in 8 bits.
-        let mut packed: [u64; WORDS_PER_MONO] =
-            std::array::from_fn(|word| self.packed[word].wrapping_add(other.packed[word]));
+        let mut packed: [u64; WORDS_PER_MONO] = [
+            self.packed[0].wrapping_add(other.packed[0]),
+            self.packed[1].wrapping_add(other.packed[1]),
+            self.packed[2].wrapping_add(other.packed[2]),
+            self.packed[3].wrapping_add(other.packed[3]),
+        ];
 
-        // Divmask overflow check: any guard bit set in the result
-        // signals per-byte exponent > 127. The mask zeroes the
-        // total-degree byte, so a wrapped top byte does not trigger
-        // a false positive here.
-        let ovf_mask = ring.overflow_mask();
-        if packed
-            .iter()
-            .zip(ovf_mask.iter())
-            .any(|(p, m)| (p & m) != 0)
-        {
+        // Divmask overflow check, OR-reduced into a single branch so
+        // the add above stays a pure data dependency — no per-word
+        // early-exit between the adds. Any guard bit set in the
+        // result signals per-byte exponent > 127. The mask zeroes
+        // the total-degree byte, so a wrapped top byte does not
+        // trigger a false positive here.
+        let m = ring.overflow_mask();
+        let ovf = (packed[0] & m[0])
+            | (packed[1] & m[1])
+            | (packed[2] & m[2])
+            | (packed[3] & m[3]);
+        if ovf != 0 {
             return None;
         }
 

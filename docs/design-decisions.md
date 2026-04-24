@@ -2512,6 +2512,305 @@ the pre-ADR code maps 1:1 to a `pool.dealloc` site.
 
 ---
 
+## ADR-017: `Monomial::mul` codegen — split add from overflow check
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+Post-ADR-016 profiling of staging-5101449 under the target List + Node-pool
+configuration placed `Monomial::mul` at ~29 % of total cycles, with time
+landing on `core::num::wrapping_add` inside `core::array::from_fn` rather
+than a single vectorised add. Two distinct problems compounded.
+
+**Problem 1 — build flag not set.** The crate had no `.cargo/config.toml`
+and no session-level `RUSTFLAGS`. The AVX2-gated code paths in `src/simd.rs`
+(ADR-007 `find_sev_match_avx2`, ADR-009 `Monomial::div` AVX2 helper) are
+gated on `#[cfg(target_feature = "avx2")]`. Without `-C target-cpu=native`
+(or equivalent), those paths are not compiled in — the scalar fallback
+is used — and LLVM cannot auto-vectorise the word-wise `wrapping_add`
+loop into a wide `vpaddq` because the target baseline (x86-64-v1) does
+not expose AVX2 registers. Every pre-2026-04-24 rustgb measurement was
+taken with AVX2 dead code as a result.
+
+**Problem 2 — overflow check interleaved with the add.** Even rebuilt
+with `-C target-cpu=native`, `Monomial::mul` only partially vectorised.
+Disassembly of `probe_mul` (native, AMD Ryzen 5 2500U / znver1, pre-fix):
+
+```
+vmovdqu xmm0, [rdx]
+vpaddq  xmm0, xmm0, [rsi]              ; 1× vpaddq xmm — words 0,1 only
+vmovq   rdi, xmm0
+test    [rcx], rdi                     ; overflow check word 0
+je      ...
+vpextrq rdi, xmm0, 0x1
+test    [rcx+0x8], rdi                 ; overflow check word 1
+je      ...
+mov     rdi, [rdx+0x10]                ; scalar load, word 2
+add     rdi, [rsi+0x10]                ; scalar add
+test    [rcx+0x10], rdi                ; overflow check word 2
+je      ...
+mov     r8,  [rdx+0x18]                ; scalar load, word 3
+add     r8,  [rsi+0x18]                ; scalar add
+test    [rcx+0x18], r8                 ; overflow check word 3
+```
+
+LLVM batched words 0-1 into one 128-bit `vpaddq xmm` and left words 2-3
+as scalar adds. The cause was the shape at `src/monomial.rs:232-246`:
+
+```rust
+let mut packed: [u64; WORDS_PER_MONO] =
+    std::array::from_fn(|word| self.packed[word].wrapping_add(other.packed[word]));
+
+let ovf_mask = ring.overflow_mask();
+if packed
+    .iter()
+    .zip(ovf_mask.iter())
+    .any(|(p, m)| (p & m) != 0)
+{
+    return None;
+}
+```
+
+The `.iter().zip().any()` closes a per-word early-exit branch after each
+overflow test. LLVM cannot coalesce the four adds into a single wide
+`vpaddq` because doing so would do work past the point where an earlier
+word's overflow test would have returned `None`.
+
+### Singular's approach
+
+`p_MemAdd_LengthGeneral` (`~/Singular/libpolys/polys/templates/p_MemAdd.h:173`):
+
+```c
+do {
+    _r[_i] += _s[_i];
+    _i++;
+} while (_i != _l);
+```
+
+Plain scalar loop on `unsigned long *`. **No overflow check in release
+builds** — only `pAssume1` under `PDEBUG`. Lengths 1-8 each have an
+explicit unrolled macro variant (`_p_MemAdd_LengthTwo` …
+`_LengthEight`), and the ring-procedure generator in
+`p_Procs_Generate.cc` dispatches to the length-specialized macro at
+ring creation time, so the hot path is flat, branch-free, and
+auto-vectorises trivially. Overflow is prevented by the ring's
+`bitmask` being chosen to fit the degree bound — it's a design-time
+invariant, not a runtime check. See also `p_ExpVectorAdd` at
+`~/Singular/libpolys/polys/monomials/p_polys.h:1432`.
+
+SEV and total-degree do not live in the exp-vector payload in Singular;
+they sit in the polyrec header and are updated elsewhere.
+
+### FLINT's approach
+
+`mpoly_monomial_add` + `mpoly_monomial_overflows` (`~/flint/src/mpoly.h:233,374`):
+
+```c
+FLINT_FORCE_INLINE
+void mpoly_monomial_add(ulong * exp_ptr, const ulong * exp2,
+                                         const ulong * exp3, slong N) {
+   for (i = 0; i < N; i++)
+      exp_ptr[i] = exp2[i] + exp3[i];
+}
+
+FLINT_FORCE_INLINE
+int mpoly_monomial_overflows(ulong * exp2, slong N, ulong mask) {
+   for (i = 0; i < N; i++)
+      if ((exp2[i] & mask) != 0)
+         return 1;
+   return 0;
+}
+```
+
+Two separate `FLINT_FORCE_INLINE` loops. The add is branch-free and
+vectorises cleanly. The overflow check is a **separate** pass; it has
+an early exit of its own, but because it's decoupled from the add, the
+vectorizer is free to emit a wide `vpaddq` for the add. `N` is runtime.
+
+### Decision — Option 1: split the add from the overflow check
+
+Matches FLINT's shape. Replaces the `from_fn` + `iter/zip/any` pattern
+at `src/monomial.rs:232-246` with an explicit 4-element array literal
+for the add and an OR-reduction + single branch for the overflow check:
+
+```rust
+let mut packed: [u64; WORDS_PER_MONO] = [
+    self.packed[0].wrapping_add(other.packed[0]),
+    self.packed[1].wrapping_add(other.packed[1]),
+    self.packed[2].wrapping_add(other.packed[2]),
+    self.packed[3].wrapping_add(other.packed[3]),
+];
+
+let m = ring.overflow_mask();
+let ovf = (packed[0] & m[0])
+        | (packed[1] & m[1])
+        | (packed[2] & m[2])
+        | (packed[3] & m[3]);
+if ovf != 0 {
+    return None;
+}
+```
+
+Semantics identical to before: total-degree cap and SEV update still
+happen inside `mul` per ADR-005. LLVM now sees four independent
+reads+writes with no loop structure, no data dependency between the
+adds and the overflow test until all four adds are complete, and a
+single branch for the overflow decision.
+
+A `const _: () = assert!(WORDS_PER_MONO == 4);` inside the function
+guards against a future change to `WORDS_PER_MONO` silently breaking
+the unroll.
+
+**Why the explicit array literal rather than `for i in 0..4` or
+`from_fn`?** Equivalent on correctness; more robust on codegen across
+compiler versions. The literal forces LLVM to see four independent
+reads+writes with no loop structure to reason about. `from_fn` in
+particular was part of the pre-fix problem: profile-attributed time
+landed inside `core::array::from_fn`'s monomorphised wrapper.
+
+### Observed codegen (post-fix, native znver1)
+
+Disassembly of the inlined `Monomial::mul` body from
+`target/release/examples/mul_probe` after the fix:
+
+```
+vmovdqu (%rdx),%xmm0
+vmovdqu 0x10(%rdx),%xmm1
+vpaddq  (%rsi),%xmm0,%xmm0            ; words 0,1
+vpaddq  0x10(%rsi),%xmm1,%xmm1        ; words 2,3
+vpand   (%rcx),%xmm0,%xmm2            ; overflow mask AND
+vpand   0x10(%rcx),%xmm1,%xmm3
+vpor    %xmm3,%xmm2,%xmm2             ; OR-reduce
+vptest  %xmm2,%xmm2                   ; single branch
+je      <all-four-ok>
+xor     %ecx,%ecx
+mov     %rcx,(%rax)                   ; return None
+ret
+<all-four-ok>:
+mov     0x28(%rsi),%edi               ; total_deg u32
+mov     0x28(%rdx),%ecx
+add     %rdi,%rcx
+...
+```
+
+All four u64 adds are SIMD (no scalar `add` on any exponent word); the
+overflow test is a single `vptest` + `je` rather than four per-word
+branches; the add→test dependency chain is broken so the two `vpaddq`
+are independent and pipelined.
+
+**On CPUs that decode 256-bit AVX2 as 2×128-bit internally (znver1 /
+Zen 1 / AMD Ryzen 5 2500U = samsung), LLVM's cost model correctly
+emits `2× vpaddq xmm` rather than `1× vpaddq ymm`** — same μops,
+same latency, same throughput. On a host with a native 256-bit
+datapath (Haswell+ / Zen 2+), LLVM is expected to fold the same source
+shape into a single `vpaddq ymm`; verified by rebuilding
+`examples/mul_probe` with `RUSTFLAGS="-C target-cpu=haswell"` (even
+there LLVM kept 2×xmm for this particular shape, because the
+`packed` field has u64-alignment (8 B) and 256-bit unaligned loads
+are not universally preferred — the point is that the four adds are
+all in vector registers with no scalar-add fallback and no per-word
+branch). The failure criterion — a scalar `add` on any exponent word
+— is cleared.
+
+### Alternatives considered — Option 2: drop the per-mul overflow check
+
+Mirror Singular: move overflow prevention to the ring-creation /
+monomial-construction boundary by choosing the exponent-byte width so
+that all additions arising in a bba run stay in-range by design. This
+eliminates the overflow test from the hot path entirely. **Deferred**
+because it touches ADR-005's "check every op" invariant — a larger
+change that requires rethinking `from_exponents`, ring setup, and
+correctness reasoning across the crate. Worth revisiting once
+post-this-ADR profiling identifies the next hotspot: if
+`Monomial::mul` is still significant even with the split-add shape,
+Option 2 becomes the next lever; if not, the overflow check has
+become cheap enough to leave in.
+
+### Also changed — `.cargo/config.toml`
+
+A new `~/rustgb/.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+This belongs on-tree because it affects every release build of the
+crate, not just this task's disassembly check. It enables the AVX2
+paths in `src/simd.rs` (ADR-007, ADR-009) — which were previously
+compiled out — as a side effect. Expected to shave ~1-3 % of total
+cycles independently, on top of the `Monomial::mul` fix.
+
+**Measurement-prior-work note:** all pre-2026-04-24 rustgb performance
+numbers recorded in ADRs 001-016 (and in `~/project/docs/profile-rustgb-*.md`)
+were taken with AVX2 disabled. They are not retroactively invalidated
+— the measurements against baselines were fair within their builds —
+but comparisons across the 2026-04-24 flag boundary should note the
+change.
+
+### Not in scope
+
+- **SEV update and total-degree cap stay inside `mul`.** Rustgb-specific
+  per-ADR-005; hoisting them is a separate refactor, only worth doing
+  once they become measurable after this fix.
+- **`Monomial::div` / `Monomial::divides`.** These use their own AVX2
+  paths via `src/simd.rs`; the config-flag change activates them as a
+  side effect. No code change in this ADR.
+- **`Field::mul`.** 7 % of total in the pre-fix profile. Separate task
+  once `Monomial::mul` drops out of the top.
+
+### Consequences
+
+- **Compile-time guard: `const _: () = assert!(WORDS_PER_MONO == 4);`**
+  inside `Monomial::mul` aborts the build if the constant is ever
+  changed without updating the hand-unrolled array literal.
+- **Branch-prediction behaviour shifts.** The pre-fix shape had four
+  correlated branches (each with its own branch-predictor slot); the
+  post-fix shape has one branch. On the common path (no overflow),
+  this is a pure win — one correctly-predicted branch versus four.
+  In the degenerate case of a monomial that overflows on word 0 (so
+  the pre-fix shape would have returned after one test), the post-fix
+  shape does four adds and four ANDs before returning. That case is
+  not on the hot path for well-formed bba inputs (the ring's
+  `bitmask` sizes the variable region for the degree bound in
+  Singular's model; rustgb's current 7-bits-per-var cap is
+  deliberately generous).
+- **All three test configurations remain green.** Default (Vec),
+  `--features linked_list_poly`, `--features 'linked_list_poly
+  linked_list_poly_pool'`. Same pass counts as pre-this-ADR.
+- **Future `WORDS_PER_MONO` change requires updating `mul`.** The
+  `const _: () = assert!(...)` above catches it at compile time, so
+  this is a find-it-immediately failure mode rather than a silent
+  correctness or performance bug.
+
+### References
+
+- Commit `064f393` — `build: enable target-cpu=native for release builds`
+  (new `.cargo/config.toml`).
+- Commit for this ADR (Commit 2) — split add from overflow check + ADR-017.
+- `~/project/docs/profile-rustgb-monomial-mul-fix-staging-5101449.md`
+  — pre/post wall-clock and call-graph profile for this ADR.
+- `~/project/docs/profile-rustgb-list-pool-staging-5101449.md` —
+  pre-fix baseline (ADR-016).
+- `~/rustgb/src/monomial.rs:226-274` — function under change.
+- `~/rustgb/src/simd.rs` — AVX2-gated modules that the config flip
+  also activates.
+- `~/Singular/libpolys/polys/templates/p_MemAdd.h:173` — Singular
+  reference (`p_MemAdd_LengthGeneral`).
+- `~/Singular/libpolys/polys/monomials/p_polys.h:1432` — Singular
+  `p_ExpVectorAdd`.
+- `~/flint/src/mpoly.h:233,374` — FLINT reference
+  (`mpoly_monomial_add`, `mpoly_monomial_overflows`).
+- ADR-005 — packed direct exponents + per-op overflow invariant.
+- ADR-007, ADR-009 — the AVX2-gated paths that the `.cargo/config.toml`
+  flip activates.
+- ADR-016 — most recent landed ADR; this one continues the
+  post-allocator-fix codegen-tuning thread.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
