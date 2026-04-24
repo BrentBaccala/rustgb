@@ -213,23 +213,30 @@ impl Monomial {
 
     // ----- Arithmetic -----
 
-    /// Multiply two monomials. Returns `None` if any resulting exponent
-    /// exceeds [`crate::ring::MAX_VAR_EXP`] (= 127), or the resulting
-    /// total degree exceeds `u32::MAX`.
+    /// Multiply two monomials.
+    ///
+    /// **Contract (ADR-018, implementing ADR-017 Option 2):** the
+    /// caller's ring construction is responsible for ensuring that
+    /// no product arising in the intended computation overflows a
+    /// per-variable byte or the u32 total-degree cache. Release
+    /// builds do not check; they match Singular's
+    /// `p_ExpVectorAdd` / `p_MemAdd_LengthGeneral` contract
+    /// (`~/Singular/libpolys/polys/monomials/p_polys.h:1432`, where
+    /// the overflow guard is gated on `PDEBUG ≥ 1`).
+    ///
+    /// Debug builds catch an overflow via `debug_assert!` on the
+    /// guard-bit divmask and on the u32 total-degree sum, mirroring
+    /// Singular's `pAssume1` checks.
     ///
     /// Implementation per ADR-005, with the codegen-motivated split
     /// in ADR-017: the word-wise wrapping-add is emitted as an
     /// explicit 4-element array literal (so LLVM sees four
     /// independent reads+writes with no loop structure and, under
     /// `-C target-cpu=native` on an AVX2 host, folds the four u64
-    /// adds into one `vpaddq ymm`); the divmask overflow check is
-    /// then a separate OR-reduction over the four words with a
-    /// single final branch, rather than a per-word `any()` early
-    /// exit that would block the vectorizer from batching the adds.
-    /// The top byte (total-degree cap) is rewritten cleanly from
-    /// the cached u32 total rather than relying on the wrap-add
-    /// result.
-    pub fn mul(&self, other: &Self, ring: &Ring) -> Option<Self> {
+    /// adds into one `vpaddq ymm`). The top byte (total-degree cap)
+    /// is rewritten cleanly from the cached u32 total rather than
+    /// relying on the wrap-add result.
+    pub fn mul(&self, other: &Self, ring: &Ring) -> Self {
         // The explicit unroll below assumes exactly four words; if
         // WORDS_PER_MONO ever changes, update the literal.
         const _: () = assert!(WORDS_PER_MONO == 4);
@@ -247,40 +254,47 @@ impl Monomial {
             self.packed[3].wrapping_add(other.packed[3]),
         ];
 
-        // Divmask overflow check, OR-reduced into a single branch so
-        // the add above stays a pure data dependency — no per-word
-        // early-exit between the adds. Any guard bit set in the
-        // result signals per-byte exponent > 127. The mask zeroes
-        // the total-degree byte, so a wrapped top byte does not
-        // trigger a false positive here.
-        let m = ring.overflow_mask();
-        let ovf = (packed[0] & m[0])
-            | (packed[1] & m[1])
-            | (packed[2] & m[2])
-            | (packed[3] & m[3]);
-        if ovf != 0 {
-            return None;
+        // Debug-only overflow check. In release, this is elided
+        // entirely (matching Singular's PDEBUG-gated pAssume1 /
+        // the bare p_MemAdd_LengthGeneral release path). The mask
+        // zeroes the total-degree byte, so a wrapped top byte does
+        // not trigger a false positive here.
+        if cfg!(debug_assertions) {
+            let m = ring.overflow_mask();
+            let ovf = (packed[0] & m[0])
+                | (packed[1] & m[1])
+                | (packed[2] & m[2])
+                | (packed[3] & m[3]);
+            debug_assert_eq!(
+                ovf, 0,
+                "Monomial::mul overflow: per-byte exponent > 127 (ADR-018 contract: \
+                 caller's ring construction must guarantee no bba-step product overflows)"
+            );
+            debug_assert!(
+                self.total_deg.checked_add(other.total_deg).is_some(),
+                "Monomial::mul total-degree u32 overflow (ADR-018 contract)"
+            );
         }
 
         // Total degree (uncapped, exact via the cached u32 sum).
-        let total = self.total_deg as u64 + other.total_deg as u64;
-        if total > u32::MAX as u64 {
-            return None;
-        }
+        // Release: wrapping_add is safe because we're below u32::MAX
+        // by contract. Debug: debug_assert! above already caught it.
+        let total = self.total_deg.wrapping_add(other.total_deg);
         // Rewrite the top byte: clear the wrap-add result and write
         // the actual cap.
-        let capped = total.min(u8::MAX as u64);
-        packed[WORDS_PER_MONO - 1] = (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
+        let capped = (total as u64).min(u8::MAX as u64);
+        packed[WORDS_PER_MONO - 1] =
+            (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
 
         // SEV update: e_new > 0 iff e_a > 0 OR e_b > 0; so OR the sevs.
         let sev = self.sev | other.sev;
 
-        Some(Self {
+        Self {
             packed,
             sev,
-            total_deg: total as u32,
+            total_deg: total,
             component: 0,
-        })
+        }
     }
 
     /// `true` iff `self | other` (each `e_i(self) ≤ e_i(other)`).
@@ -563,27 +577,43 @@ mod tests {
     }
 
     #[test]
-    fn mul_overflow_detected_via_guard_bit() {
-        // ADR-005: overflow on a single variable is caught by the
-        // divmask check on the result of the packed-word add.
+    fn mul_within_budget_succeeds() {
+        // ADR-018 (implementing ADR-017 Option 2): per-mul overflow
+        // is a debug-build invariant, not a release-time check.
+        // Verify the happy-path boundary: 63 + 64 = 127 is the
+        // largest per-variable sum that stays in the 7-bit budget.
+        let r = mk_ring(4);
+        let a = Monomial::from_exponents(&r, &[63, 0, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
+        let p = a.mul(&b, &r);
+        p.assert_canonical(&r);
+        assert_eq!(p.exponent(&r, 0).unwrap(), 127);
+    }
+
+    /// ADR-018: release builds do not detect overflow. The hot-path
+    /// `mul` contract is "caller's ring construction must keep all
+    /// products in-range"; debug builds help catch violations via
+    /// `debug_assert!`, and this test confirms that guard fires.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Monomial::mul overflow")]
+    fn mul_debug_asserts_on_per_byte_overflow() {
         let r = mk_ring(4);
         // 100 + 50 = 150 > 127: overflow on var 1.
         let a = Monomial::from_exponents(&r, &[1, 100, 0, 0]).unwrap();
         let b = Monomial::from_exponents(&r, &[1, 50, 0, 0]).unwrap();
-        assert!(a.mul(&b, &r).is_none(), "150 should overflow 7-bit slot");
+        let _ = a.mul(&b, &r);
+    }
 
-        // 64 + 64 = 128: smallest possible overflow (sets the guard
-        // bit exactly).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Monomial::mul overflow")]
+    fn mul_debug_asserts_on_exact_guard_bit_trip() {
+        let r = mk_ring(4);
+        // 64 + 64 = 128: smallest possible overflow (sets guard bit exactly).
         let a = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
         let b = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
-        assert!(a.mul(&b, &r).is_none(), "exactly 128 should overflow");
-
-        // 63 + 64 = 127: just under the limit, must succeed.
-        let a = Monomial::from_exponents(&r, &[63, 0, 0, 0]).unwrap();
-        let b = Monomial::from_exponents(&r, &[64, 0, 0, 0]).unwrap();
-        let p = a.mul(&b, &r).expect("127 should fit");
-        p.assert_canonical(&r);
-        assert_eq!(p.exponent(&r, 0).unwrap(), 127);
+        let _ = a.mul(&b, &r);
     }
 
     #[test]
@@ -598,7 +628,7 @@ mod tests {
         let b = Monomial::from_exponents(&r, &[60, 50, 40, 30, 20]).unwrap();
         // Per-var sums: 120, 120, 120, 120, 120 — all ≤127, no
         // overflow on any byte.
-        let p = a.mul(&b, &r).expect("all per-var sums = 120 ≤ 127");
+        let p = a.mul(&b, &r);
         p.assert_canonical(&r);
         for i in 0..5 {
             assert_eq!(
@@ -632,7 +662,7 @@ mod tests {
         let r = mk_ring(4);
         let a = Monomial::from_exponents(&r, &[1, 2, 0, 5]).unwrap();
         let b = Monomial::from_exponents(&r, &[3, 0, 4, 1]).unwrap();
-        let p = a.mul(&b, &r).unwrap();
+        let p = a.mul(&b, &r);
         let back = p.div(&b, &r).unwrap();
         assert_eq!(back, a);
     }

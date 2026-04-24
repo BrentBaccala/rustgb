@@ -33,8 +33,9 @@ pub const BITS_PER_VAR: u8 = 8;
 
 /// Maximum value a single variable's exponent may take. Bit 7 of each
 /// variable byte is the overflow guard (see ADR-005), so the usable
-/// range is [0, 127]. Exceeding it on a multiplication propagates a
-/// `None` from [`crate::monomial::Monomial::mul`].
+/// range is [0, 127]. Per ADR-018, ring construction is responsible
+/// for ensuring no bba-step product exceeds this bound; release-build
+/// [`crate::monomial::Monomial::mul`] does not check.
 pub const MAX_VAR_EXP: u32 = 0x7F;
 
 /// Maximum number of variables supported by the 8-bit packing.
@@ -59,9 +60,11 @@ pub struct Ring {
     field: Field,
     /// Per-word overflow guard mask: bit 7 set in each variable byte
     /// slot, 0 elsewhere (top "total-degree" byte and any unused
-    /// low bytes). ANDed with the result of a packed-word add in
-    /// `Monomial::mul`; a nonzero result signals per-byte exponent
-    /// overflow. See ADR-005 in `~/rustgb/docs/design-decisions.md`.
+    /// low bytes). Used by `Monomial::assert_canonical` and by
+    /// `Monomial::mul`'s `debug_assert!` invariant (ADR-018). Release
+    /// builds of `mul` no longer consult this mask — matching
+    /// Singular's PDEBUG-gated check. See ADR-005 / ADR-018 in
+    /// `~/rustgb/docs/design-decisions.md`.
     overflow_mask: [u64; 4],
     /// Per-word XOR mask used to flip the degrevlex tie-break direction
     /// at compare time: `0x7F` in each variable byte slot, `0x00` in
@@ -80,6 +83,21 @@ impl Ring {
     /// Returns `None` if `nvars` is out of range (`0` or `> MAX_VARS`)
     /// or if the caller passes an unsupported ordering. Today only
     /// `DegRevLex` is supported.
+    ///
+    /// **Caller contract (ADR-018, mirroring Singular's `rComplete`):**
+    /// the caller must ensure that every `Monomial::mul` product
+    /// arising in the intended computation stays within
+    /// [`MAX_VAR_EXP`] (= 127) per variable and within `u32::MAX`
+    /// in total degree. Release builds of [`crate::monomial::Monomial::mul`]
+    /// do not check this; violating the contract produces silent
+    /// exponent corruption (matching Singular's release-mode
+    /// `p_ExpVectorAdd` at
+    /// `~/Singular/libpolys/polys/monomials/p_polys.h:1432`). Debug
+    /// builds catch the violation via `debug_assert!`. If a future
+    /// FFI caller admits rings whose bba-step products could
+    /// overflow, the dispatch filter (in Singular-rustgb's
+    /// `rustgb-dispatch.lib`) must tighten to exclude them before
+    /// the ring reaches this constructor.
     pub fn new(nvars: u32, ordering: MonoOrder, field: Field) -> Option<Self> {
         if nvars == 0 || nvars > MAX_VARS {
             return None;
