@@ -2291,6 +2291,227 @@ the compiler inlines whichever the caller picks.
 
 ---
 
+## ADR-016: Thread-local Node pool for the `linked_list_poly` backend
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+ADR-015's destructive-merge splicing eliminated the per-output-term
+`Box<Node>` allocations from `merge` and the non-destructive
+`sub_mul_term`. The residual Node-allocation traffic on the List
+backend is concentrated in one place: the fresh nodes that
+`Poly::sub_mm_mult_qq_consuming` must allocate for the `m * q[i]`
+product on its hot loop. `q` is a basis element, so its nodes can't
+be spliced (they stay live in the basis); every product term is a
+brand-new `Node`. On staging-5101449 post-ADR-015 that path runs at
+the bba hot-loop rate.
+
+Each such allocation — `Box::new(Node { ... })` → `alloc::alloc` →
+glibc `_int_malloc` for a 40-ish-byte chunk — carries allocator-path
+overhead that a pool-backed design avoids. The
+`profile-rustgb-list-splice-staging-5101449.md` baseline placed the
+residual `_int_malloc` cycles in the ~10-15 % range; the prediction
+for this ADR was that a pool would close most of that.
+
+### Singular's approach
+
+omalloc `PolyBin`. Each ring owns a bin of `sizeof(spolyrec)`-sized
+slots (see `omBin PolyBin` in
+`~/Singular/libpolys/polys/monomials/ring.h`). The templates use
+`p_AllocBin(qm, bin, r)` to pop a chunk in O(1)
+(`~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc:49,56`)
+and `p_FreeBinAddr` to push it back
+(`p_Minus_mm_Mult_qq__T.cc:160`). The bins are backed by omalloc
+pages sliced into fixed-size slots at setup; allocation is a
+free-list pop with no syscall, no bin consolidation, no
+`malloc_consolidate`-style background work. This is load-bearing
+in Singular's Gröbner path: the fallback to a general-purpose
+allocator is markedly slower on the same workload.
+
+### FLINT's approach
+
+**N/A — FLINT has no linked-list polynomial backend.** FLINT's
+`nmod_mpoly` (`~/flint/src/nmod_mpoly/nmod_mpoly.h`) is a flat
+parallel array; whole polys are allocated in bulk via
+`flint_malloc` backing onto the system allocator, and there is no
+per-term bin-allocator concept. This ADR is a List-backend-only
+concern.
+
+### Decision
+
+Introduce a **thread-local** `NodePool` in
+`~/rustgb/src/poly/node_pool.rs`, used exclusively by the
+`linked_list_poly` backend, gated behind a **second** Cargo feature
+`linked_list_poly_pool` that requires `linked_list_poly`. The data
+layout of the List backend changes: `Node::next` and `Poly::head`
+become `Option<NonNull<Node>>` (regardless of which pool variant is
+active). Every allocation and deallocation routes through the
+thread-local `POOL.with(|p| p.borrow_mut()...)`; the
+`poly_list.rs` code has zero `#[cfg]`s on the alloc path — the
+feature flag swaps the *implementation* of `NodePool`, not the
+*API surface*.
+
+Two `NodePool` variants live in `node_pool.rs`, selected by
+`#[cfg(feature = "linked_list_poly_pool")]`:
+
+1. **Pool-backed** (feature on) — holds a `Vec<NonNull<Node>>`
+   free list. `alloc` pops from the free list when possible and
+   falls back to a single `Box::leak` on miss. `dealloc` pushes
+   onto the free list. Storage is **never** returned to the system
+   during normal operation; the pool's peak memory equals the peak
+   in-flight `Node` count during the run.
+2. **Forwarder** (feature off) — a unit struct whose `alloc` is a
+   plain `Box::new` + `Box::into_raw` and whose `dealloc` is a
+   `Box::from_raw` + implicit drop. No free list, no reuse. At
+   `--release`, the compiler inlines the RefCell / thread_local
+   indirection to near-zero overhead, so this variant is a valid
+   performance baseline (not just an API-compatibility layer).
+
+Enabling `linked_list_poly_pool` without `linked_list_poly`
+triggers a `compile_error!` in `src/poly/mod.rs` — the nonsense
+configuration is rejected at build time rather than silently doing
+the wrong thing.
+
+**Why a separate feature flag instead of baking the pool into the
+default List build?** To keep the pool's correctness and performance
+claims cheaply falsifiable. With both configurations in the tree,
+any future "List backend gives wrong answer on X" bug report can be
+bisected in one step: rerun with `--features 'linked_list_poly'`
+alone; if X still fails, the pool isn't the culprit. Performance
+A/B is trivial — three binaries cover the matrix (Vec, List-no-pool,
+List-pool). The cost (two lines in `Cargo.toml` + a `#[cfg]` split
+of `NodePool`) is tiny relative to that diagnostic flexibility, and
+matches the pattern already set by ADR-002's `heap_reducer` flag.
+
+**Thread-local, not shared.** The pool is per-`thread_local!`-owning-
+thread. rustgb's bba currently runs single-threaded per
+`compute_gb` call, so there is no contention or cross-thread
+lifetime issue. The `Poly` type gains `unsafe impl Send + Sync`
+because its `NonNull<Node>` is non-auto-`Send`; the safety
+argument is that nodes are never *dereferenced* from a different
+thread than the one currently holding the `Poly`. A subtle rule:
+a `Poly` must be dropped on a thread whose `NodePool` contains
+its nodes (dropping on a foreign thread silently pushes onto the
+foreign thread's free list, which is safe — `Node` is POD — but
+leaks capacity from the originating thread's pool). rustgb's
+single-threaded bba doesn't hit this edge.
+
+### Contract — Pool API
+
+```rust
+// pub(super) to the poly module; not exported from the crate.
+struct NodePool {
+    free: Vec<NonNull<Node>>, // pool-backed variant
+    // or `()` unit-struct for the forwarder variant
+}
+
+impl NodePool {
+    const fn new() -> Self;
+    fn alloc(&mut self, coeff: Coeff, mono: Monomial, next: Option<NonNull<Node>>)
+        -> NonNull<Node>;
+    unsafe fn dealloc(&mut self, ptr: NonNull<Node>);
+}
+
+thread_local! {
+    pub(super) static POOL: RefCell<NodePool> =
+        const { RefCell::new(NodePool::new()) };
+}
+```
+
+`dealloc`'s safety contract (both variants): (1) `ptr` points to a
+`Node` no longer reachable from any live `Poly`; (2) the caller has
+already taken `ptr`'s `next` field (no chain-free); (3) `ptr` was
+obtained from an earlier `alloc`. Violating any of these triggers
+UB (use-after-free, double-free, or chain drop through the pool).
+The `Poly::Drop` / `drop_leading_in_place` / splice paths all
+satisfy the contract by construction; every `Box::from_raw` site in
+the pre-ADR code maps 1:1 to a `pool.dealloc` site.
+
+### Consequences
+
+- **Wall reduction on staging-5101449 (samsung, this session):**
+  List backend 147 s → 126 s with pool on = **14 % faster**, and
+  closes the List-vs-Vec gap from 1.30× to 1.12× (Vec = 113 s).
+  Correctness unchanged: all three configurations (Vec, List-no-pool,
+  List-pool) match the committed fixture bit-for-bit.
+  (`~/project/docs/profile-rustgb-list-pool-staging-5101449.md` has
+  the fresh `perf record` call-graph; `_int_malloc` drops out of the
+  0.5 %+ flat profile entirely, replaced by a ~1.5 % combined
+  `Vec::pop` / `Vec::push` cost inside `NodePool::alloc`/`dealloc`.)
+- **Three build configurations live in the tree.** Vec (default),
+  List-no-pool (`--features linked_list_poly`), List-pool
+  (`--features 'linked_list_poly linked_list_poly_pool'`). All
+  three must pass the full `cargo test --release` matrix; all three
+  must pass staging-5101449 bit-for-bit. Verified in the ADR-016
+  commit. CI does not yet gate on all three — tracked as follow-up.
+- **Nonsense configuration rejected at compile time.** Enabling
+  `linked_list_poly_pool` alone fails with a `compile_error!` in
+  `src/poly/mod.rs`. The `compile_error!` invocation itself is the
+  regression guard; manually verified once in the ADR-016 commit.
+- **Pool is unbounded when enabled.** Peak memory on staging-5101449
+  is bounded by peak in-flight `Node` count — order ~3M × 40 B ≈
+  ~120 MB upper estimate. Acceptable on samsung (36 GB). Long-running
+  or memory-constrained workloads may need a cap; deferred.
+- **No bulk allocation in this ADR.** The system-allocator miss
+  path is a single `Box::leak`. Hit rate after warmup is expected
+  to be >99 % on typical workloads (the
+  `pool_reuses_freed_nodes` unit test confirms the free list grows
+  and is drained on subsequent allocations). Bulk would be an
+  optimization on the cold path; revisit if a real workload ever
+  surfaces a high miss rate.
+- **Node's raw-pointer shape consolidates with existing `unsafe`.**
+  The sentinel-slot pattern in `merge_consuming` and
+  `sub_mm_mult_qq_consuming` already used `*mut Option<Box<Node>>`
+  tail cursors inside `unsafe` blocks (ADR-015). Switching to
+  `Option<NonNull<Node>>` throughout doesn't grow the unsafe
+  envelope; it just types it more uniformly. The `// SAFETY:`
+  comments already present continue to cover the same invariants.
+- **If rustgb's parallel story changes (`SINGULAR_THREADS>1`),
+  this ADR's thread-local assumption has to be revisited.** Each
+  worker thread keeping its own pool is the natural extension;
+  cross-thread `Poly` sharing would need explicit pool-transfer or
+  a shared-pool design. Not a concern today because the rustgb
+  dispatch path is single-threaded. See
+  `~/Singular-parallel-bba/` for the parallel-bba Singular branch.
+- **No change to `VecPoly`.** The `node_pool` module is
+  `#[cfg(feature = "linked_list_poly")]`-gated at the `poly::mod`
+  level; the Vec backend compiles without it and its public API
+  is unchanged.
+- **The residual Vec-vs-List gap (now 12 %) is intrinsic.** The
+  profile confirms the remaining cost lands in `Monomial::mul`,
+  `Monomial::cmp`, `Field::mul`, and the pointer-chase through
+  the linked list — not in the allocator. Closing that gap would
+  require reshaping the data structure back toward Vec, which
+  undoes the List backend's purpose. ADR-016 closes the
+  allocator half of ADR-015's "Consequences"; the list-walk half
+  remains by design.
+
+### References
+
+- `~/rustgb/src/poly/node_pool.rs` — new. Pool + forwarder variants
+  and the thread-local `POOL`.
+- `~/rustgb/src/poly/poly_list.rs` — refactored to `Option<NonNull<Node>>`
+  throughout; all allocations / deallocations route through
+  `POOL.with(|p| p.borrow_mut()....)`. `unsafe impl Send + Sync for
+  Poly` with the thread-locality safety comment.
+- `~/rustgb/src/poly/mod.rs` — conditional `mod node_pool` + the
+  `compile_error!` guard on the nonsense configuration.
+- `~/rustgb/Cargo.toml` — new `linked_list_poly_pool` feature
+  entry.
+- `~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc:49,56,160`
+  — omalloc PolyBin usage (the template we port the idea from).
+- `~/Singular/libpolys/polys/monomials/ring.h` — `omBin PolyBin`
+  as a ring field.
+- `~/project/docs/profile-rustgb-list-splice-staging-5101449.md` —
+  post-ADR-015 baseline (pre-this).
+- `~/project/docs/profile-rustgb-list-pool-staging-5101449.md` —
+  post-ADR-016 measurement (companion report to this ADR).
+- ADR-001, ADR-014, ADR-015 — the ancestry of this decision.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
