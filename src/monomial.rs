@@ -392,6 +392,7 @@ impl Monomial {
     // ----- Ordering -----
 
     /// Compare under the ring's ordering.
+    #[inline]
     pub fn cmp(&self, other: &Self, ring: &Ring) -> Ordering {
         match ring.ordering() {
             MonoOrder::DegRevLex => self.cmp_degrevlex(other, ring),
@@ -420,42 +421,26 @@ impl Monomial {
     /// bytes through the same XOR-flipped compare. The dispatch shim
     /// filters rings where this path can actually hit (n_vars *
     /// max_per_var_deg > 255), so in practice this is a rare slow path.
+    ///
+    /// Codegen note (ADR-020 follow-up): the saturated slow path is
+    /// pulled out into `cmp_degrevlex_saturated_slow` with
+    /// `#[cold]` + `#[inline(never)]`, and the fast path is
+    /// `#[inline]`. Without this split, the grew saturated-path
+    /// body pushes `cmp_degrevlex` over LLVM's inlining threshold at
+    /// every callsite, which is a ~4 % wall regression at
+    /// staging-5101449 (see
+    /// `~/project/docs/profile-rustgb-drop-total-deg-staging-5101449.md`).
+    #[inline]
     fn cmp_degrevlex(&self, other: &Self, ring: &Ring) -> Ordering {
         let a_cap = (self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
         let b_cap = (other.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
-        let saturated = a_cap == u8::MAX as u64 || b_cap == u8::MAX as u64;
-        let mask = ring.cmp_flip_mask();
-
-        if saturated {
-            // Recompute exact total degrees by summing variable bytes.
-            // This is only reached when at least one operand has a
-            // saturated cap — rare given the ADR-020 dispatch filter.
-            let a_total = sum_variable_bytes(&self.packed, ring.nvars() as usize);
-            let b_total = sum_variable_bytes(&other.packed, ring.nvars() as usize);
-            match a_total.cmp(&b_total) {
-                Ordering::Equal => {}
-                ord => return ord,
-            }
-            // Equal (uncapped) total degrees: compare the lower three
-            // words via the flip mask, then the low 56 bits of the top
-            // word (also via the flip mask, which has the top byte
-            // zeroed).
-            for i in (0..WORDS_PER_MONO - 1).rev() {
-                let av = self.packed[i] ^ mask[i];
-                let bv = other.packed[i] ^ mask[i];
-                match av.cmp(&bv) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-            let lo_mask = (1u64 << 56) - 1;
-            let av_top = (self.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
-            let bv_top = (other.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
-            return av_top.cmp(&bv_top);
+        if a_cap == u8::MAX as u64 || b_cap == u8::MAX as u64 {
+            return self.cmp_degrevlex_saturated_slow(other, ring);
         }
 
         // Fast path: lex compare of all four words via the flip mask,
         // MSB first.
+        let mask = ring.cmp_flip_mask();
         for i in (0..WORDS_PER_MONO).rev() {
             let av = self.packed[i] ^ mask[i];
             let bv = other.packed[i] ^ mask[i];
@@ -465,6 +450,41 @@ impl Monomial {
             }
         }
         Ordering::Equal
+    }
+
+    /// Cold slow path for the saturated-cap case in `cmp_degrevlex`.
+    /// Pulled out-of-line so the fast path stays inline-cheap. See
+    /// `cmp_degrevlex`'s codegen note for the rationale.
+    #[cold]
+    #[inline(never)]
+    fn cmp_degrevlex_saturated_slow(&self, other: &Self, ring: &Ring) -> Ordering {
+        let mask = ring.cmp_flip_mask();
+
+        // Recompute exact total degrees by summing variable bytes.
+        // This is only reached when at least one operand has a
+        // saturated cap — rare given the ADR-020 dispatch filter.
+        let a_total = sum_variable_bytes(&self.packed, ring.nvars() as usize);
+        let b_total = sum_variable_bytes(&other.packed, ring.nvars() as usize);
+        match a_total.cmp(&b_total) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        // Equal (uncapped) total degrees: compare the lower three
+        // words via the flip mask, then the low 56 bits of the top
+        // word (also via the flip mask, which has the top byte
+        // zeroed).
+        for i in (0..WORDS_PER_MONO - 1).rev() {
+            let av = self.packed[i] ^ mask[i];
+            let bv = other.packed[i] ^ mask[i];
+            match av.cmp(&bv) {
+                Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        let lo_mask = (1u64 << 56) - 1;
+        let av_top = (self.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
+        let bv_top = (other.packed[WORDS_PER_MONO - 1] ^ mask[WORDS_PER_MONO - 1]) & lo_mask;
+        av_top.cmp(&bv_top)
     }
 
     // ----- Invariants -----
