@@ -551,7 +551,7 @@ fn build_pair(
     let sugar_h = h_sugar + (deg_lcm - deg_h);
     let sugar_s = s_deg + (deg_lcm - s_deg);
     let sugar = sugar_h.max(sugar_s);
-    Some(Pair::new(s_idx, h_idx, lcm, sugar, arrival))
+    Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
 }
 
 fn monomials_are_coprime(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
@@ -740,7 +740,7 @@ fn tail_reduce_all(polys: &mut [Poly], redundant: &mut [bool], ring: &Arc<Ring>)
             let (c, m) = f.leading().expect("nonzero");
             (c, m.clone())
         };
-        let tail = f.drop_leading();
+        let tail = f.drop_leading(ring);
 
         // Temporarily hide `i`.
         redundant[i] = true;
@@ -766,7 +766,8 @@ fn reduce_tail(tail: Poly, polys: &[Poly], redundant: &[bool], ring: &Arc<Ring>)
             break;
         };
         let m = m_ref.clone();
-        let lm_sev = m.sev();
+        // ADR-019: per-leader SEV compute.
+        let lm_sev = m.compute_sev(ring);
 
         let mut divisor: Option<usize> = None;
         for idx in 0..polys.len() {

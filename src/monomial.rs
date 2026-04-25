@@ -62,11 +62,17 @@
 //!
 //! ## Caches
 //!
-//! * `sev` (short exponent vector): a 64-bit bloom filter with bit
-//!   `i mod 64` set iff `e_i > 0`. Used by the bba sweep as a
-//!   divisibility pre-filter.
 //! * `total_deg`: sum of exponents, not capped.
 //! * `component`: always 0 today. Reserved for future module support.
+//!
+//! The short exponent vector (SEV) — a 64-bit bloom filter with bit
+//! `i mod 64` set iff `e_i > 0` — is **not** stored per Monomial.
+//! SEV is only consumed at the leading-term level by the bba sweep
+//! and chain criterion, so it lives on the enclosing `Poly`'s
+//! `lm_sev` cache. Compute it on demand from a standalone Monomial
+//! via [`Monomial::compute_sev`]. See ADR-019 in
+//! `~/rustgb/docs/design-decisions.md` for the rationale and the
+//! Singular `pGetShortExpVector` / `polyrec::pHash` precedent.
 //!
 //! Reference: mathicgb `MonoMonoid.hpp`, Singular's `p_ExpVectorAdd` /
 //! `p_LmExpVectorAddIsOk`, and FLINT's `mpoly_monomial_add`.
@@ -89,8 +95,6 @@ const _BITS_PER_VAR_IS_8: () = assert!(BITS_PER_VAR == 8);
 pub struct Monomial {
     /// Four u64 words; word 3 is most significant.
     packed: [u64; WORDS_PER_MONO],
-    /// Short exponent vector.
-    sev: u64,
     /// True total degree, uncapped.
     total_deg: u32,
     /// Component index. Always 0 today.
@@ -118,13 +122,9 @@ impl Monomial {
 
         let mut packed = [0u64; WORDS_PER_MONO];
         let mut total: u64 = 0;
-        let mut sev: u64 = 0;
 
         for (i, &e) in exps.iter().enumerate() {
             total += e as u64;
-            if e > 0 {
-                sev |= 1u64 << (i % 64);
-            }
             // Direct storage: the byte is the exponent itself, in
             // bits 0-6. Bit 7 (the overflow guard) stays clear in
             // canonical form. A zero exponent leaves the byte at 0,
@@ -144,7 +144,6 @@ impl Monomial {
 
         Some(Self {
             packed,
-            sev,
             total_deg: total as u32,
             component: 0,
         })
@@ -158,10 +157,24 @@ impl Monomial {
 
     // ----- Accessors -----
 
-    /// Short exponent vector.
+    /// Short exponent vector (bloom filter of nonzero variable
+    /// exponents). ADR-019: SEV is not cached per Monomial; compute
+    /// it on demand at the one point it's actually consumed — the
+    /// leading-term cache on `Poly` (`Poly::lm_sev`). Walking the
+    /// packed bytes is O(nvars). See ADR-019 for precedent
+    /// (Singular's `pGetShortExpVector` / `polyrec::pHash`) and the
+    /// rationale.
     #[inline]
-    pub fn sev(&self) -> u64 {
-        self.sev
+    pub fn compute_sev(&self, ring: &Ring) -> u64 {
+        let n = ring.nvars() as usize;
+        let mut sev: u64 = 0;
+        for i in 0..n {
+            let e = self.exponent_raw(n, i);
+            if e > 0 {
+                sev |= 1u64 << (i % 64);
+            }
+        }
+        sev
     }
 
     /// Total degree (uncapped).
@@ -286,12 +299,11 @@ impl Monomial {
         packed[WORDS_PER_MONO - 1] =
             (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
 
-        // SEV update: e_new > 0 iff e_a > 0 OR e_b > 0; so OR the sevs.
-        let sev = self.sev | other.sev;
+        // ADR-019: no per-Monomial SEV to combine. SEV is computed
+        // on demand at the Poly-level cache refresh.
 
         Self {
             packed,
-            sev,
             total_deg: total,
             component: 0,
         }
@@ -330,7 +342,6 @@ impl Monomial {
         let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n;
         let last_var_byte = WORDS_PER_MONO * 8 - 2;
         let mut packed = [0u64; WORDS_PER_MONO];
-        let mut sev: u64 = 0;
         for byte_idx in first_var_byte..=last_var_byte {
             let (word, shift) = split_byte_index(byte_idx);
             let ea = (self.packed[word] >> shift) & 0x7F;
@@ -340,12 +351,6 @@ impl Monomial {
             }
             let new_e = ea - eb;
             packed[word] |= new_e << shift;
-            if new_e > 0 {
-                // Recover variable index from byte position:
-                // var i has byte index `i + 31 - n`, so `i = byte - 31 + n`.
-                let var_i = byte_idx + n - (WORDS_PER_MONO * 8 - 1);
-                sev |= 1u64 << (var_i % 64);
-            }
         }
         // Total degree: self.total_deg - other.total_deg.
         if other.total_deg > self.total_deg {
@@ -356,7 +361,6 @@ impl Monomial {
         packed[WORDS_PER_MONO - 1] |= capped << 56;
         Some(Self {
             packed,
-            sev,
             total_deg: total,
             component: 0,
         })
@@ -450,7 +454,6 @@ impl Monomial {
     pub fn assert_canonical(&self, ring: &Ring) {
         let n = ring.nvars() as usize;
         let mut total: u64 = 0;
-        let mut sev: u64 = 0;
 
         for i in 0..n {
             let e = self.exponent_raw(n, i);
@@ -460,9 +463,6 @@ impl Monomial {
                 crate::ring::MAX_VAR_EXP
             );
             total += e as u64;
-            if e > 0 {
-                sev |= 1u64 << (i % 64);
-            }
         }
 
         // Guard bits must all be zero in canonical form.
@@ -478,7 +478,8 @@ impl Monomial {
 
         assert!(total <= u32::MAX as u64, "total degree overflows u32");
         assert_eq!(total as u32, self.total_deg, "total_deg cache mismatch");
-        assert_eq!(sev, self.sev, "sev cache mismatch");
+        // ADR-019: no SEV field to cross-check here; SEV lives on
+        // the enclosing Poly's `lm_sev` cache. See `compute_sev`.
 
         // Top byte is min(total, 255).
         let expected_cap = total.min(u8::MAX as u64);
@@ -562,7 +563,7 @@ mod tests {
         let r = mk_ring(7);
         let one = Monomial::one(&r);
         assert_eq!(one.total_deg(), 0);
-        assert_eq!(one.sev(), 0);
+        assert_eq!(one.compute_sev(&r), 0);
         one.assert_canonical(&r);
     }
 
@@ -641,11 +642,11 @@ mod tests {
     }
 
     #[test]
-    fn sev_matches_nonzero_vars() {
+    fn compute_sev_matches_nonzero_vars() {
         let r = mk_ring(10);
         let m = Monomial::from_exponents(&r, &[0, 2, 0, 0, 5, 0, 0, 1, 0, 0]).unwrap();
         let expected = (1u64 << 1) | (1u64 << 4) | (1u64 << 7);
-        assert_eq!(m.sev(), expected);
+        assert_eq!(m.compute_sev(&r), expected);
     }
 
     #[test]

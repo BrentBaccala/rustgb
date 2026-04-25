@@ -71,7 +71,7 @@ proptest! {
         for op in &ops {
             match op.clone() {
                 Op::Insert { i, j, sugar } => {
-                    let pair = Pair::new(i, j, lcm.clone(), sugar, arrival);
+                    let pair = Pair::new(i, j, lcm.clone(), &r, sugar, arrival);
                     arrival += 1;
                     l.insert(pair);
                 }
@@ -133,7 +133,7 @@ proptest! {
             }
             let (i, j) = if i < j { (i, j) } else { (j, i) };
             let lcm = Monomial::from_exponents(&r, &[1, 1, 1]).unwrap();
-            l.insert(Pair::new(i, j, lcm, s, arrival));
+            l.insert(Pair::new(i, j, lcm, &r, s, arrival));
             arrival += 1;
             inserted_indices.push((i, j));
         }

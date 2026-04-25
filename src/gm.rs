@@ -94,7 +94,7 @@ pub fn enter_one_pair_normal(
     let sugar_s_side = s_deg + (deg_lcm - s_deg);
     let sugar = sugar_h_side.max(sugar_s_side);
 
-    Some(Pair::new(s_idx, h_idx, lcm, sugar, arrival))
+    Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
 }
 
 /// Coprime check on monomials: no variable has nonzero exponent in
@@ -403,16 +403,16 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[0, 1, 0])));
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 0, 0])));
         let h_lm = mono(&r, &[0, 1, 1]); // y z
-        let h_lm_sev = h_lm.sev();
+        let h_lm_sev = h_lm.compute_sev(&r);
 
         // Build B by hand:
         //   (0, 3) LCM = xyz       (smallest, will survive)
         //   (1, 3) LCM = y^3 z     (incomparable with xyz, survives)
         //   (2, 3) LCM = x^2 y^2 z (xyz divides it — dies)
         let mut b = BSet::new();
-        b.push(Pair::new(0, 3, mono(&r, &[1, 1, 1]), 3, 0));
-        b.push(Pair::new(1, 3, mono(&r, &[0, 3, 1]), 4, 1));
-        b.push(Pair::new(2, 3, mono(&r, &[2, 2, 1]), 5, 2));
+        b.push(Pair::new(0, 3, mono(&r, &[1, 1, 1]), &r, 3, 0));
+        b.push(Pair::new(1, 3, mono(&r, &[0, 3, 1]), &r, 4, 1));
+        b.push(Pair::new(2, 3, mono(&r, &[2, 2, 1]), &r, 5, 2));
         let mut l = LSet::new();
 
         chain_crit_normal(&r, &s, &h_lm, h_lm_sev, 3, &mut b, &mut l);
@@ -532,7 +532,7 @@ mod tests {
 
         let mut l = LSet::new();
         let lcm_01 = mono(&r, &[2, 2]);
-        l.insert(Pair::new(0, 1, lcm_01, 4, 0));
+        l.insert(Pair::new(0, 1, lcm_01, &r, 4, 0));
         assert!(l.contains(0, 1));
 
         let h = Poly::monomial(&r, 1, mono(&r, &[1, 1]));

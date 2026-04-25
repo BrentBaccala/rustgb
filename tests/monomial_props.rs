@@ -117,7 +117,7 @@ proptest! {
     #[test]
     fn sev_of_product_is_or((r, a, b) in ring_mono2_strategy()) {
         let ab = a.mul(&b, &r);
-        prop_assert_eq!(ab.sev(), a.sev() | b.sev());
+        prop_assert_eq!(ab.compute_sev(&r), a.compute_sev(&r) | b.compute_sev(&r));
     }
 
     /// sev pre-filter soundness: `a | b` implies every bit set in `sev(a)`
@@ -127,7 +127,7 @@ proptest! {
     #[test]
     fn sev_prefilter_sound((r, a, b) in ring_mono2_strategy()) {
         if a.divides(&b, &r) {
-            prop_assert_eq!(a.sev() & !b.sev(), 0,
+            prop_assert_eq!(a.compute_sev(&r) & !b.compute_sev(&r), 0,
                 "a | b but sev(a) has bits not in sev(b)");
         }
     }

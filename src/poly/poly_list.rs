@@ -81,7 +81,8 @@ pub struct Poly {
     /// Number of live nodes reachable from `head`. Maintained on
     /// every mutation so `len()` stays O(1).
     len: usize,
-    /// Cached leading-term sev (`head.mono.sev()`); 0 when empty.
+    /// Cached leading-term sev (per ADR-019, computed via
+    /// `Monomial::compute_sev` at every `refresh_cache`); 0 when empty.
     lm_sev: u64,
     /// Cached leading coefficient (`head.coeff`); 0 when empty.
     lm_coeff: Coeff,
@@ -222,7 +223,8 @@ impl Poly {
         if c == 0 {
             return Self::zero();
         }
-        let lm_sev = m.sev();
+        // ADR-019: SEV computed once per leading-term change.
+        let lm_sev = m.compute_sev(ring);
         let lm_deg = m.total_deg();
         let head = POOL.with(|p| p.borrow_mut().alloc(c, m, None));
         Self {
@@ -270,7 +272,8 @@ impl Poly {
         let _ = p;
 
         let lm_coeff = terms[0].0;
-        let lm_sev = terms[0].1.sev();
+        // ADR-019: SEV computed on demand.
+        let lm_sev = terms[0].1.compute_sev(ring);
         let lm_deg = terms[0].1.total_deg();
 
         POOL.with(|pool_cell| {
@@ -316,10 +319,10 @@ impl Poly {
                 debug_assert!(w[0].cmp(&w[1], ring).is_gt());
             }
         }
-        let _ = ring;
         let len = coeffs.len();
         let lm_coeff = coeffs[0];
-        let lm_sev = terms[0].sev();
+        // ADR-019: SEV computed on demand.
+        let lm_sev = terms[0].compute_sev(ring);
         let lm_deg = terms[0].total_deg();
 
         POOL.with(|pool_cell| {
@@ -382,11 +385,14 @@ impl Poly {
 
     // ----- Cache maintenance -----
 
-    fn refresh_cache(&mut self) {
+    /// ADR-019: SEV is computed on-demand at leading-term refresh,
+    /// not carried per Monomial. `ring` is required so `compute_sev`
+    /// can walk the ring's variable byte layout.
+    fn refresh_cache(&mut self, ring: &Ring) {
         if let Some(h) = self.head {
             // SAFETY: `h` points to a live leading node.
             let h_ref = unsafe { h.as_ref() };
-            self.lm_sev = h_ref.mono.sev();
+            self.lm_sev = h_ref.mono.compute_sev(ring);
             self.lm_deg = h_ref.mono.total_deg();
             self.lm_coeff = h_ref.coeff;
         } else {
@@ -466,7 +472,10 @@ impl Poly {
     /// `self` is zero or a single term, returns the zero polynomial.
     /// Implemented by walking the tail and cloning each node (O(n)
     /// like the Vec version).
-    pub fn drop_leading(&self) -> Poly {
+    ///
+    /// ADR-019: `ring` is required to recompute the new leading term's
+    /// SEV (no longer cached per Monomial).
+    pub fn drop_leading(&self, ring: &Ring) -> Poly {
         if self.len <= 1 {
             return Self::zero();
         }
@@ -499,14 +508,17 @@ impl Poly {
                 lm_coeff: 0,
                 lm_deg: 0,
             };
-            out.refresh_cache();
+            out.refresh_cache(ring);
             out
         })
     }
 
     /// In-place leading-term drop. O(1): takes the head, replaces it
     /// with `head.next`, deallocates the detached node.
-    pub fn drop_leading_in_place(&mut self) {
+    ///
+    /// ADR-019: `ring` is required to recompute the new leading term's
+    /// SEV (no longer cached per Monomial).
+    pub fn drop_leading_in_place(&mut self, ring: &Ring) {
         if let Some(h) = self.head.take() {
             // SAFETY: `h` is the live leading node. We take its `next`
             // before returning it to the pool so `dealloc`'s no-chain
@@ -518,7 +530,7 @@ impl Poly {
             }
             self.len -= 1;
         }
-        self.refresh_cache();
+        self.refresh_cache(ring);
     }
 
     // ----- Arithmetic -----
@@ -602,7 +614,7 @@ impl Poly {
                 lm_coeff: 0,
                 lm_deg: 0,
             };
-            out.refresh_cache();
+            out.refresh_cache(ring);
             out
         })
     }
@@ -636,7 +648,7 @@ impl Poly {
                 lm_coeff: 0,
                 lm_deg: 0,
             };
-            out.refresh_cache();
+            out.refresh_cache(ring);
             out
         })
     }
@@ -672,7 +684,7 @@ impl Poly {
                 lm_coeff: 0,
                 lm_deg: 0,
             };
-            out.refresh_cache();
+            out.refresh_cache(ring);
             out
         })
     }
@@ -798,7 +810,7 @@ impl Poly {
                 lm_coeff: 0,
                 lm_deg: 0,
             };
-            out.refresh_cache();
+            out.refresh_cache(ring);
             out
         })
     }
@@ -946,7 +958,7 @@ impl Poly {
         // Move the chain out of the sentinel slot.
         self.head = sentinel_slot.take();
         self.len = out_len;
-        self.refresh_cache();
+        self.refresh_cache(ring);
         self
     }
 
@@ -999,7 +1011,7 @@ impl Poly {
         } else {
             // SAFETY: head is live and non-null here.
             let h = unsafe { self.head.unwrap().as_ref() };
-            assert_eq!(self.lm_sev, h.mono.sev());
+            assert_eq!(self.lm_sev, h.mono.compute_sev(ring));
             assert_eq!(self.lm_coeff, h.coeff);
             assert_eq!(self.lm_deg, h.mono.total_deg());
         }
@@ -1230,7 +1242,7 @@ fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
         lm_coeff: 0,
         lm_deg: 0,
     };
-    out.refresh_cache();
+    out.refresh_cache(ring);
     out
 }
 
@@ -1325,7 +1337,7 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
             lm_coeff: 0,
             lm_deg: 0,
         };
-        out.refresh_cache();
+        out.refresh_cache(ring);
         out
     })
 }
@@ -1439,7 +1451,7 @@ mod tests {
         let (c, m) = p.leading().unwrap();
         assert_eq!(c, 3);
         assert_eq!(m.total_deg(), 2);
-        assert_eq!(p.lm_sev(), m.sev());
+        assert_eq!(p.lm_sev(), m.compute_sev(&r));
         assert_eq!(p.lm_coeff(), 3);
         assert_eq!(p.lm_deg(), 2);
     }
@@ -1455,7 +1467,7 @@ mod tests {
                 (1, mono(&r, &[0, 0, 2])),
             ],
         );
-        let tail = p.drop_leading();
+        let tail = p.drop_leading(&r);
         tail.assert_canonical(&r);
         assert_eq!(tail.len(), 2);
         let (c, m) = tail.leading().unwrap();
@@ -1479,12 +1491,12 @@ mod tests {
             ],
         );
         for expected_len in (0..5).rev() {
-            p.drop_leading_in_place();
+            p.drop_leading_in_place(&r);
             p.assert_canonical(&r);
             assert_eq!(p.len(), expected_len);
         }
         // Extra drop on a zero poly is a no-op.
-        p.drop_leading_in_place();
+        p.drop_leading_in_place(&r);
         assert!(p.is_zero());
     }
 

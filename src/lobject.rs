@@ -119,7 +119,16 @@ impl LObject {
 
     /// Re-probe the bucket's leading term and populate the cache.
     /// Call after every `minus_m_mult_p` on the bucket.
+    ///
+    /// ADR-019: SEV is computed on demand here — the one place per
+    /// LObject life cycle we need it — rather than carried on every
+    /// term the bucket touches.
     pub fn refresh(&mut self) {
+        // Grab an Arc clone of the ring before the `&mut` on the bucket:
+        // `leading(&mut self)` conflicts with a concurrent `&self`
+        // borrow through `bucket.ring()`. An Arc::clone is a single
+        // atomic inc/dec and is cheap relative to the bucket scan.
+        let ring = Arc::clone(self.bucket.ring());
         match self.bucket.leading() {
             None => {
                 self.lm_sev = 0;
@@ -128,7 +137,7 @@ impl LObject {
                 self.is_zero = true;
             }
             Some((c, m)) => {
-                self.lm_sev = m.sev();
+                self.lm_sev = m.compute_sev(&ring);
                 self.lm_coeff = c;
                 self.lm_deg = m.total_deg();
                 self.is_zero = false;
@@ -267,7 +276,7 @@ mod tests {
             ],
         );
         let lcm = mono(&r, &[1, 1, 1]);
-        let pair = Pair::new(0, 1, lcm, 3, 0);
+        let pair = Pair::new(0, 1, lcm, &r, 3, 0);
         let mut o = LObject::from_spoly(Arc::clone(&r), &s_i, &s_j, &pair).unwrap();
         // Expected: -z + 2y = 12z + 2y; leading in degrevlex (total
         // deg 1 tied, larger-index variable smaller exponent wins)
@@ -284,7 +293,7 @@ mod tests {
         let s_i = Poly::monomial(&r, 1, mono(&r, &[1, 0]));
         let s_j = Poly::monomial(&r, 1, mono(&r, &[1, 0]));
         let lcm = mono(&r, &[1, 0]);
-        let pair = Pair::new(0, 1, lcm, 1, 0);
+        let pair = Pair::new(0, 1, lcm, &r, 1, 0);
         assert!(LObject::from_spoly(Arc::clone(&r), &s_i, &s_j, &pair).is_none());
     }
 

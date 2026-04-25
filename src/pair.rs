@@ -47,7 +47,8 @@ pub struct Pair {
     pub j: u32,
     /// LCM of `lm(S[i])` and `lm(S[j])`.
     pub lcm: Monomial,
-    /// Cached `lcm.sev()` — pre-computed so the chain criterion's
+    /// Cached short exponent vector of `lcm` — pre-computed (via
+    /// `Monomial::compute_sev`, per ADR-019) so the chain criterion's
     /// sev pre-filter is a direct u64 load.
     pub lcm_sev: u64,
     /// Sugar degree of the pair: `max(sugar(S[i]) + deg(m_i),
@@ -77,10 +78,18 @@ impl Pair {
     /// overwritten by [`LSet::insert`](crate::lset::LSet::insert);
     /// callers that never hand the pair to an `LSet` may read a stale
     /// key, which is harmless.
-    pub fn new(i: u32, j: u32, lcm: Monomial, sugar: u32, arrival: u64) -> Self {
+    pub fn new(
+        i: u32,
+        j: u32,
+        lcm: Monomial,
+        ring: &crate::ring::Ring,
+        sugar: u32,
+        arrival: u64,
+    ) -> Self {
         let (i, j) = if i < j { (i, j) } else { (j, i) };
         debug_assert!(i != j, "degenerate pair with i == j");
-        let lcm_sev = lcm.sev();
+        // ADR-019: SEV computed on demand from lcm; ring required.
+        let lcm_sev = lcm.compute_sev(ring);
         Self {
             i,
             j,
@@ -96,7 +105,11 @@ impl Pair {
     pub fn assert_canonical(&self, ring: &crate::ring::Ring) {
         assert!(self.i < self.j, "pair indices not ordered");
         self.lcm.assert_canonical(ring);
-        assert_eq!(self.lcm_sev, self.lcm.sev(), "lcm_sev cache mismatch");
+        assert_eq!(
+            self.lcm_sev,
+            self.lcm.compute_sev(ring),
+            "lcm_sev cache mismatch"
+        );
     }
 }
 
@@ -145,7 +158,7 @@ mod tests {
     fn new_swaps_indices() {
         let r = mk_ring(3);
         let l = lcm_mono(&r, &[1, 1, 0]);
-        let p = Pair::new(5, 2, l, 4, 0);
+        let p = Pair::new(5, 2, l, &r, 4, 0);
         assert_eq!(p.i, 2);
         assert_eq!(p.j, 5);
     }
@@ -155,9 +168,9 @@ mod tests {
         let r = mk_ring(3);
         let l = lcm_mono(&r, &[1, 1, 0]);
         let mut h = BinaryHeap::new();
-        h.push(Reverse(Pair::new(0, 1, l.clone(), 7, 0)));
-        h.push(Reverse(Pair::new(0, 2, l.clone(), 3, 1)));
-        h.push(Reverse(Pair::new(1, 2, l.clone(), 5, 2)));
+        h.push(Reverse(Pair::new(0, 1, l.clone(), &r, 7, 0)));
+        h.push(Reverse(Pair::new(0, 2, l.clone(), &r, 3, 1)));
+        h.push(Reverse(Pair::new(1, 2, l.clone(), &r, 5, 2)));
         let first = h.pop().unwrap().0;
         assert_eq!(first.sugar, 3);
         let second = h.pop().unwrap().0;
@@ -171,9 +184,9 @@ mod tests {
         let r = mk_ring(3);
         let l = lcm_mono(&r, &[1, 1, 0]);
         let mut h = BinaryHeap::new();
-        h.push(Reverse(Pair::new(0, 3, l.clone(), 5, 10)));
-        h.push(Reverse(Pair::new(0, 2, l.clone(), 5, 5)));
-        h.push(Reverse(Pair::new(0, 4, l.clone(), 5, 20)));
+        h.push(Reverse(Pair::new(0, 3, l.clone(), &r, 5, 10)));
+        h.push(Reverse(Pair::new(0, 2, l.clone(), &r, 5, 5)));
+        h.push(Reverse(Pair::new(0, 4, l.clone(), &r, 5, 20)));
         let a = h.pop().unwrap().0;
         assert_eq!(a.arrival, 5);
         let b = h.pop().unwrap().0;

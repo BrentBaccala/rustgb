@@ -407,7 +407,7 @@ impl KBucket {
                     continue;
                 }
                 let p = self.slots[i].as_mut().unwrap();
-                p.drop_leading_in_place();
+                p.drop_leading_in_place(&self.ring);
                 if p.is_zero() {
                     self.slots[i] = None;
                 }
@@ -441,7 +441,7 @@ impl KBucket {
             }
             let (_, mi) = p.leading().unwrap();
             if mi.cmp(&m, &self.ring).is_eq() {
-                p.drop_leading_in_place();
+                p.drop_leading_in_place(&self.ring);
                 if p.is_zero() {
                     self.slots[i] = None;
                 }

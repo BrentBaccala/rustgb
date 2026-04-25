@@ -88,7 +88,7 @@ proptest! {
             s.insert(&r, Poly::monomial(&r, 1 as Coeff, m.clone()));
         }
         for (i, m) in lms.iter().enumerate() {
-            prop_assert_eq!(s.sevs()[i], m.sev());
+            prop_assert_eq!(s.sevs()[i], m.compute_sev(&r));
             prop_assert_eq!(s.lm_degs()[i], m.total_deg());
         }
     }

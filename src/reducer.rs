@@ -979,7 +979,7 @@ mod tests {
                     } else {
                         // Move head to survivor and continue with tail.
                         survivor_terms.push((lc2, lm2));
-                        working = working.drop_leading();
+                        working = working.drop_leading(ring);
                     }
                 }
                 let _ = field;

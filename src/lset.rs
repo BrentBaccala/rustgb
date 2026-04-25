@@ -235,7 +235,7 @@ mod tests {
 
     fn mk_pair(r: &Ring, i: u32, j: u32, sugar: u32, arrival: u64) -> Pair {
         let lcm = Monomial::from_exponents(r, &vec![1u32; r.nvars() as usize]).unwrap();
-        Pair::new(i, j, lcm, sugar, arrival)
+        Pair::new(i, j, lcm, r, sugar, arrival)
     }
 
     #[test]

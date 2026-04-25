@@ -346,7 +346,13 @@ pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring
     // into the callback shape ReducerHeap::reduce_to_normal_form
     // expects.
     let (result, final_sugar) = h.reduce_to_normal_form(|leader| {
-        find_divisor_idx(s_basis, leader.sev(), leader, ring)
+        // ADR-019: compute SEV on demand for the heap reducer's
+        // per-leader divisor probe. This fires once per leader
+        // materialised by the heap, which is the same cadence at
+        // which Singular's `pGetShortExpVector` would fire if
+        // Monagan-Pearce were used there.
+        let leader_sev = leader.compute_sev(ring);
+        find_divisor_idx(s_basis, leader_sev, leader, ring)
             .map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))
     });
 
@@ -445,7 +451,7 @@ fn tail_reduce_all(s_basis: &mut SBasis, ring: &Arc<Ring>) {
             let (c, m) = f.leading().expect("nonzero");
             (c, m.clone())
         };
-        let tail = f.drop_leading();
+        let tail = f.drop_leading(ring);
 
         // Mark `i` redundant during the reduction so we don't
         // accidentally reduce by ourselves.
@@ -495,7 +501,10 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
             break;
         };
         let m = m_ref.clone();
-        let lm_sev = m.sev();
+        // ADR-019: per-leader SEV compute. One call per distinct
+        // leader of the tail reduction (amortised by the inner
+        // sev-pre-filtered scan over the basis).
+        let lm_sev = m.compute_sev(ring);
 
         // Sev pre-filter + real divisibility check.
         let sevs = s_basis.sevs();
