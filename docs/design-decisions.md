@@ -3525,6 +3525,264 @@ and `mark_dirty`, applied across three commits:
 
 ---
 
+## ADR-022: cmp_degrevlex codegen audit + length-4 specialisation
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+The post-ADR-021 perf profile of rustgb on staging-5101449 (c200-1,
+`taskset -c 11`) shows `Monomial::cmp_degrevlex` consuming **15.4 %**
+of total cycles, summed across three call sites:
+
+* 7.1 % — inside `Poly::sub_mm_mult_qq_consuming` (the merge cmp on
+  the bba reduction inner loop).
+* 6.5 % — inside `Poly::merge_consuming` (the `kBucket::absorb` path).
+* 1.8 % — inside `KBucket::leading`'s slot scan (the residual after
+  ADR-021).
+
+That is the largest single function-level cost after `Monomial::mul`,
+and `cmp_degrevlex` is called O(N) per merge (N = polynomial length).
+Any per-call shaving compounds across the staging workload's millions
+of merges. This ADR audits the codegen of the length-4 specialisation
+and tightens it to match Singular's `_LengthFour_OrdRevDeg` template
+shape.
+
+### Singular precedent
+
+`p_LmCmp_LengthFour_OrdRevDeg` is the instantiation of Singular's
+template machinery
+(`~/Singular/libpolys/polys/templates/p_Procs_Generate.cc` →
+`p_Procs_Static.cc`) for the length-4 / degrevlex specialisation. The
+shape is a hand-written sequence of four word compares with
+descending word index; no length branch (the length is the template
+parameter and folds to a fixed value), no ordering branch (the
+ordering is a separate template parameter and selects which compare
+direction to use), no virtual dispatch (the per-ring `pCompProc` is
+chosen at `rComplete` time and the result is a direct function
+pointer). Singular's interface is at
+`~/Singular/libpolys/polys/monomials/p_polys.h:pLmCmp` — the cmp
+receives `(a, b, ring)`, dispatches to the prebuilt `pCompProc`
+instantiation, and the inner cmp has neither a length nor an
+ordering runtime check.
+
+The first word in the descending compare is the degree word (and
+the highest-index variables); for the staging workload it's by far
+the most common discriminator. The remaining three words rarely
+fire on the merge hot path.
+
+FLINT: N/A — FLINT has no GB engine and therefore no kBucket merge
+hot loop. Its monomial cmp is a single `flint_mpoly_monomial_cmp`
+that walks the dense exp vector word-by-word; no length
+specialisation since exp-vector length is dynamic. Reference for
+completeness: `flint/mpoly/mpoly_monomial_cmp.c`.
+
+### Audit findings (pre-fix)
+
+Built `examples/cmp_probe.rs` (mirroring `mul_probe.rs`) and
+disassembled the resulting `probe_cmp` symbol with `objdump -d
+--no-show-raw-insn target/release/examples/cmp_probe`. Pre-fix body
+(28 instructions, ~13 on the hot equality path):
+
+```
+156f0 <probe_cmp>:
+       mov  0x18(%rdi),%rcx       ; load self.packed[3]
+       mov  %rcx,%rax
+       shr  $0x38,%rax             ; a_cap = top byte
+       cmp  $0xfe,%eax
+       ja   <slow>                 ; if a_cap > 0xfe (== 0xff), slow path
+       mov  0x18(%rsi),%r8         ; load other.packed[3]
+       movabs $0xfeffffffffffffff,%rax
+       cmp  %rax,%r8
+       ja   <slow>                 ; if b3 > 0xfeff..ff (top byte == 0xff), slow
+       mov  $0x3,%eax              ; differing-index hint = 3
+       cmp  %r8,%rcx
+       jne  <tail>
+       mov  0x10(%rdi),%rcx
+       mov  0x10(%rsi),%r8
+       mov  $0x2,%eax              ; differing-index hint = 2
+       cmp  %r8,%rcx
+       jne  <tail>
+       ...                         ; words 1, 0
+       xor  %eax,%eax
+       ret
+   tail:
+       mov  0x20(%rdx,%rax,8),%rax ; mask[differing-index]
+       xor  %rax,%r8
+       xor  %rax,%rcx
+       cmp  %r8,%rcx
+       seta %al
+       sbb  $0x0,%al
+       ret
+```
+
+LLVM was already doing several of the things we'd hoped for:
+
+* **The `match ring.ordering()` wrapper folded to nothing.** With one
+  enum variant the compiler proves the dispatch is unconditional. No
+  runtime read of the ordering field.
+* **The saturated slow path stays out of line** (the existing
+  `#[cold]` + `#[inline(never)]` split from ADR-020). The fast path
+  is small enough to inline at every call site.
+* **Equality of raw words** is used to skip the XOR mask on the
+  equal branches. XOR with a constant mask is bijective and
+  preserves equality, so `(a ^ m) == (b ^ m) ⟺ a == b`. LLVM noticed
+  and avoided the four redundant XORs on the all-equal path.
+
+But three small wastes remained:
+
+1. **Per-word "differing-index" hints.** The loop form encouraged
+   LLVM to emit `mov $3,%eax` / `$2,%eax` / etc. so the shared tail
+   could index `mask[differing-index]` via `0x20(%rdx,%rax,8)`.
+   That's one wasted mov per word on the not-equal exit path
+   (irrelevant on the all-equal hot path, but the not-equal path is
+   common in merge — the merge cmp's whole purpose is to produce
+   non-equal results).
+2. **Loop-form source obscures the Singular reference.** The Rust
+   source was a `for i in (0..WORDS_PER_MONO).rev()` loop, but
+   Singular's `_LengthFour_OrdRevDeg` is hand-unrolled. Matching
+   the reference exactly is cheap (the unroll is 4 iterations) and
+   makes future codegen audits easier.
+3. **`Monomial::cmp` is `#[inline]` but not `#[inline(always)]`.**
+   In all current call sites LLVM does inline the wrapper, but
+   `#[inline(always)]` is the correct annotation for a function
+   whose only job is a one-variant match: it removes any future
+   doubt as a second variant is added (or as a future call site
+   sits behind a less-aggressive optimisation pass).
+
+### Decision
+
+1. Hand-unroll `cmp_degrevlex` into four explicit `if a_i != b_i {
+   return (a_i ^ mask[i]).cmp(&(b_i ^ mask[i])) }` arms (MSB → LSB),
+   matching the `_LengthFour_OrdRevDeg` template body exactly.
+2. Promote `Monomial::cmp` from `#[inline]` to `#[inline(always)]`.
+3. Keep `cmp_degrevlex` itself at `#[inline]` (forcing `always` is
+   not required — LLVM is already inlining at every call site, and
+   the existing `#[cold]` slow-path split keeps the fast path
+   inline-cheap).
+4. Add `examples/cmp_probe.rs` so future audits are cheap (mirrors
+   `examples/mul_probe.rs`).
+
+Not changed:
+
+* The cmp algorithm — degrevlex order, byte-cap (degree) first,
+  then exponent words descending. Same.
+* The `MonoOrder` enum's existence — kept as the future
+  extensibility hook, even though it has only one variant today.
+* The cmp API (`Monomial::cmp(&self, other, ring) -> Ordering`).
+
+### Post-fix codegen
+
+```
+156f0 <probe_cmp>:
+       push %rax
+       mov  0x18(%rdi),%rax        ; load self.packed[3]
+       mov  %rax,%rcx
+       shr  $0x38,%rcx
+       cmp  $0xfe,%ecx
+       ja   <slow>
+       mov  0x18(%rsi),%rcx        ; load other.packed[3]
+       movabs $0xfeffffffffffffff,%r8
+       cmp  %r8,%rcx
+       ja   <slow>
+       cmp  %rcx,%rax              ; word 3
+       jne  <tail3>
+       mov  0x10(%rdi),%rax
+       mov  0x10(%rsi),%rcx
+       cmp  %rcx,%rax              ; word 2
+       jne  <tail2>
+       mov  0x8(%rdi),%rax
+       mov  0x8(%rsi),%rcx
+       cmp  %rcx,%rax              ; word 1
+       jne  <tail1>
+       mov  (%rdi),%rax
+       mov  (%rsi),%rcx
+       cmp  %rcx,%rax              ; word 0
+       jne  <tail0>
+       xor  %eax,%eax
+       ret
+   tail3: mov 0x38(%rdx),%rdx; jmp <decide>
+   tail2: mov 0x30(%rdx),%rdx; jmp <decide>
+   tail1: mov 0x28(%rdx),%rdx; jmp <decide>
+   tail0: mov 0x20(%rdx),%rdx; jmp <decide>
+   decide:
+       xor  %rdx,%rax; xor  %rdx,%rcx; cmp  %rcx,%rax
+       seta %al; sbb  $0x0,%al; ret
+```
+
+Net: the four `mov $imm,%eax` instructions on the not-equal exits
+are gone — each tail jumps directly to its own per-word
+`mov 0x{20,28,30,38}(%rdx),%rdx` with the right mask offset baked
+in. The all-equal hot path is the same length as before (12 insns:
+3 per word). The not-equal path is one mov shorter per branch (so
+~3 % shorter on the dominant first-word-differs case, larger on
+later-word-differs cases that are rarer).
+
+The same shape inlines into the three merge call sites — verified
+by disassembling `librustgb.so` (with `linked_list_poly` enabled)
+and locating the `shr $0x38; cmp $0xff; jae <sat_slow>` marker
+inside `LocalKey::with` instantiations holding the merge closures.
+The compiler also propagates the `Monomial::mul` saturation cmove
+into the cmp's saturation guard at the merge site, so the cmp's
+own saturation check fires only on the left side (the right side's
+saturation has already been bounded in the same expression).
+
+### Consequences
+
+* **Wall-clock — expected.** Cumulative `cmp_degrevlex` cost
+  pre-fix: 15.4 %. Post-fix: TBD on c200-1 (this ADR commits the
+  change; the profile-recapture report measures it). Expected drop
+  is small in absolute terms — the codegen was already near-optimal,
+  and the win is mostly the four removed `mov $imm,%eax`
+  instructions on the not-equal exit. Realistic target: drop to
+  ≤ 12 % cumulative across the three sites and ≥ 2 % wall reclaim.
+  **Null result is acceptable** — the audit's value is the
+  documented methodology and the explicit Singular shape match,
+  not necessarily a measurable speed-up.
+
+* **Maintenance.** The hand-unroll matches Singular's
+  `_LengthFour_OrdRevDeg` template body line-for-line. Future
+  revisits of this codegen (e.g. when expanding to a wider
+  per-variable packing or a length-other-than-4 specialisation) can
+  use `examples/cmp_probe.rs` for a cheap before/after disassembly
+  check.
+
+* **Soundness.** The hand-unroll preserves the cmp algorithm
+  exactly. `tests/monomial_props.rs`'s proptest oracles cross-check
+  ordering invariants (transitivity, total order on canonical
+  monomials); all green pre- and post-fix. All 197 / 211 / 212
+  tests across the three feature combinations pass.
+
+* **Saturated slow path unchanged.** The cold path
+  `cmp_degrevlex_saturated_slow` keeps its `#[cold]` +
+  `#[inline(never)]` markers and its byte-summing recompute. The
+  Singular-rustgb dispatch shim filters rings where the saturated
+  path can fire, so this branch is essentially never taken on the
+  staging workload.
+
+### References
+
+* ADR-005 — packed-exponent layout (7-bit per var + 1 guard, 4×u64,
+  byte 31 = total-deg cap).
+* ADR-017 / ADR-018 — `Monomial::mul` infallibility plan & impl.
+* ADR-019 — drop per-Monomial SEV (Stage B).
+* ADR-020 — drop per-Monomial total_deg u32; byte cap is canonical
+  (Stage C).
+* ADR-021 — kBucket lazy-lm + partial rescan (the previous baseline
+  profile capture).
+* `~/rustgb/src/monomial.rs:cmp_degrevlex` — the hand-unrolled body.
+* `~/rustgb/examples/cmp_probe.rs` — disassembly probe.
+* `~/Singular/libpolys/polys/monomials/p_polys.h:pLmCmp` — Singular's
+  cmp interface.
+* `~/Singular/libpolys/polys/templates/p_Procs_Generate.cc` —
+  Singular's length × ordering specialisation generator.
+* `~/Singular/libpolys/polys/templates/p_Procs.inc` — driver.
+* `~/project/docs/profile-rustgb-cmp-len4-staging-5101449.md` —
+  post-fix profile re-capture (sibling to this ADR).
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
