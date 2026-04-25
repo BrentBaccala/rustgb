@@ -351,43 +351,69 @@ impl KBucket {
         //
         // Per Singular's `p_kBucketSetLm__T`, each slot's leading
         // monomial is looked up exactly once per scan iteration by
-        // hoisting it outside the cmp. We cache `best_m` (a raw
-        // pointer to the current running-best leader monomial) so
-        // the inner compare doesn't re-borrow `self.slots[j]` on
-        // every loop iteration. The raw pointer is safe: the slots
-        // array is not mutated during the scan, and any reborrow
-        // that would invalidate the pointer happens only outside
-        // the scan body (between iterations of the outer `loop`).
+        // hoisting the lookup outside the cmp. We cache
+        // `leaders[i]` as a raw `*const Monomial` for every
+        // currently-live slot; the scan reads directly from those.
+        //
+        // Partial rescan: on cancellation, only the cancelled
+        // slots' new leaders need refreshing — the non-cancelled
+        // slots' Poly wasn't touched, so their cached pointers
+        // remain valid. This mirrors Singular's strategy of not
+        // re-reading buckets that didn't participate in the
+        // cancellation.
+        //
+        // SAFETY invariant for `leaders[i]`: if
+        // `live_mask & (1u32 << i) != 0` then `leaders[i]` is a
+        // non-null pointer to the leading `Monomial` of the Poly
+        // held in `self.slots[i]`. The slots array is not mutated
+        // for the duration of this function except in the
+        // cancellation peel below, which refreshes `leaders[i]`
+        // for every peeled slot before the pointer is read again.
+        let mut leaders: [*const Monomial; NUM_SLOTS] =
+            [std::ptr::null(); NUM_SLOTS];
+        let mut live_mask: u32 = 0;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(p) = slot else { continue };
+            if p.is_zero() {
+                continue;
+            }
+            let (_, m_i) = p.leading().unwrap();
+            leaders[i] = m_i as *const Monomial;
+            live_mask |= 1u32 << i;
+        }
+
         loop {
             let mut best: Option<usize> = None;
             let mut best_m: *const Monomial = std::ptr::null();
             let mut total_c: Coeff = 0;
             let mut matching_mask: u32 = 0;
-            for (i, slot) in self.slots.iter().enumerate() {
-                let Some(p) = slot else { continue };
-                if p.is_zero() {
-                    continue;
-                }
-                let (c_i, m_i) = p.leading().unwrap();
+            let mut scan_mask = live_mask;
+            while scan_mask != 0 {
+                let i = scan_mask.trailing_zeros() as usize;
+                scan_mask &= scan_mask - 1;
+                // SAFETY: live_mask bit i is set, so leaders[i]
+                // points at the leading Monomial of slots[i]
+                // (see invariant above).
+                let m_i = unsafe { &*leaders[i] };
+                // Coefficient still comes from the slot borrow
+                // (cheap — inlines to a field read).
+                let (c_i, _) = self.slots[i].as_ref().unwrap().leading().unwrap();
                 match best {
                     None => {
                         best = Some(i);
-                        best_m = m_i as *const Monomial;
+                        best_m = leaders[i];
                         total_c = c_i;
                         matching_mask = 1u32 << i;
                     }
                     Some(_) => {
-                        // SAFETY: `best_m` was set from a previous
-                        // iteration's `p.leading()` where `p` is
-                        // `self.slots[best].as_ref().unwrap()`. The
-                        // slots array is untouched across iterations
-                        // of this `for` loop, so the pointee is still
-                        // live.
+                        // SAFETY: best_m was set from leaders[_]
+                        // earlier in this same scan pass; the
+                        // slots array has not been mutated since.
                         let mj = unsafe { &*best_m };
                         match m_i.cmp(mj, &self.ring) {
                             std::cmp::Ordering::Greater => {
                                 best = Some(i);
-                                best_m = m_i as *const Monomial;
+                                best_m = leaders[i];
                                 total_c = c_i;
                                 matching_mask = 1u32 << i;
                             }
@@ -418,21 +444,29 @@ impl KBucket {
                 return Some((*c, m));
             }
 
-            // Cancellation: peel leaders off every matching slot and
-            // rescan. Use the in-place variant to avoid cloning the
-            // tail.
-            for i in 0..NUM_SLOTS {
-                if matching_mask & (1u32 << i) == 0 {
-                    continue;
-                }
+            // Cancellation: peel leaders off every matching slot,
+            // refresh that slot's entry in `leaders`, and re-run
+            // the scan. Non-matching slots' leaders are unchanged
+            // and keep their cached pointers — this is the
+            // partial rescan.
+            let mut peel_mask = matching_mask;
+            while peel_mask != 0 {
+                let i = peel_mask.trailing_zeros() as usize;
+                peel_mask &= peel_mask - 1;
                 let p = self.slots[i].as_mut().unwrap();
                 p.drop_leading_in_place(&self.ring);
                 if p.is_zero() {
                     self.slots[i] = None;
+                    leaders[i] = std::ptr::null();
+                    live_mask &= !(1u32 << i);
+                } else {
+                    let (_, m_i) = self.slots[i].as_ref().unwrap()
+                        .leading().unwrap();
+                    leaders[i] = m_i as *const Monomial;
                 }
             }
             self.lm_cache = None;
-            // fall through to repeat the scan
+            // fall through to repeat the scan over live_mask
         }
     }
 
