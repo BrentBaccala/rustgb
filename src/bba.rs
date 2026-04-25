@@ -412,6 +412,59 @@ fn find_divisor_idx(
 // `gm::chain_crit_normal`. See `~/rustgb/src/simd.rs`.
 use crate::simd::find_sev_match;
 
+/// Per-step `redTail`-style tail reduction (ADR-024).
+///
+/// Given a freshly-produced basis-candidate polynomial `h` (already
+/// monic), reduce its non-leading terms against the current
+/// `s_basis` to normal form, then re-attach the leading term and
+/// re-monic the result. Returns the reduced polynomial (possibly
+/// zero — the same edge case the leading-term reducer can hit when
+/// every term is reducible to zero).
+///
+/// This mirrors Singular's `redtailBba` invocation in `bba()`
+/// (`~/Singular/kernel/GBEngine/kstd2.cc:2789`-2791) under the
+/// `OPT_REDTAIL` toggle. The leading term itself is not reduced
+/// here — the leading-term reducer (`reduce_lobject`) ran already
+/// and produced an irreducible leader. Only tail terms can have
+/// divisors against `s_basis`.
+///
+/// Note: `h` is **not** in `s_basis` at the time of this call, so
+/// the `reduce_tail` pass uses the basis directly without any
+/// "mark self redundant" trick (`tail_reduce_all` needs that
+/// because there `f` IS in the basis at index `i`).
+///
+/// Compiled to a pass-through identity when the `redtail` Cargo
+/// feature is disabled, so the optional toggle is a clean A/B with
+/// the post-hoc-only path.
+#[cfg(feature = "redtail")]
+#[allow(dead_code)] // wired into compute_gb_serial in the next commit
+fn reduce_h_tail(h: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
+    if h.len() <= 1 {
+        // Single-term poly: no tail to reduce.
+        return h;
+    }
+    let (lc, lm) = {
+        let (c, m) = h.leading().expect("nonzero");
+        (c, m.clone())
+    };
+    let tail = h.drop_leading(ring);
+    let reduced_tail = reduce_tail(tail, s_basis, ring);
+    let combined = prepend_leading(lc, &lm, reduced_tail, ring);
+    // `combined` already has lc=1 because `h` was monic and the
+    // leading term is preserved verbatim, so this `monic` is a
+    // structural no-op except in the (impossible-here) case where
+    // `lc != 1`. Keep the call for symmetry with the post-hoc
+    // tail_reduce_all path.
+    combined.monic(ring).expect("nonzero leading coefficient")
+}
+
+#[cfg(not(feature = "redtail"))]
+#[inline(always)]
+#[allow(dead_code)] // wired into compute_gb_serial in the next commit
+fn reduce_h_tail(h: Poly, _s_basis: &SBasis, _ring: &Arc<Ring>) -> Poly {
+    h
+}
+
 /// Walk the basis and tail-reduce every non-redundant element against
 /// the others. This is the final pass that turns a Gröbner basis
 /// into **the** reduced Gröbner basis.

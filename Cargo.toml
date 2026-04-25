@@ -15,12 +15,24 @@ crate-type = ["cdylib", "rlib"]
 # stdlib only for now; add as needed.
 
 [features]
+default = ["redtail"]
+
 # Default reducer is the geobucket (ADR-002). Enabling this feature
 # switches `bba::reduce_lobject` to the heap-based Monagan-Pearce
 # reducer (ADR-008). Both reducers are always compiled; the flag
 # only chooses which one bba uses internally. Cross-validation
 # tests in `bba` always exercise both regardless of flag state.
 heap_reducer = []
+
+# Per-step `redTail`-style tail reduction during the bba main loop
+# (ADR-024). When ON (default), each freshly-produced basis element
+# `h` has its tail reduced against the current basis BEFORE it is
+# inserted, mirroring Singular's `kInterRed` / `redtailBba` step
+# under `OPT_REDTAIL`. When OFF, only the post-hoc `tail_reduce_all`
+# pass at the end runs (preserves earlier behaviour for A/B). The
+# final output is the unique reduced GB in either case — toggling
+# this flag must NOT change fixture-match outcomes.
+redtail = []
 
 # Switch the `Poly` type from the default flat-array backend
 # (`poly_vec`) to the singly-linked-list backend (`poly_list`).

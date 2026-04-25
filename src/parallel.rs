@@ -490,6 +490,59 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
     comp.basis.clear_redundant_for(&comp.ring, h_idx as usize);
 }
 
+/// Per-step `redTail`-style tail reduction (ADR-024) — parallel
+/// variant. Caller must hold `comp.insert_mutex`.
+///
+/// Reduces `h`'s non-leading terms against the current basis, then
+/// re-attaches the leading term. The leading term is preserved
+/// verbatim, so the result is never zero.
+///
+/// Compiled to a pass-through identity when the `redtail` Cargo
+/// feature is disabled.
+#[cfg(feature = "redtail")]
+#[allow(dead_code)] // wired into insert_and_enterpairs in the next commit
+fn reduce_h_tail_parallel(comp: &Computation, h: Poly) -> Poly {
+    if h.len() <= 1 {
+        return h;
+    }
+    let (lc, lm) = {
+        let (c, m) = h.leading().expect("nonzero");
+        (c, m.clone())
+    };
+    let tail = h.drop_leading(&comp.ring);
+
+    // Snapshot the live basis (we hold insert_mutex; readers may
+    // also be running, but no writer can append). Build &[Poly]
+    // and &[bool] arrays the existing parallel `reduce_tail`
+    // expects.
+    //
+    // TODO(perf): switch `reduce_tail` to accept `&[Arc<Poly>]`
+    // to avoid the deep clone of `polys_snap`. Out of scope for
+    // ADR-024's correctness-first commit.
+    let polys_snap: Vec<Arc<Poly>> = {
+        let snap = comp.basis.read_snapshot();
+        snap.polys.clone()
+    };
+    let redund_snap: Vec<bool> = {
+        let r = comp.basis.redundant.read().unwrap();
+        (0..polys_snap.len())
+            .map(|i| r[i].load(Ordering::Relaxed))
+            .collect()
+    };
+    let polys: Vec<Poly> = polys_snap.iter().map(|a| (**a).clone()).collect();
+
+    let reduced_tail = reduce_tail(tail, &polys, &redund_snap, &comp.ring);
+    let combined = prepend_leading(lc, &lm, reduced_tail, &comp.ring);
+    combined.monic(&comp.ring).expect("nonzero leading coefficient")
+}
+
+#[cfg(not(feature = "redtail"))]
+#[inline(always)]
+#[allow(dead_code)] // wired into insert_and_enterpairs in the next commit
+fn reduce_h_tail_parallel(_comp: &Computation, h: Poly) -> Poly {
+    h
+}
+
 /// Re-reduce a survivor `h` against the live basis, one last time,
 /// with the insert mutex held. If `h` reduces to zero, return
 /// `None`; otherwise return the reduced survivor (possibly the same
