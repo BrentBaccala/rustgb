@@ -2971,6 +2971,157 @@ stages are separate, each a future ADR if pursued:
 
 ---
 
+## ADR-019: Drop per-Monomial SEV; cache only at leading-term level
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+ADR-017 laid out four stages for `Monomial::mul` cost reduction.
+ADR-018 landed Stage A (drop per-mul overflow check). This ADR
+implements **Stage B**: stop carrying the short exponent vector
+(SEV) on every `Monomial`.
+
+The SEV is a 64-bit bloom filter with bit `i mod 64` set iff
+variable `i` has nonzero exponent. It is used by:
+
+* `bba::find_divisor_idx` — the per-basis-element sev pre-filter
+  inside the geobucket and heap reducer's leader-scan.
+* `gm::chain_crit_normal` — the B-internal and L-side divisibility
+  pre-filter.
+
+Both consumers read SEV from the **leading term only** (the
+enclosing `Poly`'s `lm_sev` cache, or the `Pair`'s `lcm_sev`).
+Internal monomials produced inside a merge (`p_Mult_q`,
+`p_Minus_mm_Mult_qq`) never have their SEV inspected — the
+per-term work is just an exponent add and a per-byte compare.
+
+Pre-this-ADR, `Monomial::mul` carried the SEV as an `or` of the
+two operand SEVs and stored it on the result. Every product in
+the inner reduction loop paid one `or` + one `u64` write for a
+value never read.
+
+**Memory cost on staging:** with `Monomial` at 48 bytes (including
+the SEV field), a staging-5101449-scale workload keeps roughly
+3 × 10⁶ live monomials at peak. Removing the 8-byte SEV cuts
+≈24 MB off peak heap.
+
+**CPU cost on staging:** small absolute. Post-ADR-018 the
+`Monomial::mul` self-percent is dominated by the packed-word
+add itself plus the total-degree byte rewrite; the SEV OR is
+one extra u64-OR per mul. Not on its own a hotspot; included
+here for the combined Stage-B memory + struct-shrink benefit.
+
+### Singular precedent
+
+`~/Singular/libpolys/polys/monomials/p_polys.h` — `pGetShortExpVector`
+walks the exponent vector on demand and returns a u64 bitmap:
+
+```c
+static inline unsigned long p_GetShortExpVector(const poly p, const ring r) {
+    /* walk variables, OR'ing 1UL << ... for each nonzero exponent */
+}
+```
+
+The **leading-term SEV** is cached on `polyrec::pHash`, not on
+every poly term. The internal monomial add routines —
+`p_ExpVectorAdd` / `p_MemAdd_LengthGeneral` — do not touch SEV.
+The merge templates (`~/Singular/libpolys/polys/templates/p_Mult_q__T.cc`,
+`p_Minus_mm_Mult_qq__T.cc`) walk through monomials without
+producing or consuming SEV.
+
+### FLINT precedent
+
+N/A — FLINT has no GB engine. FLINT's `mpoly` layer exposes no
+SEV concept; divisibility pre-filters are a GB-engine concern.
+
+### Decision
+
+1. Remove `sev: u64` from the `Monomial` struct.
+2. Provide `pub fn compute_sev(&self, ring: &Ring) -> u64` on
+   `Monomial`. Same scheme as the old per-construction
+   computation: `for i in 0..nvars: if exp(i) > 0 { sev |= 1 << (i % 64) }`.
+3. `Monomial::mul`, `Monomial::div`, `Monomial::from_exponents`
+   no longer maintain the field. `Monomial::mul` loses the
+   `self.sev | other.sev` and the result-struct `sev` write.
+4. `Monomial::assert_canonical` no longer cross-checks the field
+   (no field to check). The Poly-level `lm_sev` equality check in
+   `Poly::assert_canonical` now calls `compute_sev(ring)` for the
+   expected value.
+5. SEV storage migrates to the enclosing `Poly`'s existing
+   `lm_sev: u64` cache on both backends (`poly/poly_vec.rs`,
+   `poly/poly_list.rs`). `refresh_cache(ring)` — called from
+   every mutating method — calls `compute_sev(ring)` on the new
+   leader. `refresh_cache`, `drop_leading`, and
+   `drop_leading_in_place` gain a `&Ring` parameter.
+6. `Pair::new` gains a `&Ring` parameter so it can call
+   `lcm.compute_sev(ring)` instead of the now-removed
+   `lcm.sev()`.
+7. `LObject::refresh` computes SEV on demand from the bucket's
+   freshly-probed leader, using an `Arc::clone` of the bucket's
+   ring (needed because `bucket.leading()` takes `&mut self` and
+   would conflict with a concurrent `&self` borrow through
+   `bucket.ring()`).
+8. `bba::reduce_lobject_heap` and the two `reduce_tail` bodies
+   (serial in `bba.rs`, parallel in `parallel.rs`) compute SEV
+   once per peeled bucket leader — the same cadence Singular's
+   `pGetShortExpVector` fires at the equivalent callsite.
+
+### Consequences
+
+* `Monomial` is now `packed: [u64; 4] + total_deg: u32 + component: u32`
+  = 40 bytes (aligned). Down from 48. Stage C (dropping `total_deg`)
+  would take it to 32 bytes but is out of scope for this ADR.
+* `Monomial::mul` performs one fewer `or` and one fewer u64 write.
+* Per-`Poly`-leader-change cost gains one `compute_sev` call
+  (O(nvars) byte-scan over the packed block). This fires once
+  per `refresh_cache` — orders of magnitude less often than the
+  per-term costs it replaces. Net win on hot paths; the
+  geobucket-leader peel and heap-leader pop already traverse
+  `O(nvars)` byte layout anyway (for the divides / compare
+  checks), so SEV compute folds into the same working set.
+* `Pair::new` gains a `&Ring` parameter. All 21 callers updated;
+  no semantic change.
+* `drop_leading{,_in_place}` gain a `&Ring` parameter. KBucket's
+  cancellation-peel passes `&self.ring`; external callers pass
+  the ring they already have available.
+
+### Test impact
+
+All three cargo test configurations pass with the same test
+counts as before the change:
+
+* default: **195/195** (11 + 5 + 10 + 3 + 12 + 11 + 1 + 7 + 2 +
+  13 + 17 + 3)
+* `linked_list_poly`: **209/209**
+* `linked_list_poly linked_list_poly_pool`: **210/210**
+
+The proptest harnesses in `tests/monomial_props.rs`
+(`sev_of_product_is_or`, `sev_prefilter_sound`) and
+`tests/sbasis_props.rs` (`sevs_and_lm_degs_match_polys`) continue
+to pass against oracle implementations that call `compute_sev`
+rather than `sev()`.
+
+### References
+
+* Commit `dc1bc61` — `monomial: drop sev field; provide
+  compute_sev helper (ADR-019)`.
+* `~/project/docs/profile-rustgb-drop-sev-staging-5101449.md`
+  — profile report for this ADR (wall-clock pre/post,
+  `Monomial::mul` self-percent, Monomial struct size before/after).
+* ADR-017 — Stages B-D plan.
+* ADR-018 — Stage A precedent (drop per-mul overflow check).
+* ADR-005 — packed direct-exponents layout (unchanged here).
+* ADR-009 — SIMD-batched SEV sweep for `chain_crit_normal`
+  B-internal dedup (consumer of the Pair's `lcm_sev`; unaffected).
+* `~/Singular/libpolys/polys/monomials/p_polys.h` —
+  `pGetShortExpVector` and `polyrec::pHash` precedent.
+* `~/Singular/libpolys/polys/monomials/p_polys.cc` — SEV
+  computation loop.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
