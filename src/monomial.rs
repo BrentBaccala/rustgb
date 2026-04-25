@@ -392,14 +392,22 @@ impl Monomial {
     // ----- Ordering -----
 
     /// Compare under the ring's ordering.
-    #[inline]
+    ///
+    /// Today only `DegRevLex` exists, so this is a thin wrapper that
+    /// folds away to `cmp_degrevlex` at compile time. The exhaustive
+    /// `match` is kept (rather than dropped) so that any future variant
+    /// addition is forced to opt in, mirroring the dispatch pattern at
+    /// `~/Singular/libpolys/polys/monomials/p_polys.h:pLmCmp` (where
+    /// the per-ring `pCompProc` is set at `rComplete` time and the
+    /// inner cmp routine is selected with no runtime ordering branch).
+    #[inline(always)]
     pub fn cmp(&self, other: &Self, ring: &Ring) -> Ordering {
         match ring.ordering() {
             MonoOrder::DegRevLex => self.cmp_degrevlex(other, ring),
         }
     }
 
-    /// Degrevlex comparison.
+    /// Degrevlex comparison — length-4 specialisation.
     ///
     /// With direct exponent storage (ADR-005) the lex order of the raw
     /// packed words would compare variable bytes the wrong way (larger
@@ -413,6 +421,23 @@ impl Monomial {
     ///   greater after the flip, matching degrevlex's tie-break
     ///   "smaller exponent at the largest-index differing variable
     ///   wins".
+    ///
+    /// **Codegen shape (post-ADR-022).** The body is hand-unrolled to
+    /// four explicit word compares (MSB → LSB), matching Singular's
+    /// `_LengthFour_OrdRevDeg` template instantiation
+    /// (`~/Singular/libpolys/polys/templates/p_Procs_Generate.cc`'s
+    /// length+ordering specialisation). LLVM also unrolls the loop
+    /// form on its own under `-C target-cpu=native`, but the explicit
+    /// shape (a) makes the source-code intent match Singular's
+    /// reference, (b) keeps the fast path small enough that
+    /// `#[inline]` always fires at every call site
+    /// (`sub_mm_mult_qq_consuming`'s merge loop, `merge_consuming`,
+    /// `KBucket::leading`'s slot scan), and (c) lets LLVM apply the
+    /// XOR-equality optimisation: equality is preserved under XOR with
+    /// a constant mask, so the four word-equality tests can run on
+    /// the *raw* packed words (no XOR), with the mask consulted only
+    /// once on the not-equal branch to decide direction. See
+    /// `examples/cmp_probe.rs` for the disassembly probe.
     ///
     /// Saturation fallback (ADR-020): when either operand's top byte
     /// is 255 (saturated), the cap byte is uninformative for a direct
@@ -432,22 +457,59 @@ impl Monomial {
     /// `~/project/docs/profile-rustgb-drop-total-deg-staging-5101449.md`).
     #[inline]
     fn cmp_degrevlex(&self, other: &Self, ring: &Ring) -> Ordering {
-        let a_cap = (self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
-        let b_cap = (other.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
-        if a_cap == u8::MAX as u64 || b_cap == u8::MAX as u64 {
+        // Length-4 specialisation. If WORDS_PER_MONO ever changes,
+        // update the explicit unroll below.
+        const _: () = assert!(WORDS_PER_MONO == 4);
+
+        let a3 = self.packed[3];
+        let b3 = other.packed[3];
+
+        // Saturation guard: when either top byte is the saturated
+        // value 0xFF, the byte cap is uninformative — fall back to a
+        // recomputation in the cold slow path. The dispatch shim
+        // (`Singular-rustgb`'s `rustgb-dispatch.lib`) filters rings
+        // where this can be triggered in practice (n_vars *
+        // max_per_var_deg > 255), so this branch is essentially
+        // never taken on the staging workload. ADR-020.
+        if (a3 >> 56) == 0xFF || (b3 >> 56) == 0xFF {
             return self.cmp_degrevlex_saturated_slow(other, ring);
         }
 
-        // Fast path: lex compare of all four words via the flip mask,
-        // MSB first.
+        // Hand-unrolled lex compare, MSB → LSB. Equality of raw words
+        // implies equality after XOR with the mask (XOR with a
+        // constant is bijective and distributes over equality), so the
+        // four equality tests run on the *raw* packed words; the mask
+        // only enters on the "decide direction" branch, where we XOR
+        // both sides with the same word of the mask before the cmp.
+        // LLVM converts each "decide direction" sequence into a
+        // branch-free `seta` / `sbb` that produces the `Ordering` value
+        // numerically.
+        //
+        // Singular precedent: this is the exact shape of
+        // `pLmCmp_LengthFour_OrdRevDeg`'s body (4 word compares,
+        // descending word index, no loop, no length branch).
         let mask = ring.cmp_flip_mask();
-        for i in (0..WORDS_PER_MONO).rev() {
-            let av = self.packed[i] ^ mask[i];
-            let bv = other.packed[i] ^ mask[i];
-            match av.cmp(&bv) {
-                Ordering::Equal => {}
-                ord => return ord,
-            }
+        let a2 = self.packed[2];
+        let b2 = other.packed[2];
+        let a1 = self.packed[1];
+        let b1 = other.packed[1];
+        let a0 = self.packed[0];
+        let b0 = other.packed[0];
+
+        // Word 3 (MSB: contains total-deg cap byte and the highest
+        // variable bytes). When this differs, it's by far the
+        // commonest discriminator on the merge hot path.
+        if a3 != b3 {
+            return (a3 ^ mask[3]).cmp(&(b3 ^ mask[3]));
+        }
+        if a2 != b2 {
+            return (a2 ^ mask[2]).cmp(&(b2 ^ mask[2]));
+        }
+        if a1 != b1 {
+            return (a1 ^ mask[1]).cmp(&(b1 ^ mask[1]));
+        }
+        if a0 != b0 {
+            return (a0 ^ mask[0]).cmp(&(b0 ^ mask[0]));
         }
         Ordering::Equal
     }
