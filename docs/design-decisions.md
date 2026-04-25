@@ -4303,6 +4303,259 @@ through both naturally.
 
 ---
 
+## ADR-025: Divmask fast-reject for divisibility tests
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+After ADR-019 (drop per-Monomial SEV; cache only at leading-term
+level), the SEV pre-filter is the single fast-reject filter on
+every `Monomial::divides` call site that matters for wall time:
+
+* `bba::find_divisor_idx` — the inner loop of every reduction
+  step. The c200-1 (no AVX2) profile after ADR-024 attributed
+  ~7.8 % of total cycles to `Monomial::div`/`Monomial::divides`
+  invocations rooted in this site. On AVX2 hosts the SEV scan is
+  batched (ADR-007 / `simd::find_sev_match`), so the inner test
+  is cheap and the actual `divides` calls dominate the cost.
+* `gm::chain_crit_normal` — both phases. Phase 1 (B-internal,
+  pruning chain-implied B pairs by LCM divisibility) and phase 2
+  (L-side, dropping L pairs that `lm(h)` covers) each issue one
+  divisibility test per candidate.
+* `bba::reduce_tail` — the tail-reduction inner loop, both for
+  `tail_reduce_all` and the per-step `redTail` (ADR-024).
+
+SEV is a 64-bit bloom filter with bit `i mod 64` set iff
+`exp[i] > 0`. It satisfies the divisibility implication
+(`a | b ⇒ sev(a) ⊆ sev(b)`) but only encodes "is variable nonzero?" —
+not the magnitude. Two monomials with `exp[v] = 1` and `exp[v] =
+30` set the same bit, so SEV cannot reject the pair `a = (30, 0,
+0)` ∤ `b = (1, 0, 0)`. The full byte-wise `divides` walk picks up
+the slack — but that walk is the bottleneck.
+
+mathicgb's `DivMask` (`~/mathic/src/mathic/DivMask.h`) and
+Singular's `r->divmask` (`ring.cc:rGetDivMask`) both encode
+exponent ranges in additional bits per variable, which lets the
+fast-reject prove non-divisibility for many more pairs without
+walking the full exponent vector. This ADR ports the mathicgb-
+style divmask onto rustgb's `Poly` leading-term cache.
+
+### Singular's approach
+
+Singular has two related "divmask" mechanisms; only the second is
+the one we port:
+
+1. **`r->divmask` as a borrow-detection mask.** Set by
+   `rGetDivMask` (`~/Singular/libpolys/polys/monomials/ring.cc:4200`),
+   this is a per-word top-bit mask used by `_p_LmDivisibleByNoComp`
+   (`p_polys.h:1786`). The check `((la & divmask) ^ (lb & divmask))
+   != ((lb - la) & divmask)` detects per-byte borrow during the
+   subtraction `lb - la`; if a borrow occurred, some `e_a[i] >
+   e_b[i]` and `a` does not divide `b`. This is structurally a
+   borrow-from-the-overflow-guard trick on the existing exponent
+   storage, not a separate per-monomial cache.
+
+2. **Per-monomial richer divmask.** Singular's `kFindDivisibleByInT`
+   path in `~/Singular/kernel/GBEngine/kstd2.cc` consults a separate
+   `divmask` field that mathicgb-style encodes exponent ranges (see
+   the pre-redTail profile for the cycle attribution). The
+   bit-layout is fixed at ring construction by the same
+   `rSetDivMask` / `r->divmask` infrastructure but consumed at the
+   per-monomial cache.
+
+We port (2) — the structurally richer per-monomial cache — without
+adopting (1)'s borrow-detection trick. (rustgb's existing
+`Monomial::divides` walks variable bytes directly; the borrow trick
+is an alternative, not a faster path on our representation.)
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** The divmask filter is a property
+of the divisor search inside a Buchberger driver; FLINT has no
+Buchberger driver. FLINT's `nmod_mpoly_div` performs ground-truth
+divisibility tests directly on the packed exponent vectors with no
+bloom-filter pre-filter.
+
+### Decision
+
+1. **Layout.** Each ring fixes a 64-bit `(variable, threshold)`
+   layout at construction time. For `nvars` variables, each
+   variable gets `64 / nvars` bits, with the `64 % nvars`
+   leftover bits going to the lowest-indexed variables. Per-
+   variable thresholds follow the geometric scale `0, 1, 2, 4, 8,
+   16, ...`:
+     * bit 0 of variable `v` ⇔ `exp[v] > 0` (i.e. exp >= 1).
+     * bit 1 ⇔ `exp[v] > 1` (i.e. exp >= 2).
+     * bit 2 ⇔ `exp[v] > 2` (i.e. exp >= 3).
+     * bit `k` ⇔ `exp[v] > 2^(k-1)` for `k >= 1`.
+   This is mathicgb's `rebuildDefault` shape
+   (`~/mathic/src/mathic/DivMask.h:312-327`), chosen for two
+   reasons:
+     * Coarse for low exponents (where most bba intermediates
+       live) — bits 0..2 cover exp ∈ {1, 2, 3}, the common cases.
+     * Exponential for higher exponents — a single bit covers a
+       wide range, bounding the false-positive rate for outlier
+       exponent values.
+
+   For `MAX_VARS = 31`: vars 0–1 get 3 bits each (thresholds 0,
+   1, 2), vars 2–30 get 2 bits each (thresholds 0, 1). All 64
+   bits are allocated. Implementation in
+   `~/rustgb/src/ring.rs:compute_divmask_layout`.
+
+2. **Invariant.** For any pair of monomials `a, b` with `a |
+   b` (i.e. `e_a[v] <= e_b[v]` for all v):
+   ```
+   (divmask_of(a) & !divmask_of(b)) == 0
+   ```
+   Proof: each bit `(v, t)` is set iff `exp[v] > t`. If `e_a[v]
+   > t` and `e_a[v] <= e_b[v]`, then `e_b[v] > t`, so every bit
+   set in `divmask(a)` is also set in `divmask(b)`. The
+   contrapositive — `(divmask(a) & ~divmask(b)) != 0 ⇒ a ∤ b` —
+   is the fast-reject. Verified by a 4096-case proptest in
+   `~/rustgb/tests/monomial_props.rs::divmask_invariant_high_volume`.
+
+3. **Cache placement.** `Poly` carries a `lm_divmask: u64` field
+   alongside the existing `lm_sev`, populated at every
+   `refresh_cache` from `Ring::divmask_of(leading_mono)`.
+   Identical lifecycle to `lm_sev`. Stage B (ADR-019) established
+   that bitmap caches live per-Poly, not per-Monomial; ADR-025
+   follows the same convention. `SBasis` grows a parallel
+   `divmasks: Vec<u64>` alongside `sevs`. `Pair` grows
+   `lcm_divmask: u64` alongside `lcm_sev`. `BSet` grows
+   `lcm_divmasks: Vec<u64>` alongside `lcm_sevs`. The parallel
+   driver's `SharedSBasisInner` likewise.
+
+4. **Call-site replacement.** Two production sites, one each in
+   the serial and parallel drivers:
+   * `bba::find_divisor_idx` — replaced the SEV pre-filter with
+     the divmask fast-reject. The AVX2 batched scan reuses
+     ADR-007's 16-entry-unrolled main loop / 4-wide tail / scalar
+     fallback shape; `simd::find_divmask_match` is a thin alias
+     for `find_sev_match` (algorithmically identical, named
+     after the call site's bitmap semantic).
+   * `gm::chain_crit_normal` — both phases. Phase 1 (B-internal):
+     `find_divmask_superset_match` over `BSet::lcm_divmasks`.
+     Phase 2 (L-side): direct `(h_lm_divmask & !pair.lcm_divmask)`
+     test.
+   * Also: `bba::reduce_tail` (per-leader divmask compute +
+     flat-divmask scan), `parallel::reduce_lobject_parallel`
+     (snapshot scan), `parallel::chain_crit_b_internal`,
+     `parallel::chain_crit_l_side`.
+
+   The full byte-by-byte `Monomial::divides` runs only on
+   candidates that survive the divmask filter. SEV remains in
+   place for the **product criterion** (`enter_one_pair_normal`'s
+   `(h_lm_sev & s_lm_sev) == 0` coprime test) — that's a
+   different question (does any variable share?) for which SEV
+   is the right shape; divmask doesn't speak to it.
+
+5. **What is NOT changed.**
+   * `Monomial::divides` and `Monomial::div` themselves.
+     Ground-truth tests, unchanged.
+   * The SEV scheme. Coexists with divmask. SEV becomes
+     redundant for divisibility-test purposes; a future cleanup
+     ADR may retire it, but doing so is out of scope for
+     ADR-025 (the product criterion still consumes it, and the
+     redundancy of two parallel u64s per-Poly is bounded).
+   * The AVX2 SIMD primitives in `simd.rs`. The new
+     `find_divmask_match` / `find_divmask_superset_match` are
+     thin aliases for the existing `find_sev_match` /
+     `find_sev_superset_match`.
+
+### Consequences
+
+* **Lower false-positive rate at the divisor sweep.** Every
+  divmask-pass candidate that fails the full `divides` walk is a
+  cycle paid for nothing. The expected reduction depends on the
+  workload's exponent distribution: for `MAX_VARS = 31` and
+  staging exponent profiles, the divmask's per-variable bands
+  (exp = 0 / 1 / 2 / >2) are coarse-grained but strictly stronger
+  than SEV's "exp = 0 / nonzero" split. The post-fix profile
+  report (`~/project/docs/profile-rustgb-divmask-staging-5101449.md`)
+  measures the false-positive rate.
+
+* **Same correctness guarantees.** The divmask invariant is
+  proven; the fast-reject is sound. Tests pass with default
+  features, `--features linked_list_poly`, and
+  `--no-default-features`.
+
+* **Per-Poly cache cost.** One extra u64 per Poly (8 bytes), one
+  extra u64 in the SBasis parallel array per basis element (8
+  bytes), one extra u64 per Pair (8 bytes), one extra u64 per
+  BSet entry (8 bytes). For staging-5101449 with ~3000-element
+  bases that totals ~24 KB extra in the basis cache — fits in
+  L2, streams cleanly during the sweep.
+
+* **Per-leader divmask compute.** One `Ring::divmask_of` call
+  per `LObject::refresh` (cached on LObject), one per
+  `bba::reduce_tail` leader, one per heap-reducer probe.
+  `Ring::divmask_of` walks `nvars` variables × 2-3 bits each =
+  ~64 byte reads + 64 cmps per call. A handful of cycles per
+  leader; orders of magnitude smaller than the savings on the
+  per-candidate fast-reject.
+
+* **SEV becomes redundant for divisibility purposes.** The
+  product criterion still uses SEV (coprime test), so we keep
+  the SEV cache. A future cleanup ADR may either retire the SEV
+  cache from `Poly`/`SBasis`/`Pair`/`BSet` (and replace the
+  product criterion with a divmask-aware coprime test, since
+  `(divmask(a) & divmask(b)) == 0` proves SEV-coprime when each
+  variable's bit-0 only triggers on exp >= 1), or keep both for
+  the marginal benefit of two cheap pre-filters. ADR-025 does
+  not commit either way — that's a separate decision.
+
+### What's NOT in this ADR
+
+* **Adaptive divmask layout.** Singular's bigger systems
+  occasionally call `rSetDivMask` with workload-specific
+  thresholds (mathicgb's `DivMask::Calculator::rebuild` does the
+  same). We picked the static `0, 1, 2, 4, 8, 16, ...` scale for
+  simplicity. If a future profile shows the false-positive rate
+  has hot spots at specific exponent values, an adaptive
+  rebuild is a follow-up.
+* **128-bit divmask.** A `[u64; 2]` divmask doubles the bits
+  available for the layout, which would let `MAX_VARS = 31`
+  give every variable 4+ bits each (the same density as
+  `nvars = 16` today). Out of scope; the current 64-bit budget
+  is what every consumer is sized for, and the AVX2 primitive
+  takes a u64 mask. Worth reconsidering only if the
+  false-positive rate at the existing layout proves a
+  meaningful drag.
+
+### References
+
+* ADR-007 — original SEV pre-filter for the divisor sweep
+  (the structural precedent ADR-025 builds on).
+* ADR-009 — superset variant for the chain criterion's
+  B-internal sweep.
+* ADR-019 — drop per-Monomial SEV; cache only at leading-term
+  level. ADR-025 follows the same per-Poly cache placement.
+* `~/mathic/src/mathic/DivMask.h` — the mathicgb DivMask whose
+  `rebuildDefault` shape we ported.
+* `~/Singular/libpolys/polys/monomials/ring.cc:4200` —
+  Singular's `rGetDivMask` (the borrow-detection variant we did
+  *not* port).
+* `~/Singular/libpolys/polys/monomials/p_polys.h:1786` —
+  Singular's `_p_LmDivisibleByNoComp` (the borrow-trick
+  consumer).
+* `~/Singular/kernel/GBEngine/kstd2.cc` — `kFindDivisibleByInT`
+  (the per-monomial-cache divmask consumer that ADR-025
+  matches).
+* `~/rustgb/src/ring.rs` — `Ring::divmask_of`,
+  `compute_divmask_layout`.
+* `~/rustgb/src/bba.rs` — `find_divisor_idx`, `reduce_tail`.
+* `~/rustgb/src/gm.rs` — `chain_crit_normal`.
+* `~/rustgb/src/simd.rs` — `find_divmask_match`,
+  `find_divmask_superset_match`.
+* `~/rustgb/tests/monomial_props.rs` — the divmask invariant
+  proptest (4096 cases).
+* `~/project/docs/profile-rustgb-divmask-staging-5101449.md` —
+  ADR-025 post-fix profile re-capture.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
