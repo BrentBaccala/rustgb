@@ -4076,6 +4076,233 @@ What this commit **does not** buy:
 
 ---
 
+## ADR-024: Per-step `redTail`-style tail reduction during bba
+
+**Status:** Accepted
+**Date:** 2026-04-25
+
+### Context
+
+After ADR-018 through ADR-023 (inner-loop tightening: drop
+per-mul overflow check, drop per-Monomial SEV, drop per-Monomial
+total_deg, kBucket lazy-lm + partial rescan, cmp_degrevlex
+length-4 audit, hand-specialised zp/degrevlex/len4 procs), the
+post-ADR-023 staging-5101449 wall on c200-1 was 143 s (rustgb)
+vs 14 s (Singular `std()`) — a 10.2× ratio. The Stage D profile
+report (`~/project/docs/profile-rustgb-stage-d-staging-5101449.md`)
+identified the remaining structural gap: rustgb's intermediate
+polys grow longer during the run than Singular's, because rustgb
+does not perform `redTail`-style per-step tail reduction.
+
+The mechanism: a freshly-produced basis element `h` (the result
+of reducing an S-poly to a non-zero leader-irreducible form) goes
+straight into the basis. From that moment, every subsequent
+S-poly reduction that selects `h` as a divisor pays
+`O(|h|)` per step in the inner `sub_mm_mult_qq_consuming` merge.
+If `h`'s tail contains terms that are themselves reducible
+against the existing basis, those terms inflate every later
+merge that uses `h` as a reducer.
+
+Singular avoids this by running `redtailBba` immediately after
+each new basis element is produced (under `OPT_REDTAIL`, on by
+default for `std()`). Each tail term is replaced by its
+normal-form modulo the existing T-set, so `h` is in its
+"relative reduced shape" from the moment it becomes a reducer.
+
+Until ADR-024, rustgb only ran a single post-hoc pass
+(`bba::tail_reduce_all`, called once after the bba main loop
+finishes). That produces the correct final reduced GB but does
+nothing to shrink intermediate polys *during* the run.
+
+### Singular's approach
+
+Singular's `bba()` driver calls `redtailBba(&(strat->P), pos-1,
+strat, withT)` immediately after the leader-reduction loop
+produces a non-zero survivor (`~/Singular/kernel/GBEngine/kstd2.cc`
+~line 2789-2791, gated by `(TEST_OPT_REDSB)||(TEST_OPT_REDTAIL)`).
+`redtailBba` walks each non-leading term of the survivor and, for
+each one, runs the same divisor search (`kFindDivisibleByInT`)
+and the same reduction primitive (`ksReducePoly`) the leader
+loop uses — but applied at every position in the polynomial, not
+just at the head. The result is that `h`'s tail is in normal
+form against the existing T-set before `h` is inserted.
+
+`OPT_REDTAIL` is on by default for `std()` (the `bba` driver),
+off for `slimgb` and a few signature-based strategies. Singular
+also has `OPT_REDSB` (always on for `std()`) which forces both
+the per-step reduction and the post-reduction pass.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** Per-step reduction is a
+property of the Buchberger driver loop; FLINT has no Buchberger
+loop. FLINT's `nmod_mpoly_div` reduces a single polynomial
+against a fixed divisor set in one shot, so there is no concept
+of a "per-step" reduction within a producer/consumer loop.
+
+### Decision
+
+Add a new helper `bba::reduce_h_tail` that takes a
+freshly-monic basis-candidate poly `h` and returns it with the
+tail reduced to normal form against the current `SBasis`. Call
+this helper in `compute_gb_serial` immediately after each
+`reduce_lobject` produces a non-zero survivor, in both the seed
+loop and the main loop, before
+`insert_and_generate_pairs_with_sugar`. Mirror the pattern in
+the parallel driver: add `parallel::reduce_h_tail_parallel` and
+call it in `insert_and_enterpairs` after the stale-snapshot
+guard (`reduce_survivor_final`) and before the basis push, while
+holding `comp.insert_mutex` so the basis is stable.
+
+The implementation reuses the existing post-hoc `reduce_tail`
+helper (the same one `tail_reduce_all` uses): split `h` into
+`(lc, lm)` + tail, run `reduce_tail(tail, &s_basis, ring)`,
+prepend the leader, re-monic. The leading term itself is not
+reduced (the `reduce_lobject` pass already produced an
+irreducible leader; this step only touches non-leading terms),
+so the result is never zero.
+
+Gate the entire feature behind a new Cargo feature `redtail`,
+**default-on**. With the feature off, `reduce_h_tail` compiles
+to `#[inline(always)]` identity, and the only tail reduction in
+the pipeline is the post-hoc `tail_reduce_all` pass — exactly the
+pre-ADR-024 behaviour. The toggle exists to A/B the wall impact
+in case the intermediate-poly-shrink fails to amortise the
+per-step search cost.
+
+Keep the post-hoc `tail_reduce_all` pass in place. With per-step
+redTail on, every basis element's tail is in normal form against
+the basis-at-insertion-time; but later insertions can introduce
+new divisors that weren't present at insertion time, so the
+post-hoc pass remains necessary to guarantee **the** unique
+reduced GB. The post-hoc pass is idempotent on already-reduced
+input, so it costs at most one O(n × |tail|) scan when it runs
+on already-reduced polys.
+
+#### Relationship to the existing `reduce_tail`
+
+The pre-ADR-024 `bba::reduce_tail` (bba.rs:484) takes a tail
+poly, an SBasis, and a ring; it walks the tail and reduces each
+term against the basis (`tail_reduce_all` calls it once per
+basis index, with the index temporarily marked redundant so the
+poly doesn't reduce against itself). The new per-step entry
+point `reduce_h_tail` is a thin wrapper that unwraps `h` →
+`(lc, lm, tail)`, calls `reduce_tail(tail, &s_basis, ring)`
+**without** any redundant-flag dance (because `h` is not in the
+basis yet), and re-attaches `(lc, lm)`. Sharing the inner
+`reduce_tail` keeps both call sites driven by the same
+divisor-search / KBucket / sev-prefilter machinery, so future
+optimisations to the divisor search (e.g. an Arc-borrow rewrite
+to avoid the `Arc<Poly>` clone in the parallel path) flow
+through both naturally.
+
+### Consequences
+
+* **Final output is unchanged.** Both pre- and post-ADR-024
+  paths produce the unique reduced GB under `option(redSB)`.
+  The three staging fixtures (`staging-5101449`, `-5104053`,
+  `-5106746`) must continue to match bit-for-bit; that's the
+  primary correctness gate. Any divergence is a bug in the
+  per-step implementation, not an expected outcome.
+
+* **Intermediate poly sizes shrink.** Every basis element's
+  tail is in normal form against the basis at insertion time;
+  later S-poly reductions that select that element as a
+  reducer pay `O(|reduced tail|)` per merge step instead of
+  `O(|raw tail|)`. The expected wall delta depends on how much
+  reducible-tail-mass survives a leader-only reduction
+  pass — the prediction is that on staging workloads, where
+  rustgb's basis grows to ~3000-4500 polys and basis elements
+  appear at very different times in the run, the cumulative
+  per-merge savings outweigh the per-insert search cost.
+
+* **Per-insert cost.** Each new basis element pays an
+  additional pass over its tail terms, with one divisor search
+  (sev-prefiltered, AVX2-batched on samsung) per term. For a
+  basis element with no reducible tail terms, this is
+  `|tail|` divisor searches that all return `None` — pure
+  overhead. The hypothesis is that this cost is dominated by
+  the per-merge savings; the `redtail` feature flag is the A/B
+  gate for the hypothesis.
+
+* **Optional toggle.** `cargo build --no-default-features`
+  reverts to the pre-ADR-024 path. The Stage D profile
+  baseline (143 s wall on staging-5101449, 10.2× Singular)
+  becomes the redtail-off A side; ADR-024 ships the
+  redtail-on B side as the new default.
+
+* **Parallel path.** `insert_and_enterpairs` now does the
+  per-step redTail under `insert_mutex`. The basis snapshot is
+  taken once per inserted survivor (already done implicitly
+  by the existing enterpairs phase). The parallel
+  `reduce_h_tail_parallel` clones `Vec<Arc<Poly>>` to
+  `Vec<Poly>` to feed the existing parallel `reduce_tail`'s
+  `&[Poly]` signature; this is acceptable for correctness but
+  is an obvious follow-up perf target (TODO comment in source)
+  — the existing `reduce_tail` should be refactored to accept
+  `&[Arc<Poly>]` so the per-step redTail in the parallel path
+  doesn't clone the basis.
+
+* **Tests pass.** 197 / 211 / 212 / 197 unit tests across the
+  four configurations (default; linked_list_poly;
+  linked_list_poly + linked_list_poly_pool; --no-default-features).
+  The reducer-cross-validation test
+  `geobucket_and_heap_reducer_agree` and the cyclic-3 / -4 /
+  -5 / katsura-3 fixtures continue to pass — the post-hoc pass
+  was already producing the unique reduced GB; per-step redTail
+  produces the same GB just sooner during the bba loop.
+
+* **Output ordering.** Unchanged. The canonical-sort step at
+  the end of `compute_gb_serial` still runs (sorts ascending by
+  leading monomial); the GB is a deterministic function of the
+  ideal regardless of when individual tail reductions ran.
+
+### What is NOT changed
+
+* The S-polynomial construction (`LObject::from_spoly`) — the
+  S-poly is built from the raw `s_i` and `s_j` polys; if those
+  have already been per-step-redTailed, the S-poly inherits
+  smaller tails, but the construction logic is identical.
+* The Gebauer-Möller pair criteria (`gm::enterpairs`) — pair
+  generation, product / chain criterion, B-internal chain
+  filter — unchanged.
+* The leading-term reduction (`reduce_lobject`) — unchanged.
+* The post-hoc `tail_reduce_all` — kept as the unique-reduced-GB
+  guarantee for cases where late insertions introduce new
+  divisors for older elements' tails.
+* The output canonical sort.
+
+### References
+
+* ADR-018 through ADR-023 — Stage A-D inner-loop tightening
+  (the immediate prerequisites; the post-ADR-023 baseline
+  is the A side of the ADR-024 A/B).
+* `~/Singular/kernel/GBEngine/kstd2.cc:bba` — Singular's bba
+  driver (the ~line 2789 redtailBba call site is the
+  reference).
+* `~/Singular/kernel/GBEngine/kstd2.cc:redtailBba` — the
+  template that ADR-024's `reduce_h_tail` mirrors.
+* `~/Singular/kernel/GBEngine/kspoly.cc` — S-poly + reduction
+  primitives that `redtailBba` reuses.
+* `~/rustgb/src/bba.rs:reduce_h_tail` — per-step redTail
+  helper (serial).
+* `~/rustgb/src/bba.rs:compute_gb_serial` — call site (seed
+  loop and main loop).
+* `~/rustgb/src/parallel.rs:reduce_h_tail_parallel` — parallel
+  variant.
+* `~/rustgb/src/parallel.rs:insert_and_enterpairs` — parallel
+  call site.
+* `~/rustgb/src/bba.rs:reduce_tail` — shared inner helper
+  (used by both the per-step path and the post-hoc
+  `tail_reduce_all`).
+* `~/rustgb/Cargo.toml` — `redtail` feature flag (default on).
+* `~/project/docs/profile-rustgb-stage-d-staging-5101449.md` —
+  pre-ADR-024 baseline (the 143 s wall).
+* `~/project/docs/profile-rustgb-redtail-staging-5101449.md` —
+  ADR-024 post-fix profile re-capture (sibling to this ADR).
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
