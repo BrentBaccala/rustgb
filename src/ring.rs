@@ -89,6 +89,15 @@ pub struct Ring {
     /// and ADR-025 for the design rationale.
     divmask_vars: [u8; DIVMASK_BITS as usize],
     divmask_thresholds: [u32; DIVMASK_BITS as usize],
+    /// Per-variable divmask bit-range: `(start_bit, n_bits)` for
+    /// variable `v`. Used by the hot-path `divmask_of` to iterate
+    /// variables once and unpack bits per variable, rather than
+    /// looping over all 64 divmask bits and re-fetching each
+    /// variable's exponent. Length is `MAX_VARS as usize + 1` (we
+    /// keep the slot for `nvars` itself zero, which lets the hot
+    /// path skip variables outside the ring without a separate
+    /// length check).
+    divmask_var_ranges: [(u8, u8); MAX_VARS as usize + 1],
 }
 
 impl Ring {
@@ -122,7 +131,8 @@ impl Ring {
             MonoOrder::DegRevLex => {}
         }
         let (overflow_mask, cmp_flip_mask) = compute_packing_masks(nvars);
-        let (divmask_vars, divmask_thresholds) = compute_divmask_layout(nvars);
+        let (divmask_vars, divmask_thresholds, divmask_var_ranges) =
+            compute_divmask_layout(nvars);
         Some(Self {
             nvars,
             ordering,
@@ -131,6 +141,7 @@ impl Ring {
             cmp_flip_mask,
             divmask_vars,
             divmask_thresholds,
+            divmask_var_ranges,
         })
     }
 
@@ -210,18 +221,50 @@ impl Ring {
     /// structurally different from the bloom filter here. The
     /// per-monomial-cached richer scheme matches mathicgb's `DivMask`
     /// (`~/mathic/src/mathic/DivMask.h`) and is what ADR-025 ports.
+    #[inline]
     pub fn divmask_of(&self, m: &Monomial) -> u64 {
         let mut mask = 0u64;
-        for k in 0..DIVMASK_BITS as usize {
-            let v = self.divmask_vars[k] as u32;
-            // Variables with no allocated bits leave var_idx == nvars
-            // (sentinel); skip them.
-            if v >= self.nvars {
-                continue;
-            }
-            let e = m.exponent(self, v).expect("v < nvars by construction");
-            if e > self.divmask_thresholds[k] {
-                mask |= 1u64 << k;
+        let nvars = self.nvars as usize;
+        // Walk variables once; for each, count how many of this
+        // variable's geometric thresholds (0, 1, 2, 4, 8, ...) are
+        // strictly less than the exponent, and shift in that many
+        // 1-bits at the variable's start position.
+        //
+        // Branchless count formula (matching the threshold scale
+        // 0, 1, 2, 4, ..., 2^(b-2)):
+        //   * e == 0          → count = 0
+        //   * e >= 1          → count >= 1 (bit 0: e > 0)
+        //   * e >= 2          → count >= 2 (bit 1: e > 1)
+        //   * e > 2^(j-1) for j ≥ 2 → bit j set
+        //
+        // Equivalently: count = min(n_bits, ceil_log2(e+1)) where
+        // ceil_log2 here is the index of the high bit + 1. Concretely,
+        // for e>=1: count = 1 + 32 - (e-1).leading_zeros() if e>=2 else 1.
+        // Simplest correct form: clamp to n_bits and use u32::checked_log2.
+        for v in 0..nvars {
+            let e = m.exponent_raw_pub(nvars, v);
+            let (start, n_bits) = self.divmask_var_ranges[v];
+            // Set count = number of thresholds 0, 1, 2, 4, 8, ...
+            // strictly less than e. Walk while it's cheaper than
+            // computing a log; at n_bits ≤ 4 (the common case for
+            // nvars ≥ 16), the loop runs ≤ 4 times and LLVM unrolls
+            // it. For nvars = 5 or smaller, n_bits can be up to 12,
+            // and the per-iteration cost is still a single `cmp`
+            // and a `setne` plus an OR.
+            let mut t: u32 = 0;
+            let mut bit = start;
+            for _ in 0..n_bits {
+                if e > t {
+                    mask |= 1u64 << bit;
+                } else {
+                    // No subsequent threshold (which doubles or
+                    // increments t) will be reached either, so we
+                    // can break early. This shortens the inner loop
+                    // for the common case `e == 0` to one cmp.
+                    break;
+                }
+                bit += 1;
+                t = if t == 0 { 1 } else { t * 2 };
             }
         }
         mask
@@ -350,9 +393,14 @@ fn compute_packing_masks(nvars: u32) -> ([u64; 4], [u64; 4]) {
 /// constraint, every slot is allocated.
 fn compute_divmask_layout(
     nvars: u32,
-) -> ([u8; DIVMASK_BITS as usize], [u32; DIVMASK_BITS as usize]) {
+) -> (
+    [u8; DIVMASK_BITS as usize],
+    [u32; DIVMASK_BITS as usize],
+    [(u8, u8); MAX_VARS as usize + 1],
+) {
     let mut vars = [0u8; DIVMASK_BITS as usize];
     let mut thresholds = [0u32; DIVMASK_BITS as usize];
+    let mut var_ranges = [(0u8, 0u8); MAX_VARS as usize + 1];
 
     if nvars == 0 || nvars > DIVMASK_BITS {
         // Caller should never reach here (Ring::new rejects). Fill
@@ -360,7 +408,7 @@ fn compute_divmask_layout(
         for v in vars.iter_mut() {
             *v = nvars as u8;
         }
-        return (vars, thresholds);
+        return (vars, thresholds, var_ranges);
     }
 
     let nvars_us = nvars as usize;
@@ -373,6 +421,7 @@ fn compute_divmask_layout(
         // doesn't divide evenly. (The order is irrelevant for
         // correctness, but fixing it keeps the layout reproducible.)
         let bits_for_v = bits_per_var_floor + if v < extra { 1 } else { 0 };
+        var_ranges[v] = (k as u8, bits_for_v as u8);
         for j in 0..bits_for_v {
             vars[k] = v as u8;
             // Threshold scale: bit 0 → 0, bit 1 → 1, bit j → 2^(j-1).
@@ -381,7 +430,7 @@ fn compute_divmask_layout(
         }
     }
     debug_assert_eq!(k, DIVMASK_BITS as usize);
-    (vars, thresholds)
+    (vars, thresholds, var_ranges)
 }
 
 #[cfg(test)]

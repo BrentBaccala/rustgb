@@ -236,6 +236,19 @@ impl Monomial {
         ((self.packed[word] >> shift) & 0x7F) as u32
     }
 
+    /// Public-but-hidden fast-path exponent reader.
+    ///
+    /// Same as the private [`Self::exponent_raw`] but accessible from
+    /// other crate modules (specifically [`crate::ring::Ring::divmask_of`])
+    /// that need the unchecked, allocation-free per-byte read in a
+    /// hot loop. The caller must pass `nvars == ring.nvars()`; the
+    /// debug builds assert this.
+    #[doc(hidden)]
+    #[inline]
+    pub fn exponent_raw_pub(&self, nvars: usize, i: usize) -> u32 {
+        self.exponent_raw(nvars, i)
+    }
+
     /// Copy the exponent vector into a `Vec<u32>`.
     pub fn exponents(&self, ring: &Ring) -> Vec<u32> {
         let n = ring.nvars() as usize;
