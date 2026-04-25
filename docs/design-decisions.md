@@ -3122,6 +3122,184 @@ rather than `sev()`.
 
 ---
 
+## ADR-020: Drop per-Monomial `total_deg` u32; rely on byte cap (Stage C)
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+ADR-017 laid out four stages for `Monomial::mul` cost reduction and
+for shrinking the `Monomial` struct. ADR-018 landed Stage A (drop
+per-mul overflow check). ADR-019 landed Stage B (drop per-Monomial
+SEV). This ADR implements **Stage C**: drop the `total_deg: u32`
+field.
+
+The field was introduced by ADR-005 to track exact total degree so
+that `cmp_degrevlex`'s saturated-cap path could fall back on a
+reliable total. It was also used by `Monomial::mul` to maintain an
+uncapped total-degree sum, consumed as a debug-only overflow check
+(post-ADR-018) and as the source for the top-byte cap's saturated
+value.
+
+Post-ADR-018, the overflow-detection role is a release-time no-op.
+Post-ADR-019, the struct has been pared down to:
+
+```
+packed:    [u64; 4]    // 32 bytes
+total_deg: u32         //  4 bytes
+component: u32         //  4 bytes
+                       // 40 bytes total
+```
+
+The only *live* consumers of exact total degree are:
+
+1. The saturated-cap slow path in `cmp_degrevlex` (rings where the
+   top byte reads 255 for one operand so the byte-compare is
+   uninformative).
+2. Test assertions that re-derive total degree from the cache.
+
+Neither is hot, neither is bound to a struct field — both can be
+serviced by recomputing from the variable bytes of `packed` when
+needed. And the dispatch shim filters rings where the saturated
+path can actually hit.
+
+### Singular precedent
+
+`~/Singular/libpolys/polys/monomials/p_polys.cc:pTotaldegree`:
+
+```c
+long pTotaldegree(poly p, const ring r) {
+    long t = 0;
+    for (int i = r->N; i > 0; i--)
+        t += p_GetExp(p, i, r);
+    return t;
+}
+```
+
+Total degree is computed from the exponent vector on demand. There is
+no separate per-monomial u32 total-degree field. A ring-configurable
+position word (the `sgn`-weighted degree encoding) sits inside the
+exp vector itself — when the ring sets `r->pOrdIndex` appropriately,
+`p_GetComp`/`p_SetComp`-style helpers read the degree straight out of
+the packed layout, exactly like our byte cap. For rings that need
+uncapped exact degree, `pTotaldegree` walks the exp vector.
+
+FLINT: N/A — FLINT has no GB engine; polynomial-layer total-degree
+accounting is out of scope for this decision.
+
+### Decision
+
+1. **Drop `total_deg: u32` from `Monomial`.** The struct is now
+   `packed: [u64; 4] + component: u32` — 36 bytes of live data, 40
+   bytes allocated (Rust pads to the 8-byte alignment of `[u64; 4]`).
+2. **`Monomial::total_deg()` reads the byte cap:**
+   `((self.packed[3] >> 56) & 0xFF) as u32`. Inline accessor, same
+   u32 return type, callsites (`Poly::lm_deg` cache, `LObject`,
+   sugar arithmetic) unchanged.
+3. **The byte cap saturates at 255.** For the dispatched ring set
+   (Z/p, ≤31 vars, degrevlex, post-340 contract) this is
+   sufficient — realistic bba steps stay well under 255. Rings
+   where `n_vars × max_per_var_deg > 255` are filtered by the
+   Singular-dispatch shim's ring criteria; they are not supported
+   by this build configuration.
+4. **`Monomial::mul`**: drop the u32 total-degree path entirely
+   (including the `debug_assert!(self.total_deg.checked_add(...))`).
+   The top-byte rewrite now saturates the sum of the two top bytes
+   of the operands. Each operand's top byte is `min(total, 255)`,
+   so the sum is bounded by 510 and saturates cleanly at 255.
+5. **`Monomial::div`**: recompute the top-byte cap from the
+   subtracted variable bytes during the per-byte loop.
+6. **`Monomial::from_exponents`**: still writes the saturated cap
+   to the top byte; no u32 assignment.
+7. **`cmp_degrevlex` saturated-cap slow path**: recompute exact
+   totals from the variable bytes via a new internal helper
+   `sum_variable_bytes`, then compare those before falling through
+   to the existing XOR-flip variable-byte compare. The fast path
+   (neither cap saturated) is unchanged — still a lex compare of
+   all four packed words via the flip mask.
+8. **`assert_canonical`**: drops the u32 cross-check; the top-byte
+   cap cross-check (`min(total, 255) == top byte`) is retained.
+
+### What is *not* changed
+
+* The byte-cap layout in `packed[3]`'s top byte — already there
+  since ADR-005.
+* `Monomial::mul`'s top-byte rewrite logic — the rewrite still
+  happens, just sourced from byte arithmetic rather than the u32
+  sum.
+* `cmp_degrevlex`'s fast path — still a direct lex compare of the
+  flip-masked packed words.
+* The dispatch shim's ring filter — adding an explicit "max total
+  degree fits in byte" check is desirable but **out of scope**
+  for this ADR. Flagged as a follow-up: a future ADR for "wide
+  exp vector" if rings with `n_vars × max_per_var_deg > 255`
+  need supporting, or an explicit ring-acceptance predicate that
+  rejects such rings at dispatch time so the saturated path
+  becomes provably unreachable under the dispatch contract.
+
+### Consequences
+
+* **Struct footprint:** `Monomial` carries 36 bytes of live data
+  (down from 40). The aligned allocation is still 40 bytes because
+  `[u64; 4]` demands 8-byte alignment and Rust's struct layout
+  rounds the total to a multiple of the maximum field alignment.
+  A packed-attribute re-layout (or moving `component` inside the
+  top word's unused low 7 bits of a variable byte slot) could
+  recover the nominal 4 bytes; that is a separate optimisation
+  left for a future ADR.
+* **`Monomial::mul`:** one fewer u32 read, one fewer u32 add,
+  one fewer struct-field write. The top-byte saturation path is
+  now the only place a total-degree value is produced, and it
+  uses the two u64-byte-reads that the mul already performs for
+  the packed add.
+* **`cmp_degrevlex` saturated slow path:** gains an
+  O(nvars)-byte sum. The fast path is unaffected. The slow path
+  is rarely hit in practice (filter'd out by the dispatch
+  shim); the extra cost is not measurable on staging-scale
+  workloads.
+* **Stage D enablement:** the hand-specialised inner loop for
+  the bba step's canonical monomial add can assume the struct
+  has no u32 total-degree to maintain. Writes to the result
+  reduce to four u64 stores + one u32 write (`component`).
+* **Explicit limit:** rings where `n_vars × max_per_var_deg > 255`
+  are not supported by this build configuration; the dispatch
+  shim filters them. A future ADR can address wide-exp-vector
+  support if that ring class becomes interesting.
+
+### Test impact
+
+All three cargo test configurations pass in release mode with the
+same test counts as before the change:
+
+* default: **195/195**
+* `linked_list_poly`: **209/209**
+* `linked_list_poly linked_list_poly_pool`: **210/210**
+
+Two property-test expectations were refined:
+* `tests/monomial_props.rs::total_deg_is_sum` now accepts
+  `min(a.total_deg() + b.total_deg(), 255)` instead of strict
+  linearity, matching the byte cap's saturating semantics.
+* `src/monomial.rs::mul_no_carry_propagation_between_neighbouring_bytes`
+  expects 255 for a product whose uncapped total would be 600.
+
+### References
+
+* ADR-005 — original `total_deg: u32` rationale; retired by this ADR.
+* ADR-017 — Stages B-D plan.
+* ADR-018 — Stage A (drop per-mul overflow check).
+* ADR-019 — Stage B (drop per-Monomial SEV).
+* `~/rustgb/src/monomial.rs` — implementation.
+* `~/Singular/libpolys/polys/monomials/p_polys.cc:pTotaldegree`
+  — Singular precedent (total degree re-derived from the exp
+  vector, no separate field).
+* `~/project/docs/profile-rustgb-drop-sev-staging-5101449.md`
+  — Stage B (ADR-019) baseline profile report.
+* `~/project/docs/profile-rustgb-drop-total-deg-staging-5101449.md`
+  — profile report for this ADR.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
