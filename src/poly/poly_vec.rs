@@ -51,6 +51,15 @@ pub struct Poly {
     /// Cached leading-term sev (per ADR-019, computed via
     /// `Monomial::compute_sev` at every `refresh_cache`); 0 when empty.
     lm_sev: u64,
+    /// Cached leading-term divmask (ADR-025; computed via
+    /// `Ring::divmask_of` at every `refresh_cache`); 0 when empty.
+    /// Used as the primary fast-reject filter in
+    /// `bba::find_divisor_idx` and `gm::chain_crit_normal`. Coexists
+    /// with `lm_sev`: they're both 64-bit bloom filters with the same
+    /// `(a | b ⇒ mask_a ⊆ mask_b)` invariant, but divmask encodes
+    /// exponent ranges (not just nonzero/zero) so its false-positive
+    /// rate is lower.
+    lm_divmask: u64,
     /// Cached leading coefficient (`coeffs[head]`); 0 when empty.
     lm_coeff: Coeff,
     /// Cached leading monomial degree (`terms[head].total_deg()`),
@@ -74,6 +83,7 @@ impl Clone for Poly {
             terms,
             head: 0,
             lm_sev: self.lm_sev,
+            lm_divmask: self.lm_divmask,
             lm_coeff: self.lm_coeff,
             lm_deg: self.lm_deg,
         }
@@ -90,6 +100,7 @@ impl Poly {
             terms: Vec::new(),
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         }
@@ -104,12 +115,16 @@ impl Poly {
         }
         // ADR-019: SEV computed once per leading-term change.
         let lm_sev = m.compute_sev(ring);
+        // ADR-025: divmask computed alongside SEV at every leading-term
+        // refresh.
+        let lm_divmask = ring.divmask_of(&m);
         let lm_deg = m.total_deg();
         Self {
             coeffs: vec![c],
             terms: vec![m],
             head: 0,
             lm_sev,
+            lm_divmask,
             lm_coeff: c,
             lm_deg,
         }
@@ -160,6 +175,7 @@ impl Poly {
             terms: mons,
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -200,6 +216,7 @@ impl Poly {
             terms,
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -249,6 +266,7 @@ impl Poly {
             terms: mons,
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -260,14 +278,17 @@ impl Poly {
 
     /// ADR-019: SEV is computed on-demand at leading-term refresh,
     /// not carried per Monomial. `ring` is required so `compute_sev`
-    /// can walk the ring's variable byte layout.
+    /// can walk the ring's variable byte layout. ADR-025: divmask is
+    /// refreshed alongside SEV from the same leading monomial.
     fn refresh_cache(&mut self, ring: &Ring) {
         if let Some(m) = self.terms.get(self.head) {
             self.lm_sev = m.compute_sev(ring);
+            self.lm_divmask = ring.divmask_of(m);
             self.lm_deg = m.total_deg();
             self.lm_coeff = self.coeffs[self.head];
         } else {
             self.lm_sev = 0;
+            self.lm_divmask = 0;
             self.lm_coeff = 0;
             self.lm_deg = 0;
         }
@@ -314,6 +335,14 @@ impl Poly {
     #[inline]
     pub fn lm_sev(&self) -> u64 {
         self.lm_sev
+    }
+
+    /// Leading-term divmask (ADR-025). 0 when zero. Used by
+    /// `bba::find_divisor_idx` and `gm::chain_crit_normal` as the
+    /// primary fast-reject filter for divisibility tests.
+    #[inline]
+    pub fn lm_divmask(&self) -> u64 {
+        self.lm_divmask
     }
 
     /// Leading coefficient. 0 when zero.
@@ -382,6 +411,7 @@ impl Poly {
             terms: self.terms[self.head + 1..].to_vec(),
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -473,6 +503,7 @@ impl Poly {
             terms: self.terms[self.head..].to_vec(),
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -496,6 +527,7 @@ impl Poly {
             terms: self.terms[self.head..].to_vec(),
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -521,6 +553,7 @@ impl Poly {
             terms,
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -628,6 +661,7 @@ impl Poly {
             terms: out_m,
             head: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -697,10 +731,12 @@ impl Poly {
         // Cached leading fields agree with the live leading term.
         if self.is_zero() {
             assert_eq!(self.lm_sev, 0);
+            assert_eq!(self.lm_divmask, 0);
             assert_eq!(self.lm_coeff, 0);
             assert_eq!(self.lm_deg, 0);
         } else {
             assert_eq!(self.lm_sev, self.terms[self.head].compute_sev(ring));
+            assert_eq!(self.lm_divmask, ring.divmask_of(&self.terms[self.head]));
             assert_eq!(self.lm_coeff, self.coeffs[self.head]);
             assert_eq!(self.lm_deg, self.terms[self.head].total_deg());
         }
@@ -862,6 +898,7 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
         terms: out_m,
         head: 0,
         lm_sev: 0,
+        lm_divmask: 0,
         lm_coeff: 0,
         lm_deg: 0,
     };

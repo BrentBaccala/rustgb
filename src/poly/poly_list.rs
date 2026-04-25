@@ -84,6 +84,11 @@ pub struct Poly {
     /// Cached leading-term sev (per ADR-019, computed via
     /// `Monomial::compute_sev` at every `refresh_cache`); 0 when empty.
     lm_sev: u64,
+    /// Cached leading-term divmask (ADR-025; computed via
+    /// `Ring::divmask_of` at every `refresh_cache`); 0 when empty.
+    /// See [`crate::poly::poly_vec::Poly::lm_divmask`] for the full
+    /// docstring (single source of truth).
+    lm_divmask: u64,
     /// Cached leading coefficient (`head.coeff`); 0 when empty.
     lm_coeff: Coeff,
     /// Cached leading monomial degree (`head.mono.total_deg()`),
@@ -116,6 +121,7 @@ impl std::fmt::Debug for Poly {
         dbg.field("len", &self.len)
             .field("lm_coeff", &self.lm_coeff)
             .field("lm_sev", &self.lm_sev)
+            .field("lm_divmask", &self.lm_divmask)
             .field("lm_deg", &self.lm_deg);
         // Walk and collect terms for debugging.
         let mut terms: Vec<(Coeff, &Monomial)> = Vec::with_capacity(self.len);
@@ -196,6 +202,7 @@ impl Clone for Poly {
                 head,
                 len: self.len,
                 lm_sev: self.lm_sev,
+                lm_divmask: self.lm_divmask,
                 lm_coeff: self.lm_coeff,
                 lm_deg: self.lm_deg,
             }
@@ -212,6 +219,7 @@ impl Poly {
             head: None,
             len: 0,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         }
@@ -225,13 +233,16 @@ impl Poly {
             return Self::zero();
         }
         // ADR-019: SEV computed once per leading-term change.
+        // ADR-025: divmask alongside SEV.
         let lm_sev = m.compute_sev(ring);
+        let lm_divmask = ring.divmask_of(&m);
         let lm_deg = m.total_deg();
         let head = POOL.with(|p| p.borrow_mut().alloc(c, m, None));
         Self {
             head: Some(head),
             len: 1,
             lm_sev,
+            lm_divmask,
             lm_coeff: c,
             lm_deg,
         }
@@ -273,8 +284,9 @@ impl Poly {
         let _ = p;
 
         let lm_coeff = terms[0].0;
-        // ADR-019: SEV computed on demand.
+        // ADR-019: SEV computed on demand. ADR-025: divmask too.
         let lm_sev = terms[0].1.compute_sev(ring);
+        let lm_divmask = ring.divmask_of(&terms[0].1);
         let lm_deg = terms[0].1.total_deg();
 
         POOL.with(|pool_cell| {
@@ -292,6 +304,7 @@ impl Poly {
                 head,
                 len,
                 lm_sev,
+                lm_divmask,
                 lm_coeff,
                 lm_deg,
             }
@@ -322,8 +335,9 @@ impl Poly {
         }
         let len = coeffs.len();
         let lm_coeff = coeffs[0];
-        // ADR-019: SEV computed on demand.
+        // ADR-019: SEV computed on demand. ADR-025: divmask too.
         let lm_sev = terms[0].compute_sev(ring);
+        let lm_divmask = ring.divmask_of(&terms[0]);
         let lm_deg = terms[0].total_deg();
 
         POOL.with(|pool_cell| {
@@ -341,6 +355,7 @@ impl Poly {
                 head,
                 len,
                 lm_sev,
+                lm_divmask,
                 lm_coeff,
                 lm_deg,
             }
@@ -388,16 +403,19 @@ impl Poly {
 
     /// ADR-019: SEV is computed on-demand at leading-term refresh,
     /// not carried per Monomial. `ring` is required so `compute_sev`
-    /// can walk the ring's variable byte layout.
+    /// can walk the ring's variable byte layout. ADR-025: divmask
+    /// refreshed alongside SEV from the same leading monomial.
     fn refresh_cache(&mut self, ring: &Ring) {
         if let Some(h) = self.head {
             // SAFETY: `h` points to a live leading node.
             let h_ref = unsafe { h.as_ref() };
             self.lm_sev = h_ref.mono.compute_sev(ring);
+            self.lm_divmask = ring.divmask_of(&h_ref.mono);
             self.lm_deg = h_ref.mono.total_deg();
             self.lm_coeff = h_ref.coeff;
         } else {
             self.lm_sev = 0;
+            self.lm_divmask = 0;
             self.lm_coeff = 0;
             self.lm_deg = 0;
         }
@@ -444,6 +462,14 @@ impl Poly {
     #[inline]
     pub fn lm_sev(&self) -> u64 {
         self.lm_sev
+    }
+
+    /// Leading-term divmask (ADR-025). 0 when zero. Used by
+    /// `bba::find_divisor_idx` and `gm::chain_crit_normal` as the
+    /// primary fast-reject filter for divisibility tests.
+    #[inline]
+    pub fn lm_divmask(&self) -> u64 {
+        self.lm_divmask
     }
 
     /// Leading coefficient. 0 when zero.
@@ -506,6 +532,7 @@ impl Poly {
                 head: out_head,
                 len: self.len - 1,
                 lm_sev: 0,
+                lm_divmask: 0,
                 lm_coeff: 0,
                 lm_deg: 0,
             };
@@ -638,6 +665,7 @@ impl Poly {
                 head: out_head,
                 len: self.len,
                 lm_sev: 0,
+                lm_divmask: 0,
                 lm_coeff: 0,
                 lm_deg: 0,
             };
@@ -672,6 +700,7 @@ impl Poly {
                 head: out_head,
                 len: self.len,
                 lm_sev: 0,
+                lm_divmask: 0,
                 lm_coeff: 0,
                 lm_deg: 0,
             };
@@ -708,6 +737,7 @@ impl Poly {
                 head: out_head,
                 len: self.len,
                 lm_sev: 0,
+                lm_divmask: 0,
                 lm_coeff: 0,
                 lm_deg: 0,
             };
@@ -834,6 +864,7 @@ impl Poly {
                 head: out_head,
                 len: out_len,
                 lm_sev: 0,
+                lm_divmask: 0,
                 lm_coeff: 0,
                 lm_deg: 0,
             };
@@ -1191,12 +1222,14 @@ impl Poly {
         assert_eq!(self.len, count, "cached len disagrees with walk");
         if self.is_zero() {
             assert_eq!(self.lm_sev, 0);
+            assert_eq!(self.lm_divmask, 0);
             assert_eq!(self.lm_coeff, 0);
             assert_eq!(self.lm_deg, 0);
         } else {
             // SAFETY: head is live and non-null here.
             let h = unsafe { self.head.unwrap().as_ref() };
             assert_eq!(self.lm_sev, h.mono.compute_sev(ring));
+            assert_eq!(self.lm_divmask, ring.divmask_of(&h.mono));
             assert_eq!(self.lm_coeff, h.coeff);
             assert_eq!(self.lm_deg, h.mono.total_deg());
         }
@@ -1406,6 +1439,7 @@ fn merge_consuming_zp_degrevlex_len4(ring: &Ring, a: Poly, b: Poly, subtract: bo
         head: sentinel_slot.take(),
         len: out_len,
         lm_sev: 0,
+        lm_divmask: 0,
         lm_coeff: 0,
         lm_deg: 0,
     };
@@ -1558,6 +1592,7 @@ fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
         head: sentinel_slot.take(),
         len: out_len,
         lm_sev: 0,
+        lm_divmask: 0,
         lm_coeff: 0,
         lm_deg: 0,
     };
@@ -1653,6 +1688,7 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
             head: out_head,
             len: out_len,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
         };
