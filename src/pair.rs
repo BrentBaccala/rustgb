@@ -51,6 +51,11 @@ pub struct Pair {
     /// `Monomial::compute_sev`, per ADR-019) so the chain criterion's
     /// sev pre-filter is a direct u64 load.
     pub lcm_sev: u64,
+    /// Cached divmask of `lcm` (ADR-025). Pre-computed via
+    /// `Ring::divmask_of`. Used by the chain criterion's divmask
+    /// fast-reject — strictly stronger than `lcm_sev` (encodes
+    /// exponent ranges, not just nonzero/zero).
+    pub lcm_divmask: u64,
     /// Sugar degree of the pair: `max(sugar(S[i]) + deg(m_i),
     /// sugar(S[j]) + deg(m_j))`. For the bootstrap where inputs
     /// carry `sugar = lm_deg`, this is equivalent to the LCM's total
@@ -89,12 +94,15 @@ impl Pair {
         let (i, j) = if i < j { (i, j) } else { (j, i) };
         debug_assert!(i != j, "degenerate pair with i == j");
         // ADR-019: SEV computed on demand from lcm; ring required.
+        // ADR-025: divmask alongside SEV.
         let lcm_sev = lcm.compute_sev(ring);
+        let lcm_divmask = ring.divmask_of(&lcm);
         Self {
             i,
             j,
             lcm,
             lcm_sev,
+            lcm_divmask,
             sugar,
             arrival,
             key: PairKey(0),
@@ -109,6 +117,11 @@ impl Pair {
             self.lcm_sev,
             self.lcm.compute_sev(ring),
             "lcm_sev cache mismatch"
+        );
+        assert_eq!(
+            self.lcm_divmask,
+            ring.divmask_of(&self.lcm),
+            "lcm_divmask cache mismatch (ADR-025)"
         );
     }
 }

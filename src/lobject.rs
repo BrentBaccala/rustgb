@@ -34,6 +34,10 @@ pub struct LObject {
     bucket: KBucket,
     /// Cached leading sev. 0 when the LObject is zero.
     lm_sev: u64,
+    /// Cached leading divmask (ADR-025). 0 when zero. The divisor
+    /// sweep in `bba::find_divisor_idx` reads this to fast-reject
+    /// non-divisors per ADR-025.
+    lm_divmask: u64,
     /// Cached leading coeff. 0 when zero.
     lm_coeff: Coeff,
     /// Cached leading total degree (sourced from the leading
@@ -60,6 +64,7 @@ impl LObject {
         let mut o = Self {
             bucket: KBucket::from_poly(ring, p),
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
             is_zero: false,
@@ -107,6 +112,7 @@ impl LObject {
         let mut o = Self {
             bucket,
             lm_sev: 0,
+            lm_divmask: 0,
             lm_coeff: 0,
             lm_deg: 0,
             is_zero: false,
@@ -134,12 +140,14 @@ impl LObject {
         match self.bucket.leading() {
             None => {
                 self.lm_sev = 0;
+                self.lm_divmask = 0;
                 self.lm_coeff = 0;
                 self.lm_deg = 0;
                 self.is_zero = true;
             }
             Some((c, m)) => {
                 self.lm_sev = m.compute_sev(&ring);
+                self.lm_divmask = ring.divmask_of(m);
                 self.lm_coeff = c;
                 self.lm_deg = m.total_deg();
                 self.is_zero = false;
@@ -151,6 +159,14 @@ impl LObject {
     #[inline]
     pub fn lm_sev(&self) -> u64 {
         self.lm_sev
+    }
+
+    /// Cached leading divmask (ADR-025). 0 when zero. Read by
+    /// `bba::find_divisor_idx` as the primary fast-reject filter
+    /// against the basis on every reduction step.
+    #[inline]
+    pub fn lm_divmask(&self) -> u64 {
+        self.lm_divmask
     }
 
     /// Cached leading coeff. 0 when zero.
@@ -212,6 +228,7 @@ impl LObject {
         let out = self.bucket.extract_leading();
         // Cache is now stale; mark as such. The driver will refresh.
         self.lm_sev = 0;
+        self.lm_divmask = 0;
         self.lm_coeff = 0;
         self.lm_deg = 0;
         self.is_zero = false; // unknown; caller must refresh

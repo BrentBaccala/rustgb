@@ -269,8 +269,9 @@ pub fn reduce_lobject_geobucket(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc
             return;
         }
         // Take a snapshot of the leading monomial & coeff to drive
-        // the divisor search.
-        let lm_sev = lobj.lm_sev();
+        // the divisor search. ADR-025: divmask, not SEV — the
+        // divisor sweep now uses the divmask fast-reject.
+        let lm_divmask = lobj.lm_divmask();
         let lm_coeff = lobj.lm_coeff();
         // `lobj.leading()` borrows the bucket mutably — we need to
         // collect the monomial value before running the divisor
@@ -281,7 +282,7 @@ pub fn reduce_lobject_geobucket(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc
             .1
             .clone();
 
-        let Some(idx) = find_divisor_idx(s_basis, lm_sev, &lm, ring) else {
+        let Some(idx) = find_divisor_idx(s_basis, lm_divmask, &lm, ring) else {
             return;
         };
 
@@ -360,17 +361,17 @@ pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring
 
     // Drive the reduction. The closure adapts our existing
     // `find_divisor_idx` (the same one the geobucket path uses,
-    // including the AVX2-batched sev pre-filter from ADR-007)
+    // including the AVX2-batched divmask fast-reject from ADR-025)
     // into the callback shape ReducerHeap::reduce_to_normal_form
     // expects.
     let (result, final_sugar) = h.reduce_to_normal_form(|leader| {
-        // ADR-019: compute SEV on demand for the heap reducer's
+        // ADR-025: compute divmask on demand for the heap reducer's
         // per-leader divisor probe. This fires once per leader
         // materialised by the heap, which is the same cadence at
-        // which Singular's `pGetShortExpVector` would fire if
-        // Monagan-Pearce were used there.
-        let leader_sev = leader.compute_sev(ring);
-        find_divisor_idx(s_basis, leader_sev, leader, ring)
+        // which Singular's `kFindDivisibleByInT` divmask probe would
+        // fire if Monagan-Pearce were used there.
+        let leader_divmask = ring.divmask_of(leader);
+        find_divisor_idx(s_basis, leader_divmask, leader, ring)
             .map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))
     });
 
@@ -383,34 +384,51 @@ pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring
 /// `lm`, skipping redundant entries. Returns the first match in
 /// insertion order, or `None`.
 ///
-/// Internally dispatches to a SIMD-batched sev pre-filter when AVX2
-/// is enabled at compile time, and a scalar walk otherwise. The two
-/// paths produce identical results on identical inputs (verified by
-/// `find_divisor_idx_simd_matches_scalar` in the unit tests).
+/// ADR-025: uses the per-Poly divmask cache as the primary
+/// fast-reject filter. The divmask is a 64-bit bloom filter encoding
+/// exponent ranges per variable (mathicgb-style); for any pair of
+/// monomials with `a | b`, `(divmask(a) & ~divmask(b)) == 0`. The
+/// contrapositive is the fast reject. The full byte-by-byte
+/// `Monomial::divides` runs only on candidates that survive the
+/// divmask filter.
 ///
-/// See `~/rustgb/docs/design-decisions.md` ADR-007 for the rationale.
+/// Internally dispatches to a SIMD-batched divmask scan when AVX2 is
+/// enabled at compile time, and a scalar walk otherwise. The two
+/// paths produce identical results on identical inputs (verified by
+/// `find_divmask_match` matching the scalar reference).
+///
+/// See ADR-007 (the original SEV variant) and ADR-025 (the divmask
+/// upgrade) in `~/rustgb/docs/design-decisions.md`.
+///
+/// `lm_divmask` is the divmask of the target leading monomial — the
+/// caller already has it cached on the LObject (or recomputed on
+/// demand for the heap-reducer probe). The `lm_sev` argument from
+/// the previous version of this signature has been replaced; SEV
+/// is no longer consulted by the divisor sweep (see ADR-025 § "SEV
+/// becomes redundant").
 #[inline]
 fn find_divisor_idx(
     s_basis: &SBasis,
-    lm_sev: u64,
+    lm_divmask: u64,
     lm: &crate::monomial::Monomial,
     ring: &Ring,
 ) -> Option<usize> {
-    let sevs = s_basis.sevs();
+    let divmasks = s_basis.divmasks();
     let lms = s_basis.lms();
     let redund = s_basis.redundant_flags();
-    let len = sevs.len();
-    let not_lm_sev = !lm_sev;
+    let len = divmasks.len();
+    let not_lm_divmask = !lm_divmask;
 
     let mut idx = 0;
     while idx < len {
-        // Find the next sev that passes the pre-filter
-        // (`(sevs[idx] & not_lm_sev) == 0`). Returns `len` if none.
-        idx = find_sev_match(sevs, not_lm_sev, idx);
+        // Find the next divmask that passes the pre-filter
+        // (`(divmasks[idx] & not_lm_divmask) == 0`). Returns `len`
+        // if none.
+        idx = find_divmask_match(divmasks, not_lm_divmask, idx);
         if idx >= len {
             return None;
         }
-        // Sev passes; now check redundant flag and the actual divides.
+        // Divmask passes; check redundant flag and the actual divides.
         // ADR-010: read the leading monomial from the lms cache
         // (flat Vec<Monomial>, contiguous) instead of dereferencing
         // s_basis.poly(idx) (a Box<Poly> with separately-allocated
@@ -427,8 +445,13 @@ fn find_divisor_idx(
 
 // `find_sev_match` (and its AVX2 / scalar implementations) live
 // in `crate::simd` as of ADR-009 so they can be reused from
-// `gm::chain_crit_normal`. See `~/rustgb/src/simd.rs`.
+// `gm::chain_crit_normal`. See `~/rustgb/src/simd.rs`. Imported
+// for the unit tests below; ADR-025 replaces the production call
+// site with `find_divmask_match` (algorithmically identical, just
+// fed the divmask array instead of the SEV array).
+#[cfg(test)]
 use crate::simd::find_sev_match;
+use crate::simd::find_divmask_match;
 
 /// Per-step `redTail`-style tail reduction (ADR-024).
 ///
@@ -570,21 +593,21 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
             break;
         };
         let m = m_ref.clone();
-        // ADR-019: per-leader SEV compute. One call per distinct
-        // leader of the tail reduction (amortised by the inner
-        // sev-pre-filtered scan over the basis).
-        let lm_sev = m.compute_sev(ring);
+        // ADR-025: per-leader divmask compute. One call per
+        // distinct leader of the tail reduction (amortised by the
+        // inner divmask-pre-filtered scan over the basis).
+        let lm_divmask = ring.divmask_of(&m);
 
-        // Sev pre-filter + real divisibility check.
-        let sevs = s_basis.sevs();
+        // Divmask fast-reject + real divisibility check.
+        let divmasks = s_basis.divmasks();
         let redund = s_basis.redundant_flags();
         let mut divisor: Option<usize> = None;
         for idx in 0..s_basis.len() {
             if redund[idx] {
                 continue;
             }
-            let s_sev = sevs[idx];
-            if (s_sev & !lm_sev) != 0 {
+            let s_divmask = divmasks[idx];
+            if (s_divmask & !lm_divmask) != 0 {
                 continue;
             }
             let s_lm = s_basis

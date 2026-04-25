@@ -37,6 +37,13 @@ pub struct SBasis {
     /// Leading short-exponent vectors. `sevs[i] == polys[i].lm_sev()`
     /// when `polys[i]` is nonzero, else 0.
     sevs: Vec<u64>,
+    /// Leading divmasks (ADR-025). `divmasks[i] ==
+    /// polys[i].lm_divmask()` when `polys[i]` is nonzero, else 0.
+    /// Used by [`crate::bba::find_divisor_idx`] as the primary
+    /// fast-reject filter (replacing the SEV pre-filter — divmask
+    /// encodes exponent ranges, so its false-positive rate is
+    /// strictly lower than SEV's).
+    divmasks: Vec<u64>,
     /// Leading monomial cache, kept in lockstep with `polys`.
     /// `lms[i] == polys[i].leading().unwrap().1.clone()`. Used by
     /// the divisor sweep in `bba::find_divisor_idx` (ADR-010) to
@@ -66,6 +73,7 @@ impl SBasis {
         Self {
             polys: Vec::new(),
             sevs: Vec::new(),
+            divmasks: Vec::new(),
             lms: Vec::new(),
             lm_degs: Vec::new(),
             redundant: Vec::new(),
@@ -102,6 +110,13 @@ impl SBasis {
     #[inline]
     pub fn sevs(&self) -> &[u64] {
         &self.sevs
+    }
+
+    /// Slice of cached leading-term divmasks (ADR-025). Length
+    /// equals [`len`](Self::len). `divmasks()[i] == polys[i].lm_divmask()`.
+    #[inline]
+    pub fn divmasks(&self) -> &[u64] {
+        &self.divmasks
     }
 
     /// Slice of cached leading monomials. Length equals [`len`](Self::len).
@@ -167,6 +182,7 @@ impl SBasis {
             return self.polys.len();
         }
         let lm_sev = h.lm_sev();
+        let lm_divmask = h.lm_divmask();
         let lm_deg = h.lm_deg();
         // Capture the leading monomial before the poly moves into
         // the Box. `unwrap` is safe: we just checked is_zero above.
@@ -177,6 +193,7 @@ impl SBasis {
 
         self.polys.push(Box::new(h));
         self.sevs.push(lm_sev);
+        self.divmasks.push(lm_divmask);
         self.lms.push(lm);
         self.lm_degs.push(lm_deg);
         self.redundant.push(false);
@@ -192,7 +209,7 @@ impl SBasis {
     /// to call multiple times — redundancy is monotonic.
     pub fn clear_redundant_for(&mut self, ring: &Ring, idx: usize) {
         debug_assert!(idx < self.polys.len());
-        let lm_sev = self.sevs[idx];
+        let h_divmask = self.divmasks[idx];
         // ADR-010: read leader from the lms cache rather than
         // dereferencing polys[idx].leading() — the lms cache lives
         // contiguous with sevs, no Box pointer chase.
@@ -201,7 +218,11 @@ impl SBasis {
             if self.redundant[i] {
                 continue;
             }
-            if (lm_sev & !self.sevs[i]) != 0 {
+            // ADR-025: divmask fast-reject. `h_lm | s_i_lm` requires
+            // every bit set in divmask(h) to also be set in
+            // divmask(s_i). A failed test here proves
+            // non-divisibility without consulting the bytes.
+            if (h_divmask & !self.divmasks[i]) != 0 {
                 continue;
             }
             let s_i_lm = &self.lms[i];
@@ -256,6 +277,7 @@ impl SBasis {
         }
         let _ = ring; // suppress unused warning in release
         self.sevs[idx] = new_poly.lm_sev();
+        self.divmasks[idx] = new_poly.lm_divmask();
         self.lm_degs[idx] = new_poly.lm_deg();
         // ADR-010: refresh lms cache. Per the precondition above
         // the new leading monomial equals the old one, so this is
@@ -290,6 +312,11 @@ impl SBasis {
     pub fn assert_canonical(&self, ring: &Ring) {
         let n = self.polys.len();
         assert_eq!(self.sevs.len(), n);
+        assert_eq!(
+            self.divmasks.len(),
+            n,
+            "divmasks cache length mismatch (ADR-025)"
+        );
         assert_eq!(self.lms.len(), n, "lms cache length mismatch (ADR-010)");
         assert_eq!(self.lm_degs.len(), n);
         assert_eq!(self.redundant.len(), n);
@@ -298,6 +325,11 @@ impl SBasis {
             p.assert_canonical(ring);
             assert!(!p.is_zero(), "SBasis holds zero at index {i}");
             assert_eq!(self.sevs[i], p.lm_sev(), "sevs mismatch at {i}");
+            assert_eq!(
+                self.divmasks[i],
+                p.lm_divmask(),
+                "divmasks mismatch at {i}"
+            );
             assert_eq!(self.lm_degs[i], p.lm_deg(), "lm_degs mismatch at {i}");
             // ADR-010: lms cache must agree with the poly's
             // own leading monomial.

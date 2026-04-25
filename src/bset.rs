@@ -30,6 +30,13 @@ pub struct BSet {
     /// rationale (Singular's `sev_flat` flat-parallel-array
     /// pattern, applied to the BSet's pairs).
     lcm_sevs: Vec<u64>,
+    /// Parallel array of `pair.lcm_divmask` values (ADR-025).
+    /// Lockstep with `pairs` and `lcm_sevs`. Used by the
+    /// chain-criterion B-internal sweep as the primary fast-reject
+    /// (divmask encodes exponent ranges, so its false-positive rate
+    /// for the divisibility predicate is strictly lower than the
+    /// SEV's).
+    lcm_divmasks: Vec<u64>,
     /// (i, j) → index into `pairs`. Never holds a stale mapping: on
     /// removal the last element is swapped in and the hash for the
     /// swapped-in pair is updated.
@@ -42,6 +49,7 @@ impl BSet {
         Self {
             pairs: Vec::new(),
             lcm_sevs: Vec::new(),
+            lcm_divmasks: Vec::new(),
             by_indices: HashMap::new(),
         }
     }
@@ -72,6 +80,7 @@ impl BSet {
         );
         self.by_indices.insert(key, idx);
         self.lcm_sevs.push(pair.lcm_sev);
+        self.lcm_divmasks.push(pair.lcm_divmask);
         self.pairs.push(pair);
     }
 
@@ -89,11 +98,20 @@ impl BSet {
         &self.lcm_sevs
     }
 
+    /// Borrow the parallel `lcm_divmask` array (ADR-025).
+    /// `lcm_divmasks()[i] == pairs()[i].lcm_divmask`. Used by the
+    /// chain-criterion's B-internal sweep as the primary fast-reject.
+    #[inline]
+    pub fn lcm_divmasks(&self) -> &[u64] {
+        &self.lcm_divmasks
+    }
+
     /// Remove the pair at `at` (swap-remove). Returns the removed
     /// pair. Keeps `by_indices` consistent.
     pub fn swap_remove(&mut self, at: usize) -> Pair {
         let removed = self.pairs.swap_remove(at);
         self.lcm_sevs.swap_remove(at);
+        self.lcm_divmasks.swap_remove(at);
         self.by_indices.remove(&(removed.i, removed.j));
         if at < self.pairs.len() {
             // The element previously at the end now lives at `at`.
@@ -116,6 +134,11 @@ impl BSet {
             self.lcm_sevs.len(),
             "pairs / lcm_sevs length mismatch"
         );
+        assert_eq!(
+            self.pairs.len(),
+            self.lcm_divmasks.len(),
+            "pairs / lcm_divmasks length mismatch (ADR-025)"
+        );
         for (idx, pair) in self.pairs.iter().enumerate() {
             pair.assert_canonical(ring);
             let got = self.by_indices.get(&(pair.i, pair.j));
@@ -123,6 +146,10 @@ impl BSet {
             assert_eq!(
                 self.lcm_sevs[idx], pair.lcm_sev,
                 "lcm_sevs[{idx}] out of sync with pair.lcm_sev"
+            );
+            assert_eq!(
+                self.lcm_divmasks[idx], pair.lcm_divmask,
+                "lcm_divmasks[{idx}] out of sync with pair.lcm_divmask"
             );
         }
     }

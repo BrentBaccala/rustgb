@@ -276,13 +276,14 @@ pub fn reduce_lobject_parallel(lobj: &mut LObject, comp: &Computation) {
             return;
         }
 
-        // Snapshot the basis metadata. We clone the sevs and lm_degs
+        // Snapshot the basis metadata. We clone the divmasks and lm_degs
         // (small), and clone out Arcs for polys lazily once we have
-        // a sev hit. We take ONE read lock at the start of the
+        // a divmask hit. We take ONE read lock at the start of the
         // divisor search, drop it before the (potentially slow)
         // reduction step, and re-acquire on the next loop iteration.
+        // ADR-025: divmask fast-reject in place of SEV pre-filter.
 
-        let lm_sev = lobj.lm_sev();
+        let lm_divmask = lobj.lm_divmask();
         let lm_coeff = lobj.lm_coeff();
         let lm = lobj
             .leading()
@@ -292,7 +293,7 @@ pub fn reduce_lobject_parallel(lobj: &mut LObject, comp: &Computation) {
 
         let divisor: Option<(Arc<Poly>, u32)> = {
             let snap = comp.basis.read_snapshot();
-            let sevs = &snap.sevs;
+            let divmasks = &snap.divmasks;
             let polys = &snap.polys;
             let lm_degs = &snap.lm_degs;
             // Redundancy flags are atomic; read them in-line.
@@ -303,8 +304,8 @@ pub fn reduce_lobject_parallel(lobj: &mut LObject, comp: &Computation) {
                 if redundant[idx].load(Ordering::Relaxed) {
                     continue;
                 }
-                let s_sev = sevs[idx];
-                if (s_sev & !lm_sev) != 0 {
+                let s_divmask = divmasks[idx];
+                if (s_divmask & !lm_divmask) != 0 {
                     continue;
                 }
                 let s_lm = polys[idx]
@@ -421,6 +422,7 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
 
     let h_lm = h_arc.leading().expect("h is nonzero").1.clone();
     let h_lm_sev = h_arc.lm_sev();
+    let h_lm_divmask = h_arc.lm_divmask();
 
     // Iterate through non-redundant older indices (s_idx < h_idx).
     // For each, apply the product criterion and push onto B.
@@ -471,7 +473,7 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
             &comp.ring,
             &polys_snapshot,
             &h_lm,
-            h_lm_sev,
+            h_lm_divmask,
             h_idx,
             &mut l_guard,
         );
@@ -626,7 +628,7 @@ fn monomials_are_coprime(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
 /// B-internal chain criterion: drop pairs whose LCM is divisible by
 /// another pair's LCM. Equal LCMs keep the first (lowest index in
 /// B); later duplicates drop. Matches `gm::chain_crit_normal`
-/// phase 1.
+/// phase 1. ADR-025: divmask fast-reject in place of SEV.
 fn chain_crit_b_internal(ring: &Ring, b: &mut BSet) {
     let n = b.len();
     let mut kill: Vec<bool> = vec![false; n];
@@ -642,14 +644,14 @@ fn chain_crit_b_internal(ring: &Ring, b: &mut BSet) {
                 }
                 let a = &pairs[i];
                 let c = &pairs[j];
-                let equal = a.lcm_sev == c.lcm_sev && a.lcm == c.lcm;
+                let equal = a.lcm == c.lcm;
                 if equal {
                     if j > i {
                         kill[j] = true;
                     }
                     continue;
                 }
-                if (a.lcm_sev & !c.lcm_sev) == 0 && a.lcm.divides(&c.lcm, ring) {
+                if (a.lcm_divmask & !c.lcm_divmask) == 0 && a.lcm.divides(&c.lcm, ring) {
                     kill[j] = true;
                 }
             }
@@ -673,7 +675,7 @@ fn chain_crit_l_side(
     ring: &Ring,
     polys_snapshot: &[Arc<Poly>],
     h_lm: &Monomial,
-    h_lm_sev: u64,
+    h_lm_divmask: u64,
     h_idx: u32,
     l: &mut LSet,
 ) {
@@ -682,7 +684,8 @@ fn chain_crit_l_side(
         if pair.i == h_idx || pair.j == h_idx {
             continue;
         }
-        if (h_lm_sev & !pair.lcm_sev) != 0 {
+        // ADR-025: divmask fast-reject in place of SEV.
+        if (h_lm_divmask & !pair.lcm_divmask) != 0 {
             continue;
         }
         if !h_lm.divides(&pair.lcm, ring) {

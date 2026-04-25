@@ -63,6 +63,9 @@ pub struct SharedSBasisInner {
     pub polys: Vec<Arc<Poly>>,
     /// Leading short-exponent vectors.
     pub sevs: Vec<u64>,
+    /// Leading divmasks (ADR-025). Lockstep with `sevs`. Used by
+    /// the parallel divisor sweep as the primary fast-reject filter.
+    pub divmasks: Vec<u64>,
     /// Leading total degrees.
     pub lm_degs: Vec<u32>,
     /// Insertion arrival IDs (per-element, for lookup by index).
@@ -99,12 +102,14 @@ impl SharedSBasis {
     /// (`inner` first, `redundant` second) to avoid deadlock.
     pub fn push(&self, h: Arc<Poly>, arrival: u64) -> usize {
         let lm_sev = h.lm_sev();
+        let lm_divmask = h.lm_divmask();
         let lm_deg = h.lm_deg();
         let mut inner = self.inner.write().unwrap();
         let mut redundant = self.redundant.write().unwrap();
         let idx = inner.polys.len();
         inner.polys.push(h);
         inner.sevs.push(lm_sev);
+        inner.divmasks.push(lm_divmask);
         inner.lm_degs.push(lm_deg);
         inner.arrivals.push(arrival);
         redundant.push(AtomicBool::new(false));

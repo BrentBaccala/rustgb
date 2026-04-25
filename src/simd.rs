@@ -1,15 +1,21 @@
 //! SIMD helpers shared across the crate.
 //!
-//! Currently a single primitive: [`find_sev_match`], the
-//! batched sev pre-filter scan introduced in ADR-007 for the
-//! basis sweep inside `bba::reduce_lobject` and reused in ADR-009
-//! for `gm::chain_crit_normal`'s B-internal pair dedup. The
-//! function takes a flat `&[u64]` of sevs and a "not_sev" mask
-//! (the negation of the candidate sev), returning the first index
-//! where `(sevs[i] & not_sev) == 0` — i.e. the candidate's set
-//! bits are a subset of `sevs[i]`'s. That's exactly what both
-//! "candidate divides current" (ADR-007) and "outer-pair sev fits
-//! inside inner-pair sev" (ADR-009) need.
+//! Three primitives, all built on the same shape (16-entry-per-iter
+//! AVX2 unroll, 4-wide tail, scalar fallback):
+//!
+//! * [`find_sev_match`] — original SEV pre-filter (ADR-007).
+//! * [`find_divmask_match`] — divmask fast-reject (ADR-025), used
+//!   by `bba::find_divisor_idx`. Algorithmically identical to
+//!   `find_sev_match` (subset test on a u64 bloom filter) — the
+//!   distinction is which 64-bit cache the caller feeds in. Kept
+//!   as a separate name so the call site reads as the bitmap
+//!   semantic it actually consults.
+//! * [`find_sev_superset_match`] — superset variant for the
+//!   chain-criterion B-internal sweep (ADR-009).
+//!
+//! All three take a flat `&[u64]` of cached bloom filters and a
+//! mask, returning the first index where the per-bit predicate
+//! holds.
 //!
 //! Mirrors Singular's `kSevScanAVX2` from
 //! `~/Singular-next-opt/kernel/GBEngine/kstd2.cc:74-121`.
@@ -45,6 +51,24 @@ pub(crate) fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize 
 #[inline]
 pub(crate) fn find_sev_match(sevs: &[u64], not_sev: u64, start: usize) -> usize {
     find_sev_match_scalar(sevs, not_sev, start)
+}
+
+/// Return the smallest index `i >= start` with
+/// `(divmasks[i] & not_divmask) == 0`, or `divmasks.len()` if no
+/// such index exists.
+///
+/// Algorithmically identical to [`find_sev_match`] — the mask
+/// semantics are different (per-variable exponent ranges instead
+/// of just "nonzero?"), but the per-u64 subset check is the same
+/// per-qword AND + CMPEQ_EPI64 + MOVEMASK pattern. Kept as a
+/// distinct symbol so the call site in `bba::find_divisor_idx`
+/// reads as "scan divmasks", and a future divergence (e.g. a
+/// 128-bit divmask) lands in just this function.
+///
+/// ADR-025.
+#[inline]
+pub(crate) fn find_divmask_match(divmasks: &[u64], not_divmask: u64, start: usize) -> usize {
+    find_sev_match(divmasks, not_divmask, start)
 }
 
 /// Scalar implementation of [`find_sev_match`]. Used as the
@@ -174,6 +198,23 @@ pub(crate) fn find_sev_superset_match(sevs: &[u64], subset_mask: u64, start: usi
 #[inline]
 pub(crate) fn find_sev_superset_match(sevs: &[u64], subset_mask: u64, start: usize) -> usize {
     find_sev_superset_match_scalar(sevs, subset_mask, start)
+}
+
+/// Divmask analogue of [`find_sev_superset_match`] (ADR-025). Used
+/// by the chain-criterion B-internal sweep, which asks "does the
+/// outer pair's lcm divide the iterating inner pair's lcm" — i.e.
+/// `divmask(outer) ⊆ divmask(inner)`.
+///
+/// Algorithmically identical to `find_sev_superset_match`; named
+/// separately so the call site reads as the bitmap semantic it
+/// consults.
+#[inline]
+pub(crate) fn find_divmask_superset_match(
+    divmasks: &[u64],
+    subset_mask: u64,
+    start: usize,
+) -> usize {
+    find_sev_superset_match(divmasks, subset_mask, start)
 }
 
 /// Scalar implementation of [`find_sev_superset_match`].

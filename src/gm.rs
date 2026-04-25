@@ -132,7 +132,7 @@ pub fn chain_crit_normal(
     ring: &Ring,
     s_basis: &SBasis,
     h_lm: &Monomial,
-    h_lm_sev: u64,
+    h_lm_divmask: u64,
     h_idx: u32,
     b: &mut BSet,
     l: &mut LSet,
@@ -140,33 +140,29 @@ pub fn chain_crit_normal(
     // Phase 1: B-internal dedup.
     //
     // For each i, find every j whose lcm is divisible by pairs[i]'s
-    // lcm and kill it. The naive O(n^2) scalar inner loop tests
-    // `divides_with_sev(a.lcm_sev, c.lcm_sev, ...)` for every j.
-    // ADR-009 replaces the scalar sev pre-filter with a SIMD-batched
-    // scan over the BSet's flat `lcm_sevs` array.
+    // lcm and kill it. ADR-009 replaced the scalar sev pre-filter
+    // with a SIMD-batched scan over the BSet's flat `lcm_sevs`
+    // array; ADR-025 swaps that for the divmask scan
+    // `find_divmask_superset_match` over `lcm_divmasks` (strictly
+    // stronger fast-reject — divmask encodes exponent ranges).
     //
-    // Sev pre-filter for "a divides c": every set bit of a.lcm_sev
-    // must also be set in c.lcm_sev. That's the "subset_mask ⊆
-    // sevs[idx]" predicate, which `find_sev_superset_match` returns
-    // the next matching index for. (Note: this is the dual of
-    // ADR-007's `find_sev_match`, which checks the opposite
-    // direction — ADR-007 wanted "candidate divides leader" with
-    // candidate iterating, here we want "outer-pair divides
-    // inner-pair" with inner-pair iterating.)
+    // Divmask fast-reject for "a divides c": every set bit of
+    // a.lcm_divmask must also be set in c.lcm_divmask. That's the
+    // "subset_mask ⊆ divmasks[idx]" predicate.
     let n = b.len();
     let mut kill: Vec<bool> = vec![false; n];
     {
         let pairs = b.pairs();
-        let lcm_sevs = b.lcm_sevs();
+        let lcm_divmasks = b.lcm_divmasks();
         for i in 0..n {
             if kill[i] {
                 continue;
             }
             let a = &pairs[i];
-            let a_sev = a.lcm_sev;
+            let a_divmask = a.lcm_divmask;
             let mut j = 0;
             loop {
-                j = crate::simd::find_sev_superset_match(lcm_sevs, a_sev, j);
+                j = crate::simd::find_divmask_superset_match(lcm_divmasks, a_divmask, j);
                 if j >= n {
                     break;
                 }
@@ -199,9 +195,10 @@ pub fn chain_crit_normal(
         if pair.i == h_idx || pair.j == h_idx {
             continue;
         }
-        // Sev pre-filter: h_lm | pair.lcm requires every bit set in
-        // h_lm_sev to also be set in pair.lcm_sev.
-        if (h_lm_sev & !pair.lcm_sev) != 0 {
+        // Divmask fast-reject (ADR-025): h_lm | pair.lcm requires
+        // every bit set in h_lm_divmask to also be set in
+        // pair.lcm_divmask.
+        if (h_lm_divmask & !pair.lcm_divmask) != 0 {
             continue;
         }
         if !h_lm.divides(&pair.lcm, ring) {
@@ -258,6 +255,7 @@ pub fn enterpairs(
 ) -> usize {
     let h_lm = h_poly.leading().expect("h is nonzero").1.clone();
     let h_lm_sev = h_poly.lm_sev();
+    let h_lm_divmask = h_poly.lm_divmask();
 
     let mut b = BSet::new();
     let mut arrival = arrival_start;
@@ -274,7 +272,7 @@ pub fn enterpairs(
         }
     }
 
-    chain_crit_normal(ring, s_basis, &h_lm, h_lm_sev, h_idx, &mut b, l_set);
+    chain_crit_normal(ring, s_basis, &h_lm, h_lm_divmask, h_idx, &mut b, l_set);
 
     let merged = b.len();
     for pair in b.into_pairs() {
@@ -403,7 +401,7 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[0, 1, 0])));
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 0, 0])));
         let h_lm = mono(&r, &[0, 1, 1]); // y z
-        let h_lm_sev = h_lm.compute_sev(&r);
+        let h_lm_divmask = r.divmask_of(&h_lm);
 
         // Build B by hand:
         //   (0, 3) LCM = xyz       (smallest, will survive)
@@ -415,7 +413,7 @@ mod tests {
         b.push(Pair::new(2, 3, mono(&r, &[2, 2, 1]), &r, 5, 2));
         let mut l = LSet::new();
 
-        chain_crit_normal(&r, &s, &h_lm, h_lm_sev, 3, &mut b, &mut l);
+        chain_crit_normal(&r, &s, &h_lm, h_lm_divmask, 3, &mut b, &mut l);
 
         // After the criterion, B has two survivors and (2, 3) is
         // gone.
