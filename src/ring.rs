@@ -24,12 +24,17 @@
 //! enhancements in ADR-005.
 
 use crate::field::Field;
+use crate::monomial::Monomial;
 use crate::ordering::MonoOrder;
 
 /// Bits used to store each variable's exponent in the packed monomial.
 /// Eight bytes per slot, of which 7 hold the exponent and 1 is the
 /// overflow guard.
 pub const BITS_PER_VAR: u8 = 8;
+
+/// Number of bits in a divmask (fixed-width 64-bit bloom filter).
+/// See `Ring::divmask_of` and ADR-025 for the rationale.
+pub const DIVMASK_BITS: u32 = 64;
 
 /// Maximum value a single variable's exponent may take. Bit 7 of each
 /// variable byte is the overflow guard (see ADR-005), so the usable
@@ -75,6 +80,15 @@ pub struct Ring {
     /// largest-index differing variable wins"; the top byte is left
     /// untouched so larger total degree wins directly.
     cmp_flip_mask: [u64; 4],
+    /// Divmask layout: per-bit `(var, threshold)` pairs.
+    ///
+    /// Bit `k` of a monomial's divmask is set iff `exp[var_k] > threshold_k`.
+    /// The arrays are length [`DIVMASK_BITS`] = 64. Built once at ring
+    /// construction time by [`compute_divmask_layout`]; immutable
+    /// thereafter. See [`Ring::divmask_of`] for the divmask invariant
+    /// and ADR-025 for the design rationale.
+    divmask_vars: [u8; DIVMASK_BITS as usize],
+    divmask_thresholds: [u32; DIVMASK_BITS as usize],
 }
 
 impl Ring {
@@ -108,12 +122,15 @@ impl Ring {
             MonoOrder::DegRevLex => {}
         }
         let (overflow_mask, cmp_flip_mask) = compute_packing_masks(nvars);
+        let (divmask_vars, divmask_thresholds) = compute_divmask_layout(nvars);
         Some(Self {
             nvars,
             ordering,
             field,
             overflow_mask,
             cmp_flip_mask,
+            divmask_vars,
+            divmask_thresholds,
         })
     }
 
@@ -145,6 +162,101 @@ impl Ring {
     #[inline]
     pub fn cmp_flip_mask(&self) -> &[u64; 4] {
         &self.cmp_flip_mask
+    }
+
+    /// Compute the divmask of a monomial in this ring.
+    ///
+    /// The divmask is a 64-bit bloom filter encoding exponent ranges
+    /// per variable. Bit `k` is set iff the monomial's `exp[divmask_vars[k]]`
+    /// strictly exceeds `divmask_thresholds[k]`.
+    ///
+    /// # Divmask invariant
+    ///
+    /// For any pair of monomials `a, b` in this ring with
+    /// `a.divides(b, ring) == true` (i.e. `e_a[v] <= e_b[v]` for all
+    /// variables `v`), we have:
+    ///
+    /// ```text
+    /// (divmask_of(a) & !divmask_of(b)) == 0
+    /// ```
+    ///
+    /// Proof: each bit `(v, t)` of the divmask is set iff `exp[v] > t`.
+    /// If `e_a[v] > t` and `e_a[v] <= e_b[v]`, then `e_b[v] > t` also.
+    /// So every bit set in `divmask_of(a)` is also set in
+    /// `divmask_of(b)`, hence `divmask(a) & ~divmask(b) == 0`.
+    ///
+    /// The contrapositive is the fast-reject: if
+    /// `(divmask_a & !divmask_b) != 0`, then `a` does not divide `b`,
+    /// without needing the full byte-by-byte `Monomial::divides` walk.
+    ///
+    /// # Layout
+    ///
+    /// Determined at ring construction time by
+    /// [`compute_divmask_layout`]. For `nvars` variables, each variable
+    /// gets `64 / nvars` bits (rounded down), with the remainder bits
+    /// going to the lowest-indexed variables. Per-variable thresholds
+    /// follow a geometric scale `0, 1, 2, 4, 8, 16, ...` (the standard
+    /// mathicgb default — bit 0 is "exp > 0", bit 1 is "exp > 1", bit
+    /// 2 is "exp > 2", and so on). Variables with zero allocated bits
+    /// (only possible if `nvars > 64`, which we forbid) contribute
+    /// nothing to the mask.
+    ///
+    /// # Singular precedent
+    ///
+    /// Singular's `r->divmask` (set by `rGetDivMask` in
+    /// `~/Singular/libpolys/polys/monomials/ring.cc:4200`) is a
+    /// per-word top-bit mask used by `_p_LmDivisibleByNoComp` for
+    /// per-word borrow detection during the divisibility test —
+    /// structurally different from the bloom filter here. The
+    /// per-monomial-cached richer scheme matches mathicgb's `DivMask`
+    /// (`~/mathic/src/mathic/DivMask.h`) and is what ADR-025 ports.
+    pub fn divmask_of(&self, m: &Monomial) -> u64 {
+        let mut mask = 0u64;
+        for k in 0..DIVMASK_BITS as usize {
+            let v = self.divmask_vars[k] as u32;
+            // Variables with no allocated bits leave var_idx == nvars
+            // (sentinel); skip them.
+            if v >= self.nvars {
+                continue;
+            }
+            let e = m.exponent(self, v).expect("v < nvars by construction");
+            if e > self.divmask_thresholds[k] {
+                mask |= 1u64 << k;
+            }
+        }
+        mask
+    }
+
+    /// Number of bits dedicated to the highest-bit-budget variable.
+    /// Exposed for ADR-025 documentation tests.
+    #[doc(hidden)]
+    pub fn divmask_bits_for_var(&self, var: u32) -> u32 {
+        let mut count = 0u32;
+        for k in 0..DIVMASK_BITS as usize {
+            if u32::from(self.divmask_vars[k]) == var {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Borrow the per-bit `var` array of the divmask layout. Length
+    /// [`DIVMASK_BITS`]. Each entry is the variable index whose
+    /// exponent that bit examines, or `nvars` (sentinel) for an
+    /// unused bit.
+    #[doc(hidden)]
+    #[inline]
+    pub fn divmask_vars(&self) -> &[u8; DIVMASK_BITS as usize] {
+        &self.divmask_vars
+    }
+
+    /// Borrow the per-bit threshold array of the divmask layout.
+    /// Length [`DIVMASK_BITS`]. Bit `k` is set in
+    /// [`Self::divmask_of`] iff `exp[divmask_vars[k]] > thresholds[k]`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn divmask_thresholds(&self) -> &[u32; DIVMASK_BITS as usize] {
+        &self.divmask_thresholds
     }
 
     /// Predicate for the **hand-specialised dispatch fingerprint**
@@ -210,6 +322,68 @@ fn compute_packing_masks(nvars: u32) -> ([u64; 4], [u64; 4]) {
     (overflow, flip)
 }
 
+/// Compute the per-bit `(variable, threshold)` mapping for the divmask.
+///
+/// Distributes [`DIVMASK_BITS`] (= 64) bits across `nvars` variables.
+/// Each variable gets `64 / nvars` bits; the remainder `64 % nvars`
+/// goes to the lowest-indexed variables.
+///
+/// Per-variable thresholds follow the geometric scale
+/// `0, 1, 2, 4, 8, 16, ...`:
+/// * bit 0 of variable `v` ⇔ `exp[v] > 0` (i.e. exp >= 1)
+/// * bit 1 ⇔ `exp[v] > 1` (i.e. exp >= 2)
+/// * bit 2 ⇔ `exp[v] > 2` (i.e. exp >= 3)
+/// * bit 3 ⇔ `exp[v] > 4` (i.e. exp >= 5)
+/// * bit `k` ⇔ `exp[v] > 2^(k-1)` for `k >= 1`
+///
+/// This is mathicgb's default (`DivMask::Calculator::rebuildDefault`,
+/// `~/mathic/src/mathic/DivMask.h:312-327`): coarse for low exponents
+/// (which dominate in typical bba intermediates), exponential for
+/// higher ones (so a single bit covers a wide range and false-positive
+/// rates stay bounded for outlier exponent values).
+///
+/// Returns `(vars, thresholds)` with length [`DIVMASK_BITS`]. Slots
+/// allocated to variable `v < nvars` set `vars[k] = v as u8`; any
+/// remaining slots (only when `nvars > DIVMASK_BITS`, which the
+/// constructor rejects) are filled with the sentinel `vars[k] = nvars
+/// as u8` so [`Ring::divmask_of`] skips them. With our `MAX_VARS = 31`
+/// constraint, every slot is allocated.
+fn compute_divmask_layout(
+    nvars: u32,
+) -> ([u8; DIVMASK_BITS as usize], [u32; DIVMASK_BITS as usize]) {
+    let mut vars = [0u8; DIVMASK_BITS as usize];
+    let mut thresholds = [0u32; DIVMASK_BITS as usize];
+
+    if nvars == 0 || nvars > DIVMASK_BITS {
+        // Caller should never reach here (Ring::new rejects). Fill
+        // sentinels and return.
+        for v in vars.iter_mut() {
+            *v = nvars as u8;
+        }
+        return (vars, thresholds);
+    }
+
+    let nvars_us = nvars as usize;
+    let bits_per_var_floor = DIVMASK_BITS as usize / nvars_us;
+    let extra = DIVMASK_BITS as usize % nvars_us;
+
+    let mut k: usize = 0;
+    for v in 0..nvars_us {
+        // Lower-indexed variables get one extra bit when the bit count
+        // doesn't divide evenly. (The order is irrelevant for
+        // correctness, but fixing it keeps the layout reproducible.)
+        let bits_for_v = bits_per_var_floor + if v < extra { 1 } else { 0 };
+        for j in 0..bits_for_v {
+            vars[k] = v as u8;
+            // Threshold scale: bit 0 → 0, bit 1 → 1, bit j → 2^(j-1).
+            thresholds[k] = if j == 0 { 0 } else { 1u32 << (j - 1) };
+            k += 1;
+        }
+    }
+    debug_assert_eq!(k, DIVMASK_BITS as usize);
+    (vars, thresholds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +435,85 @@ mod tests {
         let r = Ring::new(1, MonoOrder::DegRevLex, Field::new(2).unwrap()).unwrap();
         let ovf = r.overflow_mask();
         assert_eq!(ovf, &[0, 0, 0, 0x0080_0000_0000_0000]);
+    }
+
+    #[test]
+    fn divmask_layout_distributes_bits() {
+        // nvars = 1 → 64 bits all to var 0.
+        let r = Ring::new(1, MonoOrder::DegRevLex, Field::new(2).unwrap()).unwrap();
+        assert_eq!(r.divmask_bits_for_var(0), 64);
+        for k in 0..64usize {
+            assert_eq!(r.divmask_vars()[k], 0);
+        }
+        // First bit threshold 0; second 1; third 2; fourth 4; ...
+        assert_eq!(r.divmask_thresholds()[0], 0);
+        assert_eq!(r.divmask_thresholds()[1], 1);
+        assert_eq!(r.divmask_thresholds()[2], 2);
+        assert_eq!(r.divmask_thresholds()[3], 4);
+        assert_eq!(r.divmask_thresholds()[4], 8);
+
+        // nvars = 16 → 4 bits per var, even split.
+        let r = Ring::new(16, MonoOrder::DegRevLex, Field::new(2).unwrap()).unwrap();
+        for v in 0..16 {
+            assert_eq!(r.divmask_bits_for_var(v), 4, "var {v}");
+        }
+
+        // nvars = 31 → 2 bits per var × 31 = 62, with the 2 leftover
+        // bits going to the lowest-indexed two vars (so vars 0 and 1
+        // get 3 bits each, vars 2..=30 get 2 bits each).
+        let r = Ring::new(31, MonoOrder::DegRevLex, Field::new(2).unwrap()).unwrap();
+        assert_eq!(r.divmask_bits_for_var(0), 3);
+        assert_eq!(r.divmask_bits_for_var(1), 3);
+        for v in 2..31 {
+            assert_eq!(r.divmask_bits_for_var(v), 2, "var {v}");
+        }
+        // Total bits accounted for: 2*3 + 29*2 = 64.
+        let total: u32 = (0..31).map(|v| r.divmask_bits_for_var(v)).sum();
+        assert_eq!(total, 64);
+    }
+
+    #[test]
+    fn divmask_invariant_simple_examples() {
+        // nvars = 3, with thresholds spread per var.
+        // a = (1, 0, 0) divides b = (2, 1, 0). Verify the divmask
+        // invariant: (mask_a & !mask_b) == 0.
+        let f = Field::new(32003).unwrap();
+        let r = Ring::new(3, MonoOrder::DegRevLex, f).unwrap();
+        let a = Monomial::from_exponents(&r, &[1, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[2, 1, 0]).unwrap();
+        assert!(a.divides(&b, &r));
+        let ma = r.divmask_of(&a);
+        let mb = r.divmask_of(&b);
+        assert_eq!(ma & !mb, 0, "divmask invariant failed for a | b");
+
+        // Identity: 1 | anything → mask(1) = 0 ⊆ everything.
+        let one = Monomial::one(&r);
+        assert_eq!(r.divmask_of(&one), 0);
+
+        // Doubled exponents: a doubles in every var; (mask_a & !mask_b) == 0.
+        let a = Monomial::from_exponents(&r, &[3, 5, 7]).unwrap();
+        let b = Monomial::from_exponents(&r, &[6, 10, 14]).unwrap();
+        assert!(a.divides(&b, &r));
+        assert_eq!(r.divmask_of(&a) & !r.divmask_of(&b), 0);
+    }
+
+    #[test]
+    fn divmask_negative_examples() {
+        // Non-divisor: a = (5, 0, 0), b = (3, 0, 0). a does not divide b.
+        // We expect the divmask to detect this with high probability.
+        let f = Field::new(32003).unwrap();
+        let r = Ring::new(3, MonoOrder::DegRevLex, f).unwrap();
+        let a = Monomial::from_exponents(&r, &[5, 0, 0]).unwrap();
+        let b = Monomial::from_exponents(&r, &[3, 0, 0]).unwrap();
+        assert!(!a.divides(&b, &r));
+        // a's exp[0] = 5 > 4 sets bit "exp[0] > 4"; b's exp[0] = 3
+        // does not. So mask(a) has a bit not in mask(b).
+        let ma = r.divmask_of(&a);
+        let mb = r.divmask_of(&b);
+        assert_ne!(
+            ma & !mb,
+            0,
+            "divmask should reject a=(5,0,0) ∤ b=(3,0,0); mask_a = {ma:#x}, mask_b = {mb:#x}"
+        );
     }
 }

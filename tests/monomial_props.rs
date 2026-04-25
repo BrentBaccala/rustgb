@@ -137,6 +137,21 @@ proptest! {
         }
     }
 
+    /// Divmask fast-reject soundness (ADR-025): `a | b` implies every
+    /// bit set in `divmask(a)` is also set in `divmask(b)`. The
+    /// divisor sweep and chain criterion rely on the contrapositive
+    /// `(divmask(a) & ~divmask(b)) != 0 ⇒ a ∤ b` to reject
+    /// non-divisors cheaply; if this ever fails, the sweeps are
+    /// unsound. This is the property that the divmask layout
+    /// `compute_divmask_layout` is engineered to satisfy.
+    #[test]
+    fn divmask_prefilter_sound((r, a, b) in ring_mono2_strategy()) {
+        if a.divides(&b, &r) {
+            prop_assert_eq!(r.divmask_of(&a) & !r.divmask_of(&b), 0,
+                "a | b but divmask(a) has bits not in divmask(b)");
+        }
+    }
+
     #[test]
     fn cmp_is_total((r, a, b) in ring_mono2_strategy()) {
         let ord_ab = a.cmp(&b, &r);
@@ -174,5 +189,43 @@ proptest! {
             let q = b.div(&a, &r).unwrap();
             q.assert_canonical(&r);
         }
+    }
+}
+
+// Divmask invariant proptest at higher case count (4096) per ADR-025
+// task spec. The bit-layout is the load-bearing piece; we want a
+// thorough random-coverage sample.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// ADR-025 divmask invariant, restated for emphasis at 4×
+    /// case count. Generates random `(a, b)` pairs, conditions on
+    /// `a.divides(&b, ring)`, and asserts the bit-subset relation
+    /// on the divmasks.
+    #[test]
+    fn divmask_invariant_high_volume((r, a, b) in ring_mono2_strategy()) {
+        if a.divides(&b, &r) {
+            prop_assert_eq!(r.divmask_of(&a) & !r.divmask_of(&b), 0,
+                "a | b but divmask(a) has bits not in divmask(b); \
+                 a={:?} b={:?} mask_a={:#x} mask_b={:#x}",
+                a.exponents(&r), b.exponents(&r),
+                r.divmask_of(&a), r.divmask_of(&b));
+        }
+    }
+
+    /// Pairwise consistency: `divmask_of` over the multiplication of
+    /// two monomials must be a *superset* of each operand's mask.
+    /// This is implied by the divmask invariant (since `a` divides
+    /// `a*b` and `b` divides `a*b`), but worth checking directly.
+    #[test]
+    fn divmask_of_product_supersets_operands((r, a, b) in ring_mono2_strategy()) {
+        let ab = a.mul(&b, &r);
+        let ma = r.divmask_of(&a);
+        let mb = r.divmask_of(&b);
+        let mab = r.divmask_of(&ab);
+        prop_assert_eq!(ma & !mab, 0,
+            "mask(a) has bit not in mask(a*b)");
+        prop_assert_eq!(mb & !mab, 0,
+            "mask(b) has bit not in mask(a*b)");
     }
 }
