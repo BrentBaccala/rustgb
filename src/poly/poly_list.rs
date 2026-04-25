@@ -566,6 +566,11 @@ impl Poly {
     /// ADR-015 for the contract mapping. Both operands are consumed
     /// (ownership transfer enforces Singular's "Destroys: p, q"
     /// comment at the Rust type level).
+    ///
+    /// **ADR-023 dispatch.** Routes to
+    /// [`Self::add_consuming_zp_degrevlex_len4`] for the supported ring
+    /// fingerprint; otherwise falls through to the generic merge.
+    #[inline]
     pub fn add_consuming(self, other: Poly, ring: &Ring) -> Poly {
         if other.is_zero() {
             return self;
@@ -573,7 +578,28 @@ impl Poly {
         if self.is_zero() {
             return other;
         }
-        merge_consuming(ring, self, other, false)
+        if ring.is_zp_degrevlex() {
+            merge_consuming_zp_degrevlex_len4(ring, self, other, false)
+        } else {
+            merge_consuming(ring, self, other, false)
+        }
+    }
+
+    /// Hand-specialised destructive add for the rustgb-supported ring
+    /// fingerprint (ADR-023). Same surface contract as
+    /// [`Self::add_consuming`] but always takes the specialised path —
+    /// useful when the caller has already validated the ring and wants
+    /// to skip the dispatch branch.
+    #[inline]
+    pub fn add_consuming_zp_degrevlex_len4(self, other: Poly, ring: &Ring) -> Poly {
+        debug_assert!(ring.is_zp_degrevlex());
+        if other.is_zero() {
+            return self;
+        }
+        if self.is_zero() {
+            return other;
+        }
+        merge_consuming_zp_degrevlex_len4(ring, self, other, false)
     }
 
     /// Out-of-place subtraction.
@@ -831,13 +857,54 @@ impl Poly {
     /// Includes the tail-splice fast path: when `self` exhausts before
     /// `q`, the remainder of `-c * m * q` is produced in a single pass
     /// and appended, rather than going through the compare loop.
+    ///
+    /// **ADR-023 dispatch.** When the ring matches the hand-specialised
+    /// fingerprint (Z/p, degrevlex, ≤31 vars — see [`Ring::is_zp_degrevlex`]),
+    /// this routes to [`Self::sub_mm_mult_qq_consuming_zp_degrevlex_len4`],
+    /// the analogue of Singular's
+    /// `p_Minus_mm_Mult_qq__FieldZp_LengthFour_OrdRevDeg` template
+    /// instantiation. The `is_zp_degrevlex` predicate is constant for
+    /// the lifetime of a `bba()` call, so LLVM can hoist the dispatch
+    /// branch out of the merge loop.
+    #[inline]
     pub fn sub_mm_mult_qq_consuming(
+        self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+    ) -> Poly {
+        if ring.is_zp_degrevlex() {
+            self.sub_mm_mult_qq_consuming_zp_degrevlex_len4(c, m, q, ring)
+        } else {
+            self.sub_mm_mult_qq_consuming_generic(c, m, q, ring)
+        }
+    }
+
+    /// Hand-specialised inner reduction step for the rustgb-supported
+    /// ring fingerprint (Z/p, degrevlex, ≤31 vars; ADR-023). The body
+    /// is structurally identical to
+    /// [`Self::sub_mm_mult_qq_consuming_generic`], but the three hot
+    /// per-iter operations — `Monomial::mul`, `Monomial::cmp_degrevlex`,
+    /// and `Field::{mul,sub,neg}` — are all `#[inline(always)]` so LLVM
+    /// fuses them into one straight-line body inside the merge loop,
+    /// matching Singular's
+    /// `p_Minus_mm_Mult_qq__FieldZp_LengthFour_OrdRevDeg`
+    /// (`~/Singular/libpolys/polys/templates/p_Procs_Generate.cc`'s
+    /// length × ordering × field instantiation).
+    ///
+    /// **Future work** (out of scope for ADR-023): codegen-time macro
+    /// generation of these specialised bodies, mirroring Singular's
+    /// `p_Procs_Generate.cc` table-driven approach.
+    #[inline]
+    pub fn sub_mm_mult_qq_consuming_zp_degrevlex_len4(
         mut self,
         c: Coeff,
         m: &Monomial,
         q: &Poly,
         ring: &Ring,
     ) -> Poly {
+        debug_assert!(ring.is_zp_degrevlex());
         debug_assert!(c < ring.field().p());
         if c == 0 || q.is_zero() {
             return self;
@@ -957,6 +1024,123 @@ impl Poly {
         });
 
         // Move the chain out of the sentinel slot.
+        self.head = sentinel_slot.take();
+        self.len = out_len;
+        self.refresh_cache(ring);
+        self
+    }
+
+    /// Generic fallback for [`Self::sub_mm_mult_qq_consuming`] used when
+    /// the ring does **not** match the [`Ring::is_zp_degrevlex`]
+    /// fingerprint. ADR-023 keeps this body alive for any future ring
+    /// shape (alternate ordering, alternate field) that the dispatch
+    /// shim later admits. Today no such ring reaches this code in the
+    /// rustgb bba driver, so this fallback is dead but kept for
+    /// extensibility — matching Singular's
+    /// `p_Minus_mm_Mult_qq__General` instantiation, which is also
+    /// always linked but rarely selected on practical workloads.
+    ///
+    /// Structurally a verbatim copy of the specialised body (the
+    /// per-iter ops are the same `Monomial::mul`, `Monomial::cmp`,
+    /// `Field::*` calls); the only difference is the absence of the
+    /// `is_zp_degrevlex` debug-assert. If a divergence between the two
+    /// bodies appears, it is a bug — they must remain in lockstep.
+    pub fn sub_mm_mult_qq_consuming_generic(
+        mut self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+    ) -> Poly {
+        debug_assert!(c < ring.field().p());
+        if c == 0 || q.is_zero() {
+            return self;
+        }
+        let f = ring.field();
+
+        let mut sentinel_slot: Option<NonNull<Node>> = None;
+        let mut tail_slot: *mut Option<NonNull<Node>> = &mut sentinel_slot;
+        let mut out_len: usize = 0;
+
+        let mut left: Option<NonNull<Node>> = self.head.take();
+        let mut right: Option<NonNull<Node>> = q.head;
+
+        POOL.with(|pool_cell| {
+            let mut pool = pool_cell.borrow_mut();
+            // SAFETY: see the specialised version's SAFETY comment.
+            unsafe {
+                loop {
+                    let (l, r) = match (left, right) {
+                        (Some(l), Some(r)) => (l, r),
+                        _ => break,
+                    };
+                    let l_ref = l.as_ref();
+                    let r_ref = r.as_ref();
+                    let r_mono = m.mul(&r_ref.mono, ring);
+                    match l_ref.mono.cmp(&r_mono, ring) {
+                        std::cmp::Ordering::Greater => {
+                            let l_ptr = l.as_ptr();
+                            left = (*l_ptr).next.take();
+                            (*l_ptr).next = None;
+                            *tail_slot = Some(l);
+                            tail_slot = &mut (*l_ptr).next;
+                            out_len += 1;
+                        }
+                        std::cmp::Ordering::Less => {
+                            let neg = f.neg(f.mul(c, r_ref.coeff));
+                            right = r_ref.next;
+                            if neg != 0 {
+                                let fresh = pool.alloc(neg, r_mono, None);
+                                *tail_slot = Some(fresh);
+                                tail_slot = &mut (*fresh.as_ptr()).next;
+                                out_len += 1;
+                            }
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let cmq = f.mul(c, r_ref.coeff);
+                            let diff = f.sub(l_ref.coeff, cmq);
+                            right = r_ref.next;
+                            let l_ptr = l.as_ptr();
+                            left = (*l_ptr).next.take();
+                            if diff != 0 {
+                                (*l_ptr).coeff = diff;
+                                (*l_ptr).next = None;
+                                *tail_slot = Some(l);
+                                tail_slot = &mut (*l_ptr).next;
+                                out_len += 1;
+                            } else {
+                                pool.dealloc(l);
+                            }
+                        }
+                    }
+                }
+                if let Some(l_head) = left.take() {
+                    let mut remaining_len = 1usize;
+                    let mut node = l_head.as_ref().next;
+                    while let Some(x) = node {
+                        remaining_len += 1;
+                        node = x.as_ref().next;
+                    }
+                    *tail_slot = Some(l_head);
+                    out_len += remaining_len;
+                } else {
+                    while let Some(r) = right {
+                        let r_ref = r.as_ref();
+                        let neg = f.neg(f.mul(c, r_ref.coeff));
+                        right = r_ref.next;
+                        if neg == 0 {
+                            continue;
+                        }
+                        let prod_m = m.mul(&r_ref.mono, ring);
+                        let fresh = pool.alloc(neg, prod_m, None);
+                        *tail_slot = Some(fresh);
+                        tail_slot = &mut (*fresh.as_ptr()).next;
+                        out_len += 1;
+                    }
+                }
+            }
+        });
+
         self.head = sentinel_slot.take();
         self.len = out_len;
         self.refresh_cache(ring);
@@ -1101,6 +1285,134 @@ impl PartialEq for Poly {
 }
 impl Eq for Poly {}
 
+/// Hand-specialised destructive merge for the rustgb-supported ring
+/// fingerprint (Z/p, degrevlex, ≤31 vars; ADR-023). Body is
+/// structurally identical to [`merge_consuming`], but with the
+/// `is_zp_degrevlex` debug-assert and an explicit `#[inline]` so the
+/// per-iter `Monomial::cmp` and `Field::*` calls (themselves
+/// `#[inline(always)]`) inline cleanly into the merge loop, matching
+/// Singular's `p_Add_q__FieldZp_LengthFour_OrdRevDeg` template
+/// instantiation.
+#[inline]
+fn merge_consuming_zp_degrevlex_len4(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
+    debug_assert!(ring.is_zp_degrevlex());
+    debug_assert!(!a.is_zero());
+    debug_assert!(!b.is_zero());
+    let f = ring.field();
+
+    let mut sentinel_slot: Option<NonNull<Node>> = None;
+    let mut tail_slot: *mut Option<NonNull<Node>> = &mut sentinel_slot;
+    let mut out_len: usize = 0;
+
+    let mut a = a;
+    let mut b = b;
+    let mut left: Option<NonNull<Node>> = a.head.take();
+    let mut right: Option<NonNull<Node>> = b.head.take();
+
+    POOL.with(|pool_cell| {
+        let mut pool = pool_cell.borrow_mut();
+        // SAFETY: see `merge_consuming`'s SAFETY comment — the argument
+        // is identical here.
+        unsafe {
+            loop {
+                let (l, r) = match (left, right) {
+                    (Some(l), Some(r)) => (l, r),
+                    _ => break,
+                };
+                let l_ref = l.as_ref();
+                let r_ref = r.as_ref();
+                match l_ref.mono.cmp(&r_ref.mono, ring) {
+                    std::cmp::Ordering::Greater => {
+                        let l_ptr = l.as_ptr();
+                        left = (*l_ptr).next.take();
+                        (*l_ptr).next = None;
+                        *tail_slot = Some(l);
+                        tail_slot = &mut (*l_ptr).next;
+                        out_len += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        let r_ptr = r.as_ptr();
+                        right = (*r_ptr).next.take();
+                        (*r_ptr).next = None;
+                        if subtract {
+                            (*r_ptr).coeff = f.neg((*r_ptr).coeff);
+                        }
+                        *tail_slot = Some(r);
+                        tail_slot = &mut (*r_ptr).next;
+                        out_len += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let bc = if subtract {
+                            f.neg(r_ref.coeff)
+                        } else {
+                            r_ref.coeff
+                        };
+                        let s = f.add(l_ref.coeff, bc);
+                        let l_ptr = l.as_ptr();
+                        let r_ptr = r.as_ptr();
+                        left = (*l_ptr).next.take();
+                        right = (*r_ptr).next.take();
+                        if s != 0 {
+                            (*l_ptr).coeff = s;
+                            (*l_ptr).next = None;
+                            *tail_slot = Some(l);
+                            tail_slot = &mut (*l_ptr).next;
+                            out_len += 1;
+                            pool.dealloc(r);
+                        } else {
+                            pool.dealloc(l);
+                            pool.dealloc(r);
+                        }
+                    }
+                }
+            }
+
+            if let Some(l_head) = left.take() {
+                let mut remaining_len = 1usize;
+                let mut node = l_head.as_ref().next;
+                while let Some(x) = node {
+                    remaining_len += 1;
+                    node = x.as_ref().next;
+                }
+                *tail_slot = Some(l_head);
+                out_len += remaining_len;
+            } else if let Some(r_head) = right.take() {
+                if subtract {
+                    let mut cur: Option<NonNull<Node>> = Some(r_head);
+                    while let Some(n) = cur {
+                        let n_ptr = n.as_ptr();
+                        let nxt = (*n_ptr).next.take();
+                        (*n_ptr).coeff = f.neg((*n_ptr).coeff);
+                        *tail_slot = Some(n);
+                        tail_slot = &mut (*n_ptr).next;
+                        out_len += 1;
+                        cur = nxt;
+                    }
+                } else {
+                    let mut remaining_len = 1usize;
+                    let mut node = r_head.as_ref().next;
+                    while let Some(x) = node {
+                        remaining_len += 1;
+                        node = x.as_ref().next;
+                    }
+                    *tail_slot = Some(r_head);
+                    out_len += remaining_len;
+                }
+            }
+        }
+    });
+
+    let mut out = Poly {
+        head: sentinel_slot.take(),
+        len: out_len,
+        lm_sev: 0,
+        lm_coeff: 0,
+        lm_deg: 0,
+    };
+    out.refresh_cache(ring);
+    out
+}
+
 /// Destructive merge: walk both chains, splicing input nodes
 /// directly into the output chain rather than allocating fresh
 /// ones. Mirrors Singular's `p_Add_q` node-splice pattern (see
@@ -1110,6 +1422,12 @@ impl Eq for Poly {}
 /// coefficients.
 ///
 /// Both inputs must be nonempty (callers guard zero operands).
+///
+/// Generic fallback for the ADR-023 dispatch — used when the ring
+/// does not match the [`Ring::is_zp_degrevlex`] fingerprint. Today no
+/// such ring reaches the bba driver, so this body is dead but kept
+/// for extensibility (analogous to Singular's `p_Add_q__General`
+/// instantiation).
 fn merge_consuming(ring: &Ring, a: Poly, b: Poly, subtract: bool) -> Poly {
     debug_assert!(!a.is_zero());
     debug_assert!(!b.is_zero());

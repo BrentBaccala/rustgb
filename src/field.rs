@@ -76,7 +76,12 @@ impl Field {
     }
 
     /// Addition in Z/pZ. Inputs must already be reduced (`< p`).
-    #[inline]
+    ///
+    /// `#[inline(always)]` (ADR-023): this function is on the
+    /// merge-loop hot path of the linked-list backend's
+    /// `merge_consuming_zp_degrevlex_len4`. Forcing the inline gives
+    /// LLVM full visibility of `self.p` and the branch's directionality.
+    #[inline(always)]
     pub fn add(&self, a: Coeff, b: Coeff) -> Coeff {
         debug_assert!(a < self.p && b < self.p);
         let s = a as u64 + b as u64;
@@ -88,14 +93,18 @@ impl Field {
     }
 
     /// Subtraction in Z/pZ. Inputs must already be reduced.
-    #[inline]
+    ///
+    /// `#[inline(always)]` (ADR-023): see `add`'s rationale.
+    #[inline(always)]
     pub fn sub(&self, a: Coeff, b: Coeff) -> Coeff {
         debug_assert!(a < self.p && b < self.p);
         if a >= b { a - b } else { a + self.p - b }
     }
 
     /// Negation in Z/pZ. Input must be reduced.
-    #[inline]
+    ///
+    /// `#[inline(always)]` (ADR-023): see `add`'s rationale.
+    #[inline(always)]
     pub fn neg(&self, a: Coeff) -> Coeff {
         debug_assert!(a < self.p);
         if a == 0 { 0 } else { self.p - a }
@@ -103,7 +112,12 @@ impl Field {
 
     /// Multiplication in Z/pZ via Barrett reduction. Inputs must be
     /// reduced (`< p < 2^31`), so the product fits in `u64`.
-    #[inline]
+    ///
+    /// `#[inline(always)]` (ADR-023): the Barrett-reduce body is the
+    /// inner-loop coefficient op of the bba reducer. Forcing the
+    /// inline keeps `self.barrett_mu` and `self.p` in registers across
+    /// successive iterations of the merge loop.
+    #[inline(always)]
     pub fn mul(&self, a: Coeff, b: Coeff) -> Coeff {
         debug_assert!(a < self.p && b < self.p);
         // prod < 2^62 since a, b < 2^31.

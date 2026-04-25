@@ -146,6 +146,40 @@ impl Ring {
     pub fn cmp_flip_mask(&self) -> &[u64; 4] {
         &self.cmp_flip_mask
     }
+
+    /// Predicate for the **hand-specialised dispatch fingerprint**
+    /// (ADR-023): characteristic Z/p (always true today since [`Field`]
+    /// only models Z/pZ), monomial ordering [`MonoOrder::DegRevLex`],
+    /// and `nvars ≤ MAX_VARS` (= 31, the WORDS_PER_MONO=4 length-4
+    /// packing limit). When this predicate returns `true`, the
+    /// `Poly::*_zp_degrevlex_len4` specialisations may be used in
+    /// place of the generic implementations.
+    ///
+    /// The check is constant-foldable in practice: a `Ring` is built
+    /// once at FFI boundary and the answer is invariant for the
+    /// lifetime of a `bba()` call. LLVM tends to hoist the dispatch
+    /// branch out of the inner loop entirely once the caller's
+    /// `&Ring` parameter is realised.
+    ///
+    /// Mirrors Singular's per-ring procs-table lookup: at `rComplete`
+    /// time Singular picks the single
+    /// `p_Minus_mm_Mult_qq__FieldZp_LengthFour_OrdRevDeg`
+    /// instantiation and stamps a function pointer; rustgb does the
+    /// same selection inline, with the predicate as the compile-time
+    /// gate.
+    #[inline]
+    pub fn is_zp_degrevlex(&self) -> bool {
+        // `MonoOrder::DegRevLex` is the only variant; the match folds
+        // to a constant. `Field` only models Z/pZ today, so the
+        // characteristic check is trivially true. The `nvars` bound
+        // is enforced at construction (`Ring::new` rejects nvars >
+        // MAX_VARS), so this also folds to true. Kept as an explicit
+        // method so future variants (e.g. a different ordering) must
+        // consciously update the dispatch fingerprint.
+        match self.ordering {
+            MonoOrder::DegRevLex => self.nvars <= MAX_VARS,
+        }
+    }
 }
 
 impl PartialEq for Ring {

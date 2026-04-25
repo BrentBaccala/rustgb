@@ -267,6 +267,13 @@ impl Monomial {
     /// result — ADR-020 drops the separate u32 total-degree cache,
     /// so total degree is read back out of the top byte of
     /// `packed[3]`.
+    ///
+    /// `#[inline(always)]` (ADR-023): on the hand-specialised merge
+    /// path, `m * q[i]` is computed inside the inner loop. Forcing
+    /// the inline keeps the SIMD `vpaddq` result threading directly
+    /// into the cmp's word loads (no spill to memory) — observed in
+    /// the post-ADR-022 disassembly capture.
+    #[inline(always)]
     pub fn mul(&self, other: &Self, ring: &Ring) -> Self {
         // The explicit unroll below assumes exactly four words; if
         // WORDS_PER_MONO ever changes, update the literal.
