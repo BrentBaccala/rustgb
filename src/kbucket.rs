@@ -348,8 +348,19 @@ impl KBucket {
         // slots matching `best`), and `matching` (slot indices whose
         // leaders equal the running maximum). On encountering a new
         // strictly-larger leader we reset total_c and matching.
+        //
+        // Per Singular's `p_kBucketSetLm__T`, each slot's leading
+        // monomial is looked up exactly once per scan iteration by
+        // hoisting it outside the cmp. We cache `best_m` (a raw
+        // pointer to the current running-best leader monomial) so
+        // the inner compare doesn't re-borrow `self.slots[j]` on
+        // every loop iteration. The raw pointer is safe: the slots
+        // array is not mutated during the scan, and any reborrow
+        // that would invalidate the pointer happens only outside
+        // the scan body (between iterations of the outer `loop`).
         loop {
             let mut best: Option<usize> = None;
+            let mut best_m: *const Monomial = std::ptr::null();
             let mut total_c: Coeff = 0;
             let mut matching_mask: u32 = 0;
             for (i, slot) in self.slots.iter().enumerate() {
@@ -361,14 +372,22 @@ impl KBucket {
                 match best {
                     None => {
                         best = Some(i);
+                        best_m = m_i as *const Monomial;
                         total_c = c_i;
                         matching_mask = 1u32 << i;
                     }
-                    Some(j) => {
-                        let (_, mj) = self.slots[j].as_ref().unwrap().leading().unwrap();
+                    Some(_) => {
+                        // SAFETY: `best_m` was set from a previous
+                        // iteration's `p.leading()` where `p` is
+                        // `self.slots[best].as_ref().unwrap()`. The
+                        // slots array is untouched across iterations
+                        // of this `for` loop, so the pointee is still
+                        // live.
+                        let mj = unsafe { &*best_m };
                         match m_i.cmp(mj, &self.ring) {
                             std::cmp::Ordering::Greater => {
                                 best = Some(i);
+                                best_m = m_i as *const Monomial;
                                 total_c = c_i;
                                 matching_mask = 1u32 << i;
                             }
