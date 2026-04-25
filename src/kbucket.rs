@@ -134,9 +134,21 @@ pub struct KBucket {
     /// Exponentially-sized slots; `slots[i]` holds polys of length
     /// `≤ 4^i`. `None` means the slot is empty.
     slots: [Option<Poly>; NUM_SLOTS],
-    /// Cached leading term: `(coeff, monomial, slot_index)`. The
-    /// `slot_index` is which slot currently owns the leading term.
-    lm_cache: Option<(Coeff, Monomial, usize)>,
+    /// Cached leading term: `(coeff, monomial, slot_index,
+    /// matching_mask)`. The `slot_index` is the index of one slot
+    /// owning a copy of the leading monomial; `matching_mask` is
+    /// the bitmask of *all* slots whose leader equals
+    /// `monomial`. The leading coefficient `coeff` is the sum of
+    /// those slots' leading coefficients (mod p).
+    ///
+    /// `matching_mask` lets `mark_dirty` decide cheaply whether a
+    /// touched slot might invalidate the cache: a modification to
+    /// a slot in `matching_mask` is always invalidating; a
+    /// modification to a slot *not* in `matching_mask` whose new
+    /// leader is strictly less than the cached `monomial` cannot
+    /// affect the bucket's leading term and may preserve the
+    /// cache. See ADR-021.
+    lm_cache: Option<(Coeff, Monomial, usize, u32)>,
     /// Bitmask of slots changed since the last `leading()` call.
     /// Bit `i` (i < `NUM_SLOTS`) corresponds to slot `i`.
     dirty: u32,
@@ -166,8 +178,10 @@ impl KBucket {
         if !p.is_zero() {
             let i = slot_for_len(p.len());
             debug_assert!(i < NUM_SLOTS);
+            // Cache is empty, so the new_lm Some/None choice is
+            // moot — pass None for clarity.
             b.slots[i] = Some(p);
-            b.mark_dirty(i);
+            b.mark_dirty(i, None);
         }
         b
     }
@@ -190,9 +204,78 @@ impl KBucket {
 
     // ----- Mutation -----
 
-    fn mark_dirty(&mut self, slot: usize) {
+    /// Mark a slot as dirty (its content may have changed since the
+    /// cache was last computed) and decide whether the leading-term
+    /// cache survives.
+    ///
+    /// `new_lm` is the new leading monomial of the slot's poly, if
+    /// known. When supplied:
+    ///
+    /// * If `slot` is in the cached `matching_mask` (i.e. the slot
+    ///   was contributing to the cached leader), the cache is
+    ///   invalidated unconditionally — its `coeff` is no longer
+    ///   correct and `new_lm` may be smaller than the previous
+    ///   contribution.
+    /// * If `slot` is *not* in `matching_mask` and `new_lm` is
+    ///   strictly less than the cached monomial, the cached leader
+    ///   still dominates and the cache is preserved (we still set
+    ///   the dirty bit so a future `leading()` re-scan would pick
+    ///   up the change — but per the bba pattern that re-scan
+    ///   happens after the cached leader is consumed).
+    /// * Otherwise (no `new_lm`, or `new_lm >= cached`), invalidate.
+    ///
+    /// When `new_lm` is `None` (e.g. the slot was emptied by
+    /// cancellation), invalidate.
+    ///
+    /// See ADR-021 for the algorithmic justification.
+    fn mark_dirty(&mut self, slot: usize, new_lm: Option<&Monomial>) {
         debug_assert!(slot < NUM_SLOTS);
         self.dirty |= 1u32 << slot;
+        if let (Some(new_lm), Some((_, cached_m, _, matching_mask))) =
+            (new_lm, self.lm_cache.as_ref())
+        {
+            // Cached slot was contributing → invalidate.
+            if matching_mask & (1u32 << slot) != 0 {
+                self.lm_cache = None;
+                return;
+            }
+            // Otherwise cache survives only if new_lm is strictly
+            // less than the cached monomial.
+            if new_lm.cmp(cached_m, &self.ring) == std::cmp::Ordering::Less {
+                // Cache valid: preserve it. Note we still set the
+                // dirty bit above; that's intentional — we want
+                // `leading()` to re-validate in case multiple
+                // mark_dirty calls accumulate (the cache check
+                // happens only when dirty == 0 anyway, but
+                // preserving lm_cache here means the *next* call
+                // to leading() finds a populated cache to compare
+                // against during scan — see also extract_leading,
+                // which clears the cache when it pops the leader).
+                //
+                // Actually we want the fast path: clear `dirty`'s
+                // bit for this slot only if the cache is still
+                // authoritative. But a stale `dirty` bit is fine
+                // — `leading()` rescans on dirty != 0 and the
+                // resulting cache equals the prior one. The win is
+                // that we don't lose the cache between calls when
+                // `leading()` was already up-to-date and the next
+                // mutation is a small absorb.
+                //
+                // To get the fast path on a subsequent
+                // `leading()` call, we need `dirty == 0`. Since we
+                // just set the slot bit, clear it — the cache is
+                // semantically still valid even though slot was
+                // touched. (`dirty` mirrors "since last leading()
+                // call has anything plausibly changed?"; we just
+                // proved nothing leader-relevant did.)
+                self.dirty &= !(1u32 << slot);
+                return;
+            }
+            // new_lm >= cached: invalidate.
+            self.lm_cache = None;
+            return;
+        }
+        // No new_lm or no cache: invalidate (pre-task-556 behaviour).
         self.lm_cache = None;
     }
 
@@ -212,8 +295,13 @@ impl KBucket {
         loop {
             match self.slots[i].take() {
                 None => {
+                    // Empty slot — q lands here. Its leader is the
+                    // new slot's leader; tell mark_dirty so the
+                    // cache may survive when q's leader is below
+                    // the cached one.
+                    let q_lm = q.leading().map(|(_, m)| m.clone());
                     self.slots[i] = Some(q);
-                    self.mark_dirty(i);
+                    self.mark_dirty(i, q_lm.as_ref());
                     return;
                 }
                 Some(existing) => {
@@ -225,14 +313,18 @@ impl KBucket {
                     // output term (ADR-015). On the Vec backend
                     // `add_consuming` is a thin forwarder to `add`.
                     let merged = existing.add_consuming(q, &self.ring);
-                    self.mark_dirty(i);
                     if merged.is_zero() {
-                        // Accumulated sum cancelled; nothing to place.
+                        // Accumulated sum cancelled; nothing to
+                        // place. The slot was emptied — pass None
+                        // so mark_dirty invalidates conservatively.
+                        self.mark_dirty(i, None);
                         return;
                     }
                     let target = slot_for_len(merged.len());
                     if target == i {
+                        let merged_lm = merged.leading().map(|(_, m)| m.clone());
                         self.slots[i] = Some(merged);
+                        self.mark_dirty(i, merged_lm.as_ref());
                         return;
                     }
                     debug_assert!(
@@ -245,6 +337,10 @@ impl KBucket {
                         merged.len(),
                         NUM_SLOTS - 1
                     );
+                    // Slot i was just emptied (its prior content
+                    // moved into `merged`). Mark it dirty with no
+                    // new leader.
+                    self.mark_dirty(i, None);
                     q = merged;
                     i = target;
                 }
@@ -292,14 +388,19 @@ impl KBucket {
         // do not check. Debug builds catch violations inside
         // `Monomial::mul` via `debug_assert!`.
         let merged = existing.sub_mm_mult_qq_consuming(c, m, p, &self.ring);
-        self.mark_dirty(i);
         if merged.is_zero() {
             // Sum cancelled at this slot; no further work.
+            self.mark_dirty(i, None);
             return;
         }
         let target = slot_for_len(merged.len());
         if target == i {
+            // The merged poly stays in slot i; pass its leader so
+            // mark_dirty can preserve the cache when the new
+            // leader is below the cached one.
+            let merged_lm = merged.leading().map(|(_, m)| m.clone());
             self.slots[i] = Some(merged);
+            self.mark_dirty(i, merged_lm.as_ref());
             return;
         }
         // `merged` outgrew slot `i`; cascade through `absorb`. The
@@ -310,6 +411,11 @@ impl KBucket {
             target > i,
             "sub_mm_mult_qq shrank into smaller slot ({target} < {i})"
         );
+        // Slot i is now empty (its content went into `merged`).
+        // The cascade in absorb() will mark slots dirty as it
+        // proceeds; we just need to invalidate slot i's stale
+        // dirty/cache state.
+        self.mark_dirty(i, None);
         self.absorb(merged);
     }
 
@@ -332,7 +438,7 @@ impl KBucket {
     /// To actually pop the leader, use [`extract_leading`](Self::extract_leading).
     pub fn leading(&mut self) -> Option<(Coeff, &Monomial)> {
         if self.dirty == 0
-            && let Some((c, ref m, _)) = self.lm_cache
+            && let Some((c, ref m, _, _)) = self.lm_cache
         {
             return Some((c, m));
         }
@@ -439,8 +545,8 @@ impl KBucket {
                 // scan/rescan pattern that cloned up front.
                 let lead_m = self.slots[best_slot].as_ref().unwrap()
                     .leading().unwrap().1.clone();
-                self.lm_cache = Some((total_c, lead_m, best_slot));
-                let (c, m, _) = self.lm_cache.as_ref().unwrap();
+                self.lm_cache = Some((total_c, lead_m, best_slot, matching_mask));
+                let (c, m, _, _) = self.lm_cache.as_ref().unwrap();
                 return Some((*c, m));
             }
 
@@ -554,7 +660,7 @@ impl KBucket {
                 "slot {i} holds a zero-length poly; should be None"
             );
         }
-        if let Some((c, m, slot)) = &self.lm_cache {
+        if let Some((c, m, slot, matching_mask)) = &self.lm_cache {
             assert_ne!(*c, 0, "cached leading coeff must be nonzero");
             // The cached slot's leader should share the cached m
             // (the slot's leader monomial == m). We don't verify the
@@ -570,6 +676,26 @@ impl KBucket {
                 sm.cmp(m, &self.ring).is_eq(),
                 "lm_cache monomial disagrees with its slot's leader"
             );
+            // matching_mask: every slot whose bit is set must be
+            // non-empty and have a leader equal to `m`. The slot
+            // we recorded must be in the mask.
+            assert!(
+                matching_mask & (1u32 << *slot) != 0,
+                "lm_cache: cached slot {slot} not present in matching_mask"
+            );
+            for i in 0..NUM_SLOTS {
+                if matching_mask & (1u32 << i) == 0 {
+                    continue;
+                }
+                let mp = self.slots[i].as_ref().expect(
+                    "lm_cache: slot in matching_mask must be populated",
+                );
+                let (_, mi) = mp.leading().unwrap();
+                assert!(
+                    mi.cmp(m, &self.ring).is_eq(),
+                    "lm_cache: matching_mask slot {i} leader != cached"
+                );
+            }
         }
     }
 }
@@ -699,6 +825,80 @@ mod tests {
         // Another op dirties again.
         b.minus_m_mult_p(&m, 1, &q);
         assert_ne!(b.dirty, 0);
+    }
+
+    /// ADR-021: a mark_dirty triggered by an absorb into an empty
+    /// slot (separate from the cached slot) whose new leader is
+    /// strictly less than the cached one must preserve the cache.
+    ///
+    /// We construct a bucket whose cached leader lives in some
+    /// slot, then call `minus_m_mult_p` with a `p` that lands in a
+    /// *different* (empty) slot and whose product leader is below
+    /// the cached leader. The cache must survive.
+    #[test]
+    fn mark_dirty_preserves_cache_when_new_lm_is_smaller() {
+        let r = mk_ring(3, 13);
+        // Build a bucket whose leader lives in slot 1 (length 4):
+        // x^3 + x^2 + x + z. The leader is x^3.
+        let big = Poly::from_terms(
+            &r,
+            vec![
+                (2, mono(&r, &[3, 0, 0])),
+                (1, mono(&r, &[2, 0, 0])),
+                (1, mono(&r, &[1, 0, 0])),
+                (1, mono(&r, &[0, 0, 1])),
+            ],
+        );
+        let mut b = KBucket::from_poly(Arc::clone(&r), big);
+        let _ = b.leading();
+        assert_eq!(b.dirty, 0);
+        assert!(b.lm_cache.is_some());
+        let cached_slot = b.lm_cache.as_ref().unwrap().2;
+
+        // Now we want to add to a slot != cached_slot. Use a
+        // poly of length 1 (lands in slot 0) whose leader is z
+        // (less than x^3).
+        let small = Poly::from_terms(&r, vec![(1, mono(&r, &[0, 0, 1]))]);
+        b.minus_m_mult_p(&Monomial::one(&r), 1, &small);
+        // The op went into slot 0 (length 1 → slot 0); cached
+        // slot is 1. We expect the cache to survive.
+        assert_ne!(cached_slot, 0, "test setup: cached slot must be != 0");
+        assert!(
+            b.lm_cache.is_some(),
+            "cache must survive an absorb to a different slot below cached leader"
+        );
+        // The leader of the bucket is unchanged.
+        let (c1, m1) = b.leading().unwrap();
+        assert_eq!(c1, 2);
+        assert_eq!(*m1, mono(&r, &[3, 0, 0]));
+    }
+
+    /// ADR-021: a mark_dirty whose new leader equals the cached
+    /// one must invalidate (the contributing coefficient sum may
+    /// have changed). Add a cancelling small term to a slot with
+    /// the same leader — the cache must be rebuilt.
+    #[test]
+    fn mark_dirty_invalidates_when_new_lm_equals_cached() {
+        let r = mk_ring(3, 13);
+        let p = Poly::from_terms(
+            &r,
+            vec![(3, mono(&r, &[2, 0, 0])), (1, mono(&r, &[0, 0, 1]))],
+        );
+        let mut b = KBucket::from_poly(Arc::clone(&r), p);
+        let _ = b.leading();
+        assert_eq!(b.dirty, 0);
+        // Now do a minus_m_mult_p that produces same leader. We
+        // give an op that adds 2*x^2 to the slot — the slot's
+        // leader is still x^2 but the contributing coefficient
+        // changes (3 -> 5).
+        let q = Poly::from_terms(&r, vec![(2, mono(&r, &[2, 0, 0]))]);
+        // We want +q, which is -(-1)*1*q.
+        let neg_one = r.field().neg(1);
+        b.minus_m_mult_p(&Monomial::one(&r), neg_one, &q);
+        // Probe the leader; coeff should be the new sum 5.
+        let (c, m) = b.leading().unwrap();
+        assert_eq!(*m, mono(&r, &[2, 0, 0]));
+        assert_eq!(c, 5);
     }
 
     #[test]
