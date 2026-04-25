@@ -377,6 +377,12 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
         return;
     };
 
+    // ADR-024: per-step redTail. Reduce `h`'s tail against the
+    // current basis before insertion. We hold `insert_mutex` here,
+    // so the basis is stable. The leading term is preserved
+    // verbatim, so the result is never zero.
+    let h = reduce_h_tail_parallel(comp, h);
+
     let h_arc = Arc::new(h);
     // Allocate arrival for the basis element itself (though SBasis
     // doesn't store a poly-level arrival tied to pair arrivals;
@@ -500,7 +506,6 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
 /// Compiled to a pass-through identity when the `redtail` Cargo
 /// feature is disabled.
 #[cfg(feature = "redtail")]
-#[allow(dead_code)] // wired into insert_and_enterpairs in the next commit
 fn reduce_h_tail_parallel(comp: &Computation, h: Poly) -> Poly {
     if h.len() <= 1 {
         return h;
@@ -538,7 +543,6 @@ fn reduce_h_tail_parallel(comp: &Computation, h: Poly) -> Poly {
 
 #[cfg(not(feature = "redtail"))]
 #[inline(always)]
-#[allow(dead_code)] // wired into insert_and_enterpairs in the next commit
 fn reduce_h_tail_parallel(_comp: &Computation, h: Poly) -> Poly {
     h
 }

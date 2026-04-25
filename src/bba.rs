@@ -112,6 +112,12 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
             .into_poly()
             .monic(&ring)
             .expect("nonzero poly has invertible lc");
+        // ADR-024: per-step redTail reduction. Reduce `h`'s tail
+        // against the current basis before inserting, so `h` is in
+        // its (relative) reduced shape from the moment it becomes a
+        // reducer. Compiled to a pass-through identity under
+        // `--no-default-features` (feature `redtail` off).
+        let h = reduce_h_tail(h, &s_basis, &ring);
         next_arrival = insert_and_generate_pairs_with_sugar(
             &ring,
             &mut s_basis,
@@ -148,6 +154,8 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
             .into_poly()
             .monic(&ring)
             .expect("nonzero lobject has invertible lc");
+        // ADR-024: per-step redTail. See note above in the seed loop.
+        let h = reduce_h_tail(h, &s_basis, &ring);
         next_arrival = insert_and_generate_pairs_with_sugar(
             &ring,
             &mut s_basis,
@@ -160,6 +168,16 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
 
     // Tail-reduce every surviving basis element against the rest of
     // the basis to obtain the unique reduced GB.
+    //
+    // ADR-024: with the `redtail` feature ON (default), each basis
+    // element's tail is already reduced against the basis at the
+    // time it was inserted. Later insertions can still introduce
+    // new divisors that weren't present at insertion time, so the
+    // post-hoc pass remains necessary to guarantee **the** reduced
+    // GB. With the feature OFF, this pass is the only tail
+    // reduction in the pipeline. Either way, the post-hoc pass is
+    // idempotent on already-tail-reduced input, so leaving it in
+    // costs at most one O(basis_size × tail_size) scan.
     tail_reduce_all(&mut s_basis, &ring);
 
     // Extract the surviving (non-redundant) polynomials, canonically
@@ -437,7 +455,6 @@ use crate::simd::find_sev_match;
 /// feature is disabled, so the optional toggle is a clean A/B with
 /// the post-hoc-only path.
 #[cfg(feature = "redtail")]
-#[allow(dead_code)] // wired into compute_gb_serial in the next commit
 fn reduce_h_tail(h: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
     if h.len() <= 1 {
         // Single-term poly: no tail to reduce.
@@ -460,7 +477,6 @@ fn reduce_h_tail(h: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
 
 #[cfg(not(feature = "redtail"))]
 #[inline(always)]
-#[allow(dead_code)] // wired into compute_gb_serial in the next commit
 fn reduce_h_tail(h: Poly, _s_basis: &SBasis, _ring: &Arc<Ring>) -> Poly {
     h
 }
