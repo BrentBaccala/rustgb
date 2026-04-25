@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 68100aab1d46426ac7951ca82b3d0739da3e8166a710dbe3be23700fd6060bc8 # shrinks to (r, a, b) = (Ring { nvars: 8, ordering: DegRevLex, field: Field { p: 32003, barrett_mu: 144101678543492 }, overflow_mask: [0, 0, 9223372036854775808, 36170086419038336], cmp_flip_mask: [0, 0, 9151314442816847872, 35887507618889599] }, Monomial { packed: [0, 0, 0, 7714971894823781389], component: 0 }, Monomial { packed: [0, 0, 1369094286720630784, 10743356796859518744], component: 0 })

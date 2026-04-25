@@ -110,8 +110,13 @@ proptest! {
 
     #[test]
     fn total_deg_is_sum((r, a, b) in ring_mono2_strategy()) {
+        // ADR-020: total_deg is the byte cap (saturates at 255).
+        // The sum rule holds exactly when the result doesn't
+        // saturate; above 255 the product's cap reads 255.
         let ab = a.mul(&b, &r);
-        prop_assert_eq!(ab.total_deg(), a.total_deg() + b.total_deg());
+        let raw_sum = a.total_deg() + b.total_deg();
+        let expected = raw_sum.min(255);
+        prop_assert_eq!(ab.total_deg(), expected);
     }
 
     #[test]

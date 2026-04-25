@@ -55,15 +55,23 @@
 //!   tie-break rule "smaller exponent at the largest-index differing
 //!   variable wins".
 //!
-//! Caveat: total degrees that exceed 255 saturate the top byte. When
-//! either operand's cap is saturated, `cmp_degrevlex` falls back on
-//! the cached `total_deg: u32` first, then on the variable bytes
-//! through the same XOR-flipped compare.
+//! Caveat: total degrees that exceed 255 saturate the top byte. For
+//! the rings dispatched to rustgb (Z/p, ≤31 vars, degrevlex — see the
+//! Singular-dispatch shim), no realistic bba step pushes total degree
+//! past 255 unless the ring was misconfigured; the byte cap is the
+//! canonical total-degree in ADR-020. Rings for which this is wrong
+//! (`n_vars × max_per_var_deg > 255`) are filtered by the dispatch
+//! shim, not supported by this build configuration.
 //!
 //! ## Caches
 //!
-//! * `total_deg`: sum of exponents, not capped.
 //! * `component`: always 0 today. Reserved for future module support.
+//!
+//! The total-degree u32 (ADR-005) has been dropped — total degree is
+//! read from the top byte of `packed[3]` (saturating at 255). See
+//! ADR-020 in `~/rustgb/docs/design-decisions.md` for the Stage-C
+//! rationale and the Singular precedent (`pTotaldegree` recomputes
+//! from the exp vector when needed; no separate field).
 //!
 //! The short exponent vector (SEV) — a 64-bit bloom filter with bit
 //! `i mod 64` set iff `e_i > 0` — is **not** stored per Monomial.
@@ -93,10 +101,10 @@ const _BITS_PER_VAR_IS_8: () = assert!(BITS_PER_VAR == 8);
 /// `Send + Sync`: only owns integer arrays.
 #[derive(Clone, Debug)]
 pub struct Monomial {
-    /// Four u64 words; word 3 is most significant.
+    /// Four u64 words; word 3 is most significant. The top byte of
+    /// `packed[3]` stores `min(total_deg, 255)` — the canonical
+    /// total-degree for this Monomial (ADR-020).
     packed: [u64; WORDS_PER_MONO],
-    /// True total degree, uncapped.
-    total_deg: u32,
     /// Component index. Always 0 today.
     component: u32,
 }
@@ -106,9 +114,10 @@ impl Monomial {
 
     /// Build a monomial from an exponent slice of length `ring.nvars()`.
     ///
-    /// Returns `None` if the length is wrong, any exponent exceeds
+    /// Returns `None` if the length is wrong or any exponent exceeds
     /// [`crate::ring::MAX_VAR_EXP`] (= 127, the 7-bit per-variable
-    /// limit), or the total degree exceeds `u32::MAX`.
+    /// limit). Total degree saturates at 255 in the top-byte cap
+    /// (ADR-020); the dispatch shim filters rings where this matters.
     pub fn from_exponents(ring: &Ring, exps: &[u32]) -> Option<Self> {
         let n = ring.nvars() as usize;
         if exps.len() != n {
@@ -134,17 +143,13 @@ impl Monomial {
             packed[word] |= (e as u64) << shift;
         }
 
-        // Top byte: capped total degree (full 8 bits, no guard).
+        // Top byte: capped total degree (full 8 bits, no guard). This
+        // is the canonical total-degree cache per ADR-020.
         let capped = total.min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] |= capped << 56;
 
-        if total > u32::MAX as u64 {
-            return None;
-        }
-
         Some(Self {
             packed,
-            total_deg: total as u32,
             component: 0,
         })
     }
@@ -177,10 +182,23 @@ impl Monomial {
         sev
     }
 
-    /// Total degree (uncapped).
+    /// Total degree, saturating at 255 (ADR-020).
+    ///
+    /// Sourced from the top byte of `packed[3]`: the byte cap is the
+    /// canonical total-degree now that the per-Monomial `total_deg:
+    /// u32` has been dropped (Stage C of ADR-017's plan — see
+    /// ADR-020). For the dispatched ring set (Z/p, ≤31 vars,
+    /// degrevlex), this is sufficient — realistic bba steps stay
+    /// well under 255. Rings where `n_vars × max_per_var_deg > 255`
+    /// are filtered by the Singular-dispatch shim.
+    ///
+    /// Singular precedent: `pTotaldegree` in
+    /// `~/Singular/libpolys/polys/monomials/p_polys.cc` recomputes
+    /// total degree from the exp vector when the stored byte isn't
+    /// enough; there is no separate per-monomial u32 field.
     #[inline]
     pub fn total_deg(&self) -> u32 {
-        self.total_deg
+        ((self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF) as u32
     }
 
     /// Component index. Always 0 in this bootstrap.
@@ -231,15 +249,13 @@ impl Monomial {
     /// **Contract (ADR-018, implementing ADR-017 Option 2):** the
     /// caller's ring construction is responsible for ensuring that
     /// no product arising in the intended computation overflows a
-    /// per-variable byte or the u32 total-degree cache. Release
-    /// builds do not check; they match Singular's
-    /// `p_ExpVectorAdd` / `p_MemAdd_LengthGeneral` contract
+    /// per-variable byte. Release builds do not check; they match
+    /// Singular's `p_ExpVectorAdd` / `p_MemAdd_LengthGeneral` contract
     /// (`~/Singular/libpolys/polys/monomials/p_polys.h:1432`, where
     /// the overflow guard is gated on `PDEBUG ≥ 1`).
     ///
-    /// Debug builds catch an overflow via `debug_assert!` on the
-    /// guard-bit divmask and on the u32 total-degree sum, mirroring
-    /// Singular's `pAssume1` checks.
+    /// Debug builds catch a per-byte overflow via `debug_assert!` on
+    /// the guard-bit divmask, mirroring Singular's `pAssume1` checks.
     ///
     /// Implementation per ADR-005, with the codegen-motivated split
     /// in ADR-017: the word-wise wrapping-add is emitted as an
@@ -247,8 +263,10 @@ impl Monomial {
     /// independent reads+writes with no loop structure and, under
     /// `-C target-cpu=native` on an AVX2 host, folds the four u64
     /// adds into one `vpaddq ymm`). The top byte (total-degree cap)
-    /// is rewritten cleanly from the cached u32 total rather than
-    /// relying on the wrap-add result.
+    /// is then rewritten cleanly from the byte-sum's saturated
+    /// result — ADR-020 drops the separate u32 total-degree cache,
+    /// so total degree is read back out of the top byte of
+    /// `packed[3]`.
     pub fn mul(&self, other: &Self, ring: &Ring) -> Self {
         // The explicit unroll below assumes exactly four words; if
         // WORDS_PER_MONO ever changes, update the literal.
@@ -283,28 +301,24 @@ impl Monomial {
                 "Monomial::mul overflow: per-byte exponent > 127 (ADR-018 contract: \
                  caller's ring construction must guarantee no bba-step product overflows)"
             );
-            debug_assert!(
-                self.total_deg.checked_add(other.total_deg).is_some(),
-                "Monomial::mul total-degree u32 overflow (ADR-018 contract)"
-            );
         }
 
-        // Total degree (uncapped, exact via the cached u32 sum).
-        // Release: wrapping_add is safe because we're below u32::MAX
-        // by contract. Debug: debug_assert! above already caught it.
-        let total = self.total_deg.wrapping_add(other.total_deg);
-        // Rewrite the top byte: clear the wrap-add result and write
-        // the actual cap.
-        let capped = (total as u64).min(u8::MAX as u64);
+        // Rewrite the top byte: the wrap-add of the two top bytes
+        // is the uncapped sum (modulo 256). Saturate to 255. Because
+        // each operand's top byte is min(total, 255), their sum is
+        // bounded by 510; if the sum is ≥ 256 we must saturate.
+        let a_cap = (self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
+        let b_cap = (other.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
+        let sum_cap = (a_cap + b_cap).min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] =
-            (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
+            (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (sum_cap << 56);
 
         // ADR-019: no per-Monomial SEV to combine. SEV is computed
         // on demand at the Poly-level cache refresh.
+        // ADR-020: no per-Monomial u32 total-degree to maintain.
 
         Self {
             packed,
-            total_deg: total,
             component: 0,
         }
     }
@@ -336,12 +350,15 @@ impl Monomial {
     ///
     /// With direct storage, the per-byte op is `e_new = e_self - e_other`,
     /// rejecting when `e_other > e_self`. Per-byte loop maintained for
-    /// the same reason as `divides`.
+    /// the same reason as `divides`. The top-byte total-degree cap is
+    /// recomputed from the resulting exponent sum (saturating at 255
+    /// per ADR-020).
     pub fn div(&self, other: &Self, ring: &Ring) -> Option<Self> {
         let n = ring.nvars() as usize;
         let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n;
         let last_var_byte = WORDS_PER_MONO * 8 - 2;
         let mut packed = [0u64; WORDS_PER_MONO];
+        let mut total: u64 = 0;
         for byte_idx in first_var_byte..=last_var_byte {
             let (word, shift) = split_byte_index(byte_idx);
             let ea = (self.packed[word] >> shift) & 0x7F;
@@ -351,17 +368,12 @@ impl Monomial {
             }
             let new_e = ea - eb;
             packed[word] |= new_e << shift;
+            total += new_e;
         }
-        // Total degree: self.total_deg - other.total_deg.
-        if other.total_deg > self.total_deg {
-            return None;
-        }
-        let total = self.total_deg - other.total_deg;
-        let capped = (total as u64).min(u8::MAX as u64);
+        let capped = total.min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] |= capped << 56;
         Some(Self {
             packed,
-            total_deg: total,
             component: 0,
         })
     }
@@ -401,10 +413,13 @@ impl Monomial {
     ///   "smaller exponent at the largest-index differing variable
     ///   wins".
     ///
-    /// Saturation fallback: when either operand's capped top byte is
-    /// 255, the cap byte is uninformative; we fall back on the cached
-    /// `total_deg: u32` first, then on the variable bytes through the
-    /// same XOR-flipped compare.
+    /// Saturation fallback (ADR-020): when either operand's top byte
+    /// is 255 (saturated), the cap byte is uninformative for a direct
+    /// compare. We recompute exact total degrees from the variable
+    /// bytes and compare those first, then fall back on the variable
+    /// bytes through the same XOR-flipped compare. The dispatch shim
+    /// filters rings where this path can actually hit (n_vars *
+    /// max_per_var_deg > 255), so in practice this is a rare slow path.
     fn cmp_degrevlex(&self, other: &Self, ring: &Ring) -> Ordering {
         let a_cap = (self.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
         let b_cap = (other.packed[WORDS_PER_MONO - 1] >> 56) & 0xFF;
@@ -412,7 +427,12 @@ impl Monomial {
         let mask = ring.cmp_flip_mask();
 
         if saturated {
-            match self.total_deg.cmp(&other.total_deg) {
+            // Recompute exact total degrees by summing variable bytes.
+            // This is only reached when at least one operand has a
+            // saturated cap — rare given the ADR-020 dispatch filter.
+            let a_total = sum_variable_bytes(&self.packed, ring.nvars() as usize);
+            let b_total = sum_variable_bytes(&other.packed, ring.nvars() as usize);
+            match a_total.cmp(&b_total) {
                 Ordering::Equal => {}
                 ord => return ord,
             }
@@ -476,10 +496,10 @@ impl Monomial {
             );
         }
 
-        assert!(total <= u32::MAX as u64, "total degree overflows u32");
-        assert_eq!(total as u32, self.total_deg, "total_deg cache mismatch");
         // ADR-019: no SEV field to cross-check here; SEV lives on
         // the enclosing Poly's `lm_sev` cache. See `compute_sev`.
+        // ADR-020: no u32 total-degree cache to cross-check; the
+        // top byte of packed[3] is the canonical total degree.
 
         // Top byte is min(total, 255).
         let expected_cap = total.min(u8::MAX as u64);
@@ -537,6 +557,22 @@ fn split_byte_index(byte_idx: usize) -> (usize, u32) {
     let word = byte_idx / 8;
     let shift = ((byte_idx % 8) * 8) as u32;
     (word, shift)
+}
+
+/// Sum the variable-slot bytes of a packed block. Used by the
+/// saturated-cap slow path of `cmp_degrevlex` (ADR-020) to recompute
+/// an exact total degree when the top-byte cap has saturated.
+#[inline]
+fn sum_variable_bytes(packed: &[u64; WORDS_PER_MONO], nvars: usize) -> u32 {
+    let first_var_byte = (WORDS_PER_MONO * 8 - 1) - nvars;
+    let last_var_byte = WORDS_PER_MONO * 8 - 2;
+    let mut total: u32 = 0;
+    for byte_idx in first_var_byte..=last_var_byte {
+        let (word, shift) = split_byte_index(byte_idx);
+        let e = ((packed[word] >> shift) & 0x7F) as u32;
+        total += e;
+    }
+    total
 }
 
 #[cfg(test)]
@@ -638,7 +674,9 @@ mod tests {
                 "exponent of var {i} corrupted by neighbour byte"
             );
         }
-        assert_eq!(p.total_deg(), 600);
+        // ADR-020: total_deg is the byte cap, saturating at 255.
+        // True sum is 600; saturated value is 255.
+        assert_eq!(p.total_deg(), 255);
     }
 
     #[test]
