@@ -3300,6 +3300,231 @@ Two property-test expectations were refined:
 
 ---
 
+## ADR-021: kBucket lazy-lm — hoist redundant lookup, partial rescan, smarter cache invalidation
+
+**Status:** Accepted
+**Date:** 2026-04-24
+
+### Context
+
+The post-task-340 `perf` profile of rustgb on staging-5101449
+(c200-1, `taskset -c 11`) shows `KBucket::leading` consuming
+**10.4 %** of total cycles, broken down as:
+
+* 3.4 % — scan-loop bookkeeping (re-borrowing `self.slots[j]`,
+  branch-mispredicts in the `match best { … }` arms).
+* 1.8 % — `cmp_degrevlex` inside the slot scan.
+* 1.1 % — `Monomial::sev` recompute (already amortised by ADR-019,
+  remaining cost is the `compute_sev` call inside the cancellation
+  peel which strips and reconstructs leading-term sev when the
+  cache is rebuilt under reducer-driven cancellation).
+* ~4 % — TLS-attribution leak from inlining (counts that
+  belong to inlined callees).
+
+The cache exists (`lm_cache` + `dirty` bitmask), but the rebuild
+path is hot because every reduction step in the bba inner loop
+invalidates the leader. The pattern is:
+
+```
+loop {
+    let (c, m) = bucket.leading()?;     // hits scan
+    let (red_c, red_q) = pick_reducer(m);
+    bucket.minus_m_mult_p(&u, red_c, red_q);  // dirties → invalidates cache
+}
+```
+
+Singular's `p_kBucketSetLm__T`
+(`~/Singular/libpolys/polys/templates/p_kBucketSetLm__T.cc`) faces
+the same algorithmic constraint but spends substantially less time
+per call. Reading the template, three shape differences stand out:
+
+1. Singular's slot scan hoists each slot's leader-pointer into a
+   local `p` outside the inner cmp; ours re-borrowed
+   `self.slots[j].as_ref().unwrap().leading()` on every iteration
+   of the inner branch.
+2. Singular's cancellation peel does not restart the slot scan
+   from `j = 1` — it preserves the current `j` (the running
+   running-best index) across iterations of the `do…while (j<0)`
+   wrapper, so non-cancelled slots carry their candidacy forward.
+   Ours was a hard reset.
+3. Singular invalidates the cache whenever a slot is touched,
+   without checking whether the touch could affect the leader.
+   In the bba pattern this is correct (the touch is exactly the
+   leader-cancelling minus_m_mult_p), but in `kBucket_Add_q` and
+   in any non-leader-cancelling `minus_m_mult_p` the cache could
+   in principle survive — Singular doesn't bother because its
+   per-call cost is already low. *We* bother because we already
+   pay for `lm_cache` storage.
+
+### Singular precedent
+
+Quoted from `~/Singular/libpolys/polys/templates/p_kBucketSetLm__T.cc`
+(the no-coef-buckets template):
+
+```c
+do
+{
+  j = 0;
+  for (int i = 1; i<=bucket->buckets_used; i++)
+  {
+    if (bucket->buckets[i] != NULL)
+    {
+      MULTIPLY_BUCKET(bucket,i);
+      p = bucket->buckets[j];   // hoist: read once per i
+      if (j == 0) { … }
+      p_MemCmp__T(bucket->buckets[i]->exp, p->exp, length, ordsgn,
+                  goto Equal, goto Greater, goto Continue);
+      …
+    }
+  }
+  …
+} while (j < 0);
+```
+
+Two important properties:
+
+1. `p = bucket->buckets[j]` is re-read once per `i`, but the
+   per-iteration cmp uses pointer-arithmetic on
+   `bucket->buckets[i]->exp` and `p->exp` — no further
+   indirection through `j`.
+2. The outer `do…while (j<0)` lets a cancellation set `j = -1`
+   and re-run the for-loop with `j = 0` again, but the slot
+   array's contents are otherwise unchanged — non-cancelled
+   slots still hold the same poly with the same leader. Our
+   problem was that we *recomputed* the leader pointer on every
+   re-scan; Singular's loop just re-walks the same buckets array
+   and the `p->exp` pointers are stable across re-scans.
+
+FLINT: N/A — FLINT has no geobucket reducer.
+
+### Decision
+
+Three structural changes to `~/rustgb/src/kbucket.rs::leading`
+and `mark_dirty`, applied across three commits:
+
+1. **Hoist the redundant per-slot leading lookup.** Cache a
+   `*const Monomial` to the running-best slot's leader monomial
+   in a local `best_m`. The cmp inner branch reads
+   `&*best_m` instead of re-borrowing `self.slots[j]`. The slots
+   array is not mutated during a scan pass, so the pointer stays
+   live for the duration. Commit `kbucket: hoist redundant
+   leading() lookup in scan`.
+
+2. **Partial rescan after cancellation.** Cache *every*
+   live slot's leader pointer in a stack-local
+   `[*const Monomial; NUM_SLOTS] leaders` array, populated
+   once at function entry. The scan iterates a `live_mask`
+   bitmap (skipping empty slots without the empty-check
+   conditional). On cancellation, we peel only the slots in
+   `matching_mask`, refresh just their entries in `leaders`,
+   and re-scan `live_mask` — non-matching slots' pointers
+   stay valid because their Polys weren't touched. This
+   mirrors Singular's "re-walk same buckets array" strategy
+   but with explicit raw pointers (Singular gets it for free
+   because its slot reads go through the unchanged
+   `bucket->buckets[i]->exp`). Commit `kbucket: partial rescan
+   after cancellation`.
+
+3. **Smarter cache invalidation in `mark_dirty`.** Extend
+   `lm_cache` from `(Coeff, Monomial, usize)` to
+   `(Coeff, Monomial, usize, u32)` where the new u32 is the
+   bitmask of all slots whose leader equals the cached
+   monomial (populated during the scan). Change `mark_dirty`
+   to take `Option<&Monomial>` — the new leader of the touched
+   slot when known. Cache survives when:
+   * `new_lm` is supplied, AND
+   * the touched slot is not in `matching_mask`, AND
+   * `new_lm < cached.m` strictly.
+
+   In that case the bucket's leading term hasn't changed (the
+   touched slot didn't contribute, and its new leader can't
+   exceed the existing leader), so we keep `lm_cache` and
+   clear the bit we just set in `dirty`. Otherwise invalidate
+   as before.
+
+   Call sites updated to thread the new leader where it is
+   already cheaply available (e.g. `merged.leading()` on the
+   non-empty branches of `absorb` and `minus_m_mult_p`).
+   Commit `kbucket: smarter cache invalidation in mark_dirty`.
+
+### What is *not* changed
+
+* `NUM_SLOTS = 15` and `SLOT_BASE = 4` — the slot-tier
+  geometry stays exactly as it was.
+* The cancellation arithmetic — sum coefficients of matching
+  slots, peel matching slots if the sum is zero — same
+  algebra.
+* The public `extract_leading` API — unchanged.
+* The `leading()` return type and the `&mut self` receiver
+  rationale (it is logically a query but mutates the
+  representation by peeling cancelled leaders) — unchanged.
+* SEV pretest before cmp — *not* introduced. Singular's
+  `pLmCmp` doesn't pretest with SEV, and SEV is not a partial
+  order on monomials (it's a divisibility hint, not an
+  ordering hint). Skip.
+
+### Consequences
+
+* **Wall-clock:** in the `KBucket::leading` hot path, the
+  scan pass loses 1–2 redundant pointer indirections per slot
+  and the inner cmp branch becomes a single
+  `unsafe { &*best_m }` deref + `cmp_degrevlex`. The partial
+  rescan saves an `O(|live|)` re-borrow on every cancellation
+  iteration. The conditional invalidation lets the bba
+  pattern benefit when the next reduction lands on a
+  non-leader slot — the cache survives and the next
+  `leading()` is O(1).
+
+* **Soundness:** the new raw-pointer use is contained in
+  `KBucket::leading`. The slots array is not mutated for the
+  duration of one scan pass; the cancellation peel updates
+  `leaders[i]` before any re-read of that index. SAFETY
+  comments document the invariant. The `_not_sync` marker
+  ensures no other thread can intrude on the borrow.
+
+* **Cache invalidation correctness:** ADR-021 introduces a
+  state-conditional cache-preservation rule. The
+  `matching_mask` bit lets us identify when a touched slot
+  was contributing to the cached leader (always invalidate
+  in that case). Two new unit tests
+  (`mark_dirty_preserves_cache_when_new_lm_is_smaller`,
+  `mark_dirty_invalidates_when_new_lm_equals_cached`)
+  exercise both branches; existing
+  `minus_m_mult_p_dirties_slot` covers the
+  same-leader-equal case (which still invalidates).
+
+* **Memory footprint:** `KBucket::lm_cache` grows by 4 bytes
+  (the new `matching_mask: u32`). The footprint of a
+  `KBucket` is dominated by the 15 `Option<Poly>` slots and
+  the ring `Arc`, so this is noise.
+
+* **Test impact:** all three feature configurations pass:
+  default (197/197), `linked_list_poly` (210/210),
+  `linked_list_poly + linked_list_poly_pool` (211/211). Two
+  new unit tests added; no existing tests modified.
+
+### References
+
+* ADR-002 — geobucket reducer adopted; this ADR is a hot-path
+  refinement, not a structural change.
+* ADR-018 — `Monomial::mul` infallibility (lets the cmp inner
+  branch be a pure compute).
+* ADR-019 — drop per-Monomial SEV (eliminates SEV recompute
+  inside the leader peel).
+* ADR-020 — drop per-Monomial total_deg u32 (Stage C of the
+  Monomial slim-down).
+* `~/rustgb/src/kbucket.rs:130-460` — `KBucket` impl.
+* `~/Singular/libpolys/polys/templates/p_kBucketSetLm__T.cc`
+  — Singular's reference algorithm.
+* `~/Singular/kernel/GBEngine/kInline.h` — bucket inline
+  accessors (`kBucketLm`, `kBucketAdjustBucketsUsed`).
+* `~/project/docs/profile-rustgb-drop-total-deg-staging-5101449.md`
+  — Stage C baseline profile (the 10.4% measurement).
+* `~/project/docs/profile-rustgb-kbucket-lazy-lm-staging-5101449.md`
+  — post-fix profile re-capture.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
