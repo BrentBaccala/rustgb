@@ -3783,6 +3783,299 @@ saturation has already been bounded in the same expression).
 
 ---
 
+## ADR-023: Stage D — hand-specialised inner loops for zp / degrevlex / len4
+
+**Status:** Accepted
+**Date:** 2026-04-25
+
+### Context
+
+After Stages A-C (ADR-018 dropping the per-mul overflow check;
+ADR-019 dropping per-Monomial SEV; ADR-020 dropping per-Monomial
+total_deg u32) and the cmp/kBucket tightenings (ADR-021,
+ADR-022), the bba reduction inner loop on the linked-list backend
+(`linked_list_poly`) is structurally as clean as a generic
+implementation can be. The remaining gap to Singular's
+`p_Minus_mm_Mult_qq__FieldZp_LengthFour_OrdRevDeg` —
+the corresponding template instantiation in
+`~/Singular/libpolys/polys/templates/p_Procs_Generate.cc` — comes
+from per-ring-config function specialisation: at `rComplete` time
+Singular picks one specialised function pointer (field × length ×
+ordering) and stamps it on the ring; the inner cmp/mul/field op
+bodies are baked in.
+
+The Stage-D hypothesis was that significant per-iter wall savings
+might be available by replacing the dispatch-friendly generic body
+(parameterised over `Field`, `MonoOrder`, and length-of-packed
+buffer) with a hand-written specialised body that fuses
+`Monomial::mul`, `Monomial::cmp_degrevlex`, and
+`Field::{mul, sub, neg}` into one straight-line function with no
+function-call boundaries inside the loop.
+
+### Singular's approach
+
+Singular's polynomial procs are dispatched per ring via the
+`p_Procs_Field` / `p_Procs_Length` / `p_Procs_Ord` template
+parameters (`~/Singular/libpolys/polys/templates/p_Procs_Generate.cc`).
+At ring construction (`rComplete`,
+`~/Singular/libpolys/polys/monomials/ring.cc`) the per-field /
+per-length / per-ordering combination is materialised: e.g.
+`p_Minus_mm_Mult_qq__FieldZp_LengthFour_OrdRevDeg` is one row
+in the table. The instantiation has every choice baked in at
+compile time — the field-arithmetic ops, the length-fixed packed
+add, and the ordering-specific cmp body are all inlined into the
+single function body. No virtual dispatch, no enum match, no
+trait object — just the body of the inner loop with everything
+substituted. The driver picks the right row at ring construction
+and stores the function pointer for the lifetime of the
+computation.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** FLINT's `nmod_mpoly` does have
+per-bits packed multiplication and division specialisations (e.g.
+`_nmod_mpoly_mul_johnson_8`), but they exist for the polynomial
+multiplication operation, not for a Gröbner-basis reducer's merge
+loop (FLINT has no such loop). Reference for completeness: the
+FLINT `nmod_mpoly` files use macro-generated specialisations
+keyed off bits-per-exponent, mirroring the Singular template
+pattern at the polynomial layer. rustgb's `Monomial` packing is
+already length-4 specialised (ADR-005), so the polynomial-layer
+analogue is moot here; the ADR-023 question is at the
+GB-reducer-layer, where FLINT does not apply.
+
+### Decision
+
+Add three hand-specialised public functions to
+`~/rustgb/src/poly/poly_list.rs` (the linked-list backend, which
+is the one that runs on the rustgb-list-pool target config):
+
+1. `Poly::sub_mm_mult_qq_consuming_zp_degrevlex_len4` — the bba
+   reduction inner step.
+2. `Poly::add_consuming_zp_degrevlex_len4` — the kBucket absorb
+   path.
+3. `merge_consuming_zp_degrevlex_len4` — the shared internal helper.
+
+Add a `Ring::is_zp_degrevlex()` predicate that returns true when
+the field is Z/p (always today since `Field` only models Z/pZ),
+the ordering is degrevlex (the only `MonoOrder` variant today),
+and `nvars ≤ MAX_VARS = 31` (the 4-word packing limit, enforced
+at ring construction). The predicate is constant-foldable: a
+`Ring` is built once at the FFI boundary and the answer is
+invariant for the lifetime of a `bba()` call.
+
+Dispatch from the generic public methods:
+
+```rust
+pub fn sub_mm_mult_qq_consuming(
+    self, c: Coeff, m: &Monomial, q: &Poly, ring: &Ring,
+) -> Poly {
+    if ring.is_zp_degrevlex() {
+        self.sub_mm_mult_qq_consuming_zp_degrevlex_len4(c, m, q, ring)
+    } else {
+        self.sub_mm_mult_qq_consuming_generic(c, m, q, ring)
+    }
+}
+```
+
+LLVM hoists the dispatch branch out of any caller that has a
+statically-realised `&Ring`. The generic fallback is kept alive
+(both source and emitted symbol) so that any future FFI ring
+shape outside the dispatch fingerprint still has a correct
+implementation, mirroring Singular's `p_Add_q__General` /
+`p_Minus_mm_Mult_qq__General` rows in the procs table.
+
+Promote `Field::add`, `Field::sub`, `Field::neg`, `Field::mul`,
+and `Monomial::mul` to `#[inline(always)]`. The existing
+`#[inline(always)]` on `Monomial::cmp` (ADR-022) already gives
+`cmp_degrevlex` the same treatment via its single-variant match
+wrapper. Rationale: the Stage-D goal is to remove all
+function-call boundaries from the inner loop body. The
+`#[inline(always)]` annotations are documentation and insurance —
+LLVM was already inlining at -C target-cpu=native; the explicit
+attribute removes the future-doubt hazard if a less aggressive
+optimisation pass ever sees this code.
+
+### What the source-level "specialisation" buys (and doesn't)
+
+The pre-ADR-023 generic body and the new
+`*_zp_degrevlex_len4` specialised body are **structurally
+identical** — the per-iteration ops are `m.mul(&q[i].mono, ring)`,
+`l.mono.cmp(&r_mono, ring)`, `f.mul / f.sub / f.neg`, in the same
+order, with the same control flow. There is no algorithmic
+difference. The differences are:
+
+1. **Naming the dispatch fingerprint explicitly.** The source
+   reads as "this is the FieldZp/LengthFour/OrdRevDeg row of the
+   procs table" rather than as a generic body that LLVM happens
+   to specialise. Future audits comparing to Singular's
+   procs-table generator have a 1:1 source mapping.
+
+2. **Locking in the inlining.** The `#[inline(always)]` on
+   `Field::*` and `Monomial::mul` removes the doubt that a less
+   aggressive optimisation flag (no `target-cpu=native`, or LLVM
+   on a later release that retunes its inlining heuristic) could
+   un-inline a hot operation and break the straight-line shape.
+
+3. **A documented place to extend.** When the dispatch shim
+   admits a second supported shape (e.g. lex ordering, or a
+   wider per-variable packing), the Stage-D pattern is to add a
+   second specialised body next to the existing one and tighten
+   the `is_zp_degrevlex` predicate, matching the Singular procs
+   pattern. The generic fallback is the safety net while the
+   second specialisation is bedded in.
+
+What this commit **does not** buy:
+
+* **No measurable instruction-count delta** in the inlined inner
+  loop body. Pre- and post-ADR-023 disassembly of the
+  `LocalKey::with` closure inside `kbucket::minus_m_mult_p` is
+  byte-for-byte equivalent on `target-cpu=native`. The post-ADR-022
+  codegen was already what Stage D was aiming for; the
+  specialisation is documentary, not algorithmic. **Null result on
+  wall time is the expected outcome.**
+
+* **No new CPU instructions used.** The body still relies on
+  `vpaddq` for the packed-add, `mulx` for Barrett, and the
+  XOR-based degrevlex compare. Future widening would consume more
+  of the CPU's SIMD width (`vpaddq ymm` for length-8 packing); out
+  of scope for ADR-023.
+
+### What is NOT changed
+
+* The cmp algorithm — same hand-unrolled MSB→LSB length-4 body
+  from ADR-022.
+* The mul algorithm — same explicit 4-element wrapping-add
+  literal from ADR-017 / ADR-018.
+* The Barrett reduce — same body in `Field::mul`.
+* The kBucket / sbasis interfaces — `KBucket::minus_m_mult_p` and
+  `KBucket::absorb` continue to call the generic public methods
+  (`sub_mm_mult_qq_consuming`, `add_consuming`); the dispatch
+  branch is internal to those entry points.
+* The Vec backend (`poly_vec.rs`) — its
+  `sub_mm_mult_qq_consuming` is a thin forwarder to
+  `sub_mul_term`, and the staging workload uses the linked-list
+  backend (`linked_list_poly`). Specialising the Vec path is left
+  as follow-up work; the `is_zp_degrevlex` predicate is reusable
+  across backends, and a future commit can extend the dispatch.
+
+### Future work
+
+* **Codegen-time macro generation.** Singular's `p_Procs_Generate.cc`
+  uses C preprocessor macros to expand a single template body
+  into N specialised functions, one per (field, length, ordering)
+  triple. rustgb could mirror this with a `proc_macro!` that
+  consumes the generic body and emits a specialised `*_xxx`
+  function per supported ring fingerprint. Out of scope here
+  (one specialisation is enough to validate the pattern); track
+  as a candidate ADR if a second fingerprint becomes hot.
+
+* **A second supported ordering.** The dispatch shim today
+  filters to degrevlex only. If the staging workload ever
+  motivates lex or some weighted ordering, the Stage-D
+  pattern says: add `cmp_lex_len4` to `Monomial`, add
+  `merge_consuming_zp_lex_len4`, gate via a
+  `Ring::is_zp_lex()` predicate, dispatch from the public
+  `merge_consuming` entry point.
+
+* **Vec backend dispatch.** The Vec backend
+  (`~/rustgb/src/poly/poly_vec.rs`) would need its own
+  `sub_mm_mult_qq_consuming_zp_degrevlex_len4` (currently it
+  forwards to `sub_mul_term`, which allocates fresh terms rather
+  than reusing). Per the ADR-001 profile, the Vec backend was
+  the original baseline — but as the staging workload runs on
+  `linked_list_poly`, this is low priority. Track as follow-up.
+
+### Consequences
+
+* **Wall clock — null result expected and measured.** On
+  `target-cpu=native`, LLVM was already producing the inlined
+  straight-line shape that the specialisation aims to lock in.
+  Disassembly of `librustgb.so`'s `LocalKey::with` closure for
+  `sub_mm_mult_qq_consuming` (sym 0x24d00, post-ADR-023 build)
+  shows the same body as the pre-ADR-023 capture in
+  `profile-rustgb-cmp-len4-staging-5101449.md` — `vpaddq xmm0`
+  for the Monomial::mul SIMD add, four explicit length-4 cmp
+  arms with the XOR-flip-mask tail, Barrett-reduce mulx on the
+  equal path, no spills, no calls. Realistic wall delta: 0 % to
+  +1 %. **Hypothesis for the null result: LLVM was already
+  cross-inlining all three ops at every call site, and the inner
+  loop is register-bound on the Barrett mulx and the SIMD vpaddq
+  rather than on dispatch overhead.** No instruction was removed
+  from the hot path.
+
+* **Rust:Singular ratio.** Improvement from ~22-25× to ≤15×
+  is the optimistic decision criterion stated in the task spec.
+  Pre-ADR-022 baseline (ADR-021 capture) had rustgb at ~22-23×
+  Singular on staging-5101449. ADR-022 narrowed the gap by ~1.5
+  % wall on the audit-driven cmp tightening. ADR-023's
+  contribution to that gap is null on `target-cpu=native`. The
+  remaining ratio gap is structural (Singular's geobucket has
+  per-bucket length thresholds tuned per ring; rustgb's
+  geobucket is a uniform-bucket cascade — a different ADR's
+  scope). **Ratio unchanged from post-ADR-022.**
+
+* **Source-level cost.** Roughly 130 lines of duplicated
+  source: the specialised `sub_mm_mult_qq_consuming_zp_degrevlex_len4`
+  body and the corresponding `*_generic` fallback body. The
+  alternative — keeping only the specialised body and dropping
+  the generic — would lose the safety net for any future ring
+  shape, and the `is_zp_degrevlex` debug-assert would become a
+  caller-side `assume`. The duplication is documented as the
+  Singular-style trade-off and is the same cost Singular pays
+  in the `p_Procs_Static.cc` build artefact. Prefer documenting
+  to deduplication for ADR clarity.
+
+* **Soundness.** The specialised and generic bodies are
+  structurally identical; correctness is delegated to the
+  shared invariants (sentinel-slot pattern from ADR-015, Pool
+  contract from ADR-016, monomial canonicality from ADR-005).
+  Tests pass: 197 (default) / 211 (linked_list_poly) / 212
+  (linked_list_poly + linked_list_poly_pool), unchanged from
+  the post-ADR-022 baseline. Bit-for-bit fixture match on the
+  three staging tests (staging-5101449, -5104053, -5106746) is
+  required by the task spec; documented in the sibling profile
+  report.
+
+### References
+
+* ADR-005 — packed-exponent layout (length-4 specialisation
+  rationale).
+* ADR-014, ADR-015, ADR-016 — linked-list backend, splice-style
+  merges, Node pool.
+* ADR-017 / ADR-018 — `Monomial::mul` infallibility plan and
+  implementation.
+* ADR-019 — drop per-Monomial SEV (Stage B).
+* ADR-020 — drop per-Monomial total_deg u32 (Stage C).
+* ADR-021 — kBucket lazy-lm + partial rescan.
+* ADR-022 — cmp_degrevlex codegen audit + length-4
+  specialisation (the immediate prerequisite — the post-ADR-022
+  inlined loop body is the baseline ADR-023 ships against).
+* `~/rustgb/src/poly/poly_list.rs:sub_mm_mult_qq_consuming` —
+  dispatcher.
+* `~/rustgb/src/poly/poly_list.rs:sub_mm_mult_qq_consuming_zp_degrevlex_len4`
+  — specialised body.
+* `~/rustgb/src/poly/poly_list.rs:merge_consuming_zp_degrevlex_len4`
+  — shared specialised helper.
+* `~/rustgb/src/ring.rs:is_zp_degrevlex` — dispatch fingerprint
+  predicate.
+* `~/rustgb/src/field.rs` — `add/sub/neg/mul` promoted to
+  `#[inline(always)]`.
+* `~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc` —
+  Singular's parameterised template body.
+* `~/Singular/libpolys/polys/templates/p_Add_q__T.cc` — same for
+  add.
+* `~/Singular/libpolys/polys/templates/p_Procs_Generate.cc` —
+  Singular's table-driven instantiation generator.
+* `~/Singular/libpolys/polys/templates/p_Procs.inc` — driver.
+* `~/project/docs/profile-rustgb-cmp-len4-staging-5101449.md` —
+  ADR-022 baseline capture (the inlined merge-loop disassembly
+  that ADR-023 inherits unchanged).
+* `~/project/docs/profile-rustgb-stage-d-staging-5101449.md` —
+  ADR-023 post-fix profile re-capture (sibling to this ADR).
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
