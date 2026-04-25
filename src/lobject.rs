@@ -36,7 +36,9 @@ pub struct LObject {
     lm_sev: u64,
     /// Cached leading coeff. 0 when zero.
     lm_coeff: Coeff,
-    /// Cached leading total degree. 0 when zero.
+    /// Cached leading total degree (sourced from the leading
+    /// Monomial's byte cap per ADR-020, saturates at 255). 0 when
+    /// zero.
     lm_deg: u32,
     /// Cached is_zero flag (snapshot of the last `refresh`).
     is_zero: bool,

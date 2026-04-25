@@ -53,8 +53,9 @@ pub struct Poly {
     lm_sev: u64,
     /// Cached leading coefficient (`coeffs[head]`); 0 when empty.
     lm_coeff: Coeff,
-    /// Cached leading monomial degree (`terms[head].total_deg()`);
-    /// 0 when empty.
+    /// Cached leading monomial degree (`terms[head].total_deg()`),
+    /// sourced from the Monomial's byte cap (ADR-020, saturates at
+    /// 255). 0 when empty.
     lm_deg: u32,
 }
 
