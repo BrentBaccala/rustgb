@@ -4472,9 +4472,21 @@ bloom-filter pre-filter.
   workload's exponent distribution: for `MAX_VARS = 31` and
   staging exponent profiles, the divmask's per-variable bands
   (exp = 0 / 1 / 2 / >2) are coarse-grained but strictly stronger
-  than SEV's "exp = 0 / nonzero" split. The post-fix profile
-  report (`~/project/docs/profile-rustgb-divmask-staging-5101449.md`)
-  measures the false-positive rate.
+  than SEV's "exp = 0 / nonzero" split. **Measured (c200-1,
+  taskset -c 11, 3 runs):** post-348 wall on staging-5101449 is
+  14.70 s mean (CV 0.6 %) vs 15.35 s (CV 0.07 %) at the
+  pre-divmask `2c6c06d` baseline — a **−0.65 s, −4.2 % wall
+  reclaim** on top of ADR-024. Native Singular `std()` on the
+  same host is 14.10 s, so the rustgb : Singular ratio drops
+  from 1.089× (post-347) to **1.043× (post-348)**. The full
+  staging suite (3 fixtures, single 1 s-resolution pass) drops
+  from 80 s to 72 s cumulative. False-positive rate
+  instrumentation was not added; the headline wall delta is the
+  evidence the ADR ships on. The post-fix profile report
+  (`~/project/docs/profile-rustgb-divmask-staging-5101449.md`)
+  documents the implementation; the c200-1 wall numbers are
+  captured in `~/project/docs/rustgb-singular-perf-gap-analysis.md`'s
+  closeout section.
 
 * **Same correctness guarantees.** The divmask invariant is
   proven; the fast-reject is sound. Tests pass with default
