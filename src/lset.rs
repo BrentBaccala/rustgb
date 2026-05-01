@@ -246,75 +246,9 @@ impl LSet {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::field::Field;
-    use crate::monomial::Monomial;
-    use crate::ordering::MonoOrder;
-    use crate::ring::Ring;
-
-    fn mk_ring(nvars: u32) -> Ring {
-        Ring::new(nvars, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap()
-    }
-
-    fn mk_pair(r: &Ring, i: u32, j: u32, sugar: u32, arrival: u64) -> Pair {
-        let lcm = Monomial::from_exponents(r, &vec![1u32; r.nvars() as usize]).unwrap();
-        Pair::new(i, j, lcm, r, sugar, arrival)
-    }
-
-    #[test]
-    fn insert_pop_orders_by_sugar() {
-        let r = mk_ring(3);
-        let mut l = LSet::new();
-        l.insert(mk_pair(&r, 0, 1, 7, 0));
-        l.insert(mk_pair(&r, 0, 2, 3, 1));
-        l.insert(mk_pair(&r, 1, 2, 5, 2));
-        assert_eq!(l.len(), 3);
-        l.assert_canonical(&r);
-        assert_eq!(l.pop().unwrap().sugar, 3);
-        assert_eq!(l.pop().unwrap().sugar, 5);
-        assert_eq!(l.pop().unwrap().sugar, 7);
-        assert!(l.pop().is_none());
-        assert_eq!(l.len(), 0);
-    }
-
-    #[test]
-    fn delete_by_indices_tombstones() {
-        let r = mk_ring(3);
-        let mut l = LSet::new();
-        l.insert(mk_pair(&r, 0, 1, 7, 0));
-        l.insert(mk_pair(&r, 0, 2, 3, 1));
-        l.insert(mk_pair(&r, 1, 2, 5, 2));
-        assert!(l.delete(0, 2));
-        assert!(!l.contains(0, 2));
-        l.assert_canonical(&r);
-        // Remaining pop order: 5 then 7.
-        assert_eq!(l.pop().unwrap().sugar, 5);
-        assert_eq!(l.pop().unwrap().sugar, 7);
-        assert!(l.pop().is_none());
-    }
-
-    #[test]
-    fn reinsert_same_indices_replaces() {
-        let r = mk_ring(3);
-        let mut l = LSet::new();
-        l.insert(mk_pair(&r, 0, 1, 7, 0));
-        l.insert(mk_pair(&r, 0, 1, 3, 1)); // same indices, lower sugar
-        assert_eq!(l.len(), 1);
-        assert_eq!(l.pop().unwrap().sugar, 3);
-        assert!(l.pop().is_none());
-    }
-
-    #[test]
-    fn contains_agrees_with_delete() {
-        let r = mk_ring(3);
-        let mut l = LSet::new();
-        l.insert(mk_pair(&r, 2, 5, 4, 0));
-        assert!(l.contains(2, 5));
-        assert!(l.contains(5, 2)); // swap tolerated
-        assert!(l.delete(5, 2));
-        assert!(!l.contains(2, 5));
-        assert!(!l.delete(2, 5));
-    }
-}
+// Public API contract tests live in `tests/lset_contract.rs` so
+// the same test bodies exercise whichever backend `cargo
+// --features flat_lset` selects. Backend-specific invariant
+// tests (none today; the heap backend has nothing analogous to
+// the flat backend's tombstone-vector lockstep) would live here
+// under `#[cfg(test)] mod tests`.
