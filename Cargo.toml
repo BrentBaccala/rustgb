@@ -50,6 +50,16 @@ linked_list_poly = []
 # ADR-016 for the rationale and measured impact.
 linked_list_poly_pool = []
 
+# Switch the public `LSet` type from the default heap-based backend
+# (`src/lset.rs`) to a flat-Vec backend (`src/lset_flat.rs`) with
+# parallel `lcm_divmasks: Vec<u64>` enabling SIMD-batched filtered
+# scans for the chain-criterion Phase-2 sweep. Off by default —
+# see ADR-026 for the rationale, parallel-array shape, and the
+# A/B story. Both backend modules always compile; only the public
+# alias chosen by `lib.rs` differs. The contract tests under
+# `tests/lset_contract.rs` exercise whichever backend is selected.
+flat_lset = []
+
 [dev-dependencies]
 proptest = "1"
 

@@ -1737,7 +1737,13 @@ beyond just the monomial-storage savings.
 
 ## ADR-012 (candidate, not yet adopted): LSet bitset / flat-array restructure
 
-**Status:** Under review — listed for visibility, not active.
+**Status:** Superseded by #026 (flat-Vec backend behind a
+`flat_lset` cargo feature, 2026-04-30). The implementation
+chosen by ADR-026 is the flat-array restructure ADR-012
+sketched, but with: (a) `Vec<Pair>` + parallel `Vec<bool>`
+tombstones (rather than the bitset variant), (b) zeroed
+`lcm_divmasks[idx]` on tombstone for SIMD safety, and (c) an
+A/B feature flag rather than a default switch.
 **Date:** placeholder
 
 ### Context
@@ -4565,6 +4571,201 @@ bloom-filter pre-filter.
   proptest (4096 cases).
 * `~/project/docs/profile-rustgb-divmask-staging-5101449.md` —
   ADR-025 post-fix profile re-capture.
+
+---
+
+## ADR-026: Flat-Vec `LSet` backend behind a `flat_lset` cargo feature
+
+**Status:** Accepted (implementation only — A/B perf measurement
+deferred to a follow-up task)
+**Date:** 2026-04-30
+
+### Context
+
+The C++ refactor that took Singular's pair-management from the
+sev-prefilter branch (1.37–1.47× spielwiese on the staging suite)
+to the unordered-scan branch (2.12–2.54× spielwiese) — a ~1.5×
+wall reduction — replaced tree iteration with vector iteration,
+allowing SIMD-batched filtered scans over a flat parallel
+`lcm_sevs` array (`~/project/docs/refactor-sev-filtered-iterator-report.md`).
+
+In rustgb, the analogous bottleneck is the `LSet` chain-criterion
+Phase-2 sweep at `gm.rs:194-227` and `parallel.rs:680-721`.
+Today's `LSet` stores pairs in a `BinaryHeap<Reverse<HeapEntry>>`
+where each `HeapEntry` carries an ~80-byte `Pair` clone. The
+sweep does
+
+```rust
+for pair in l.iter_live() {
+    if (h_lm_divmask & !pair.lcm_divmask) != 0 { continue; }
+    ...
+}
+```
+
+— a struct-strided scan with a scalar divmask test per element.
+The divmasks aren't laid out contiguously, so the
+`find_divmask_superset_match` SIMD primitive (already used for
+the BSet's Phase-1 sweep, ADR-009/ADR-025) cannot be applied.
+
+ADR-012 enumerated the same restructure but deferred adoption
+because higher-impact items (ADR-010 `lms` cache, ADR-024
+redTail) hadn't shipped yet. Those have shipped; the staging
+profile after them attributes ~5–10 % of wall to chain_crit_normal
+Phase-2's struct-strided iteration, which is now the largest
+reachable single optimization.
+
+### Decision
+
+Add a new module `~/rustgb/src/lset_flat.rs` that mirrors
+`lset.rs`'s public API but stores pairs in a flat parallel-array
+shape, with a SIMD-batched filtered iterator. Selectable via
+`--features flat_lset` (off by default — both backends compile
+unconditionally; the `lib.rs` alias picks the one this build
+ships). Phase-2 call sites use a new `iter_filtered_subset(mask)`
+method present on both backends so the call site is uniform.
+
+Storage layout (flat backend):
+
+```rust
+pairs:        Vec<Pair>             // append-only flat backing
+tombstones:   Vec<bool>             // parallel; true ⇔ logically deleted
+lcm_divmasks: Vec<u64>              // parallel; zeroed when tombstoned
+by_indices:   HashMap<(u32,u32), usize>   // O(1) lookup of live slot
+sorted:       BinaryHeap<Reverse<SortedKey>>
+                                    // (sugar, arrival, idx) for ordered pop
+live:         usize                 // O(1) len()
+next_key:     u64                   // matches lset.rs for fixture parity
+```
+
+`pop()` walks the sorted heap, skipping tombstoned slots; the
+live slot's `Pair` is *cloned* before tombstoning (so the caller
+gets ownership and the slot stays in `pairs` for memory-stable
+indexing). `delete()` and the implicit reinsert-tombstone in
+`insert()` flip `tombstones[idx] = true`, zero
+`lcm_divmasks[idx]`, and drop the `by_indices` mapping.
+
+`iter_filtered_subset(mask)` dispatches to
+`crate::simd::find_divmask_superset_match` over `lcm_divmasks`
+— exactly the AVX2-batched primitive ADR-009 introduced for the
+BSet's Phase-1 sweep. Tombstoned slots have
+`lcm_divmasks[idx] == 0`; the predicate
+`(mask & !0) == mask == 0` is true only when `mask == 0`, which
+the Phase-2 callers (always passing a nonzero `h_lm_divmask`)
+never trigger.
+
+The heap backend gets a trivial wrapper:
+`iter_live().filter(|p| (mask & !p.lcm_divmask) == 0)`. Same
+semantics, scalar per-element. The point is API uniformity —
+call sites work against either backend without `#[cfg]`.
+
+### Singular's approach
+
+Singular's L-set is `LSet L` (`~/Singular-rustgb/kernel/GBEngine/kutil.h:326`),
+implemented as an `LObject*` array indexed by `Ll`. The C++
+refactor that motivates this ADR added a parallel
+`std::vector<unsigned long> sev_flat` so the chain-criterion
+sweep can scan a contiguous `&[u64]` of cached SEVs through
+`kSevScanAVX2` instead of struct-strided indirection through
+the `LObject*` array
+(`~/project/docs/refactor-sev-filtered-iterator-report.md`).
+The flat-Vec rustgb backend is the same shape, ported.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine** and therefore no L-set / pair
+queue / Gebauer-Möller chain criterion. The closest concept is
+mpoly_heap's heap-of-pending-products, which is a different data
+structure with no tombstones and no SIMD pre-filter pattern.
+
+### Consequences
+
+**Maintained (both backends):**
+- The reduced GB output is bit-for-bit identical between
+  backends on all three staging tests (5101449, 5104053,
+  5106746). Verified via `~/project/run-rustgb-staging-validation.sh`
+  twice — once per backend.
+- Public API: `new`, `insert`, `pop`, `delete`, `contains`,
+  `len`, `is_empty`, `iter_live`, `iter_filtered_subset`,
+  `assert_canonical`. Identical signatures on both backends.
+- `Send + Sync` (no interior mutability), so `SharedLSet`'s
+  `Mutex` wrap unchanged.
+- Determinism: the sorted-pop heap orders on `(sugar, arrival,
+  idx)`, with arrival monotonically assigned by `next_arrival`.
+  Two backends fed the same insert stream pop in the same order.
+
+**Invariants the flat backend's `assert_canonical` checks:**
+1. `pairs.len() == tombstones.len() == lcm_divmasks.len()`.
+2. Every live slot has `lcm_divmasks[idx] == pairs[idx].lcm_divmask`
+   and `pairs[idx].assert_canonical(ring)` holds.
+3. Every tombstoned slot has `lcm_divmasks[idx] == 0` (the
+   divmask cache is zeroed on tombstone).
+4. `by_indices[(i, j)]` always references a non-tombstoned slot
+   whose `pair.i == i && pair.j == j`.
+5. `live == count(!tombstones)`.
+
+**Wall:** *not measured by this task*. The deliverable is the
+implementation and the A/B-able feature flag. A follow-up task
+will benchmark both backends on c200-1 against the
+`bench-suite.sh` staging path and report the wall delta.
+
+**Pitfalls considered:**
+- *Pop semantics.* `BinaryHeap`'s `pop` returns by value, so the
+  flat backend can't use `mem::take` on a `Pair` slot without a
+  sentinel. Cloning the live `Pair` before tombstoning is one
+  `Pair::clone` per pop — bounded by the number of basis
+  elements, not by basis size, so far below the chain-criterion
+  scan savings the SIMD path will provide.
+- *Sorted-heap of indices.* The `BinaryHeap<Reverse<(sugar,
+  arrival, idx)>>` is small (`u32 + u64 + usize` per entry, ~20
+  bytes vs the heap-backend's ~88 bytes per HeapEntry) and the
+  `idx` tie-breaker keeps Ord total even when two pairs share
+  `(sugar, arrival)`.
+- *Tombstone-vs-divmask desync.* Pop, delete, and reinsert all
+  flip `tombstones[idx] = true` AND zero `lcm_divmasks[idx]` in
+  the same statement, so the SIMD primitive can never report a
+  dead slot for a non-zero query mask. `assert_canonical`
+  asserts the pairing in both directions. This is the analogue
+  of the C++ `sev_flat` desync bug
+  (`~/project/docs/refactor-sev-filtered-iterator-report.md`)
+  written defensively from the start.
+- *`assert_send_sync::<LSet>()` at `lib.rs:62`.* Both backends
+  are `Send + Sync` by construction (no `Cell`, `RefCell`, or
+  raw pointers); the compile-time check passes under both
+  feature configurations.
+- *Direction of the SIMD primitive.* Phase-2's divmask test is
+  "`h_lm_divmask ⊆ pair.lcm_divmask`" (a *superset* test on
+  `lcm_divmasks[i]`), so the iterator routes through
+  `find_divmask_superset_match`, *not* `find_divmask_match`.
+  The task spec called the latter; the former is correct given
+  the divisibility direction.
+
+### References
+
+* ADR-007 — original SEV pre-filter (the structural precedent).
+* ADR-009 — SIMD-batched superset sweep on BSet's
+  `lcm_sevs` (the immediate template the new iterator follows).
+* ADR-012 — the earlier deferred candidate this ADR supersedes.
+  ADR-012 marked **Superseded by #026** below.
+* ADR-025 — divmask fast-reject (the cached `lcm_divmask`
+  consumed by the new iterator).
+* `~/rustgb/src/lset.rs` — heap backend (default).
+* `~/rustgb/src/lset_flat.rs` — flat-Vec backend (this ADR).
+* `~/rustgb/src/lib.rs:53-57` — public alias selecting the
+  backend based on `--features flat_lset`.
+* `~/rustgb/src/gm.rs:194` — Phase-2 call site, now using
+  `iter_filtered_subset(h_lm_divmask)`.
+* `~/rustgb/src/parallel.rs:680` — parallel Phase-2 call site,
+  same transformation.
+* `~/rustgb/src/simd.rs` — `find_divmask_superset_match` (the
+  AVX2 primitive the iterator dispatches through).
+* `~/rustgb/tests/lset_contract.rs` — cross-backend contract
+  tests; same bodies run on either backend.
+* `~/project/docs/refactor-sev-filtered-iterator-report.md` —
+  the C++ writable_set / unordered_iterator refactor that
+  motivates this port.
+* `~/project/docs/staging-bench-30Apr2026.md` — the open thread
+  about the rustgb-vs-next-opt 2.5–3× gap that this ADR partly
+  addresses.
 
 ---
 

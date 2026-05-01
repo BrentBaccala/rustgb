@@ -188,6 +188,31 @@ impl LSet {
         })
     }
 
+    /// Iterate live pairs whose `lcm_divmask` is a *superset* of
+    /// `subset_mask` — i.e. `(subset_mask & !pair.lcm_divmask) == 0`.
+    ///
+    /// This is the chain-criterion Phase-2 fast-reject: a candidate
+    /// pair `p` survives the divmask filter iff every bit set in the
+    /// fresh element's `h_lm_divmask` is also set in `p.lcm_divmask`
+    /// (a necessary condition for `h_lm | p.lcm`). This iterator
+    /// pre-filters by divmask only — the caller still has to run
+    /// the exact `divides` check on each yielded element.
+    ///
+    /// On the heap backend this is a trivial wrapper around
+    /// [`iter_live`] with a scalar per-element filter. The flat
+    /// backend (`lset_flat::LSet`, behind `cargo --features
+    /// flat_lset`) implements the same API with a SIMD-batched
+    /// scan over a parallel `lcm_divmasks: Vec<u64>` array — same
+    /// semantics, much higher throughput. Call sites work against
+    /// either backend without `#[cfg]`.
+    pub fn iter_filtered_subset(
+        &self,
+        subset_mask: u64,
+    ) -> impl Iterator<Item = &Pair> + '_ {
+        self.iter_live()
+            .filter(move |p| (subset_mask & !p.lcm_divmask) == 0)
+    }
+
     /// Debug-only invariant check.
     pub fn assert_canonical(&self, ring: &crate::ring::Ring) {
         // Every live pair in the heap has a matching by_indices entry.
