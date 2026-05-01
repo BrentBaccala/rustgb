@@ -53,7 +53,7 @@ use crate::computation::Computation;
 use crate::field::Coeff;
 use crate::kbucket::KBucket;
 use crate::lobject::LObject;
-use crate::lset::LSet;
+use crate::LSet;
 use crate::monomial::Monomial;
 use crate::pair::Pair;
 use crate::poly::Poly;
@@ -679,13 +679,12 @@ fn chain_crit_l_side(
     h_idx: u32,
     l: &mut LSet,
 ) {
+    // ADR-026: divmask fast-reject is delegated to the LSet's
+    // `iter_filtered_subset` iterator (scalar on the heap backend,
+    // SIMD-batched on the flat backend under `--features flat_lset`).
     let mut to_drop: Vec<(u32, u32)> = Vec::new();
-    for pair in l.iter_live() {
+    for pair in l.iter_filtered_subset(h_lm_divmask) {
         if pair.i == h_idx || pair.j == h_idx {
-            continue;
-        }
-        // ADR-025: divmask fast-reject in place of SEV.
-        if (h_lm_divmask & !pair.lcm_divmask) != 0 {
             continue;
         }
         if !h_lm.divides(&pair.lcm, ring) {

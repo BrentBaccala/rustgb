@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::lset::LSet;
+use crate::LSet;
 use crate::poly::Poly;
 use crate::ring::Ring;
 

@@ -28,7 +28,7 @@ use crate::field::Coeff;
 use crate::gm::enterpairs;
 use crate::kbucket::KBucket;
 use crate::lobject::LObject;
-use crate::lset::LSet;
+use crate::LSet;
 use crate::poly::Poly;
 use crate::ring::Ring;
 use crate::sbasis::SBasis;

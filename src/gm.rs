@@ -23,7 +23,7 @@
 //! always use the straight "global ordering, no Mora ecart" path.
 
 use crate::bset::BSet;
-use crate::lset::LSet;
+use crate::LSet;
 use crate::monomial::Monomial;
 use crate::pair::Pair;
 use crate::poly::Poly;
@@ -190,15 +190,17 @@ pub fn chain_crit_normal(
     }
 
     // Phase 2: L-side G-M elimination.
+    //
+    // ADR-026: the divmask fast-reject is moved inside the LSet's
+    // `iter_filtered_subset` iterator so the heap-based backend
+    // sees a scalar per-element filter and the flat-Vec backend
+    // (under `--features flat_lset`) sees a SIMD-batched
+    // `find_divmask_superset_match` scan over its parallel
+    // `lcm_divmasks` array. The call site is unchanged in
+    // semantics; we just delegate the divmask test.
     let mut to_drop: Vec<(u32, u32)> = Vec::new();
-    for pair in l.iter_live() {
+    for pair in l.iter_filtered_subset(h_lm_divmask) {
         if pair.i == h_idx || pair.j == h_idx {
-            continue;
-        }
-        // Divmask fast-reject (ADR-025): h_lm | pair.lcm requires
-        // every bit set in h_lm_divmask to also be set in
-        // pair.lcm_divmask.
-        if (h_lm_divmask & !pair.lcm_divmask) != 0 {
             continue;
         }
         if !h_lm.divides(&pair.lcm, ring) {

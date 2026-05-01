@@ -33,6 +33,8 @@ pub mod gm;
 pub mod kbucket;
 pub mod lobject;
 pub mod lset;
+#[cfg(feature = "flat_lset")]
+pub mod lset_flat;
 pub mod monomial;
 pub mod ordering;
 pub mod pair;
@@ -50,7 +52,10 @@ pub use bset::BSet;
 pub use field::{Coeff, Field};
 pub use kbucket::KBucket;
 pub use lobject::LObject;
+#[cfg(not(feature = "flat_lset"))]
 pub use lset::LSet;
+#[cfg(feature = "flat_lset")]
+pub use lset_flat::LSet;
 pub use monomial::Monomial;
 pub use ordering::MonoOrder;
 pub use pair::{Pair, PairKey};
