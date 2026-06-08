@@ -785,6 +785,238 @@ impl Poly {
         self.sub_mul_term(c, m, q, ring)
     }
 
+    /// Destructive in-place `self - c·m·q` using caller-provided
+    /// reusable scratch buffers (ADR-030). Equivalent in result to
+    /// `self.sub_mul_term(c, m, q, ring)`, but:
+    ///
+    /// * **No per-call allocation.** The merge output is written into
+    ///   the caller's `scratch_c` / `scratch_m` (cleared first, capacity
+    ///   reused). The result `Poly` takes ownership of those buffers via
+    ///   `mem::swap`; `self`'s now-drained buffers are swapped back into
+    ///   the scratch slots, so the two buffer pairs ping-pong and steady
+    ///   state allocates nothing.
+    /// * **No surviving-monomial clones.** `self`'s live terms are
+    ///   *moved* out of its `terms` Vec via `Vec::drain` (a `memcpy` of
+    ///   the 48-byte POD `Monomial`, no `Clone`), rather than cloned.
+    ///   Only genuinely-new `m·q[j]` terms are freshly built (by
+    ///   `m.mul`, which constructs in place — also no clone).
+    ///
+    /// This is the Vec-backend analogue of Singular's
+    /// `p_Minus_mm_Mult_qq__T` node-splice contract (zero alloc per
+    /// surviving term), achieved without the list-walk pointer-chasing
+    /// of the `linked_list_poly` backend (ADR-015) — see ADR-030.
+    ///
+    /// Per ADR-018 the caller's ring construction must keep every
+    /// `m·q[j]` product in-range; release builds do not check.
+    ///
+    /// The divmask is deferred (ADR-029): the output feeds a bucket
+    /// slot whose divmask is never read.
+    pub(crate) fn sub_mm_mult_qq_into(
+        mut self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+        scratch_c: &mut Vec<Coeff>,
+        scratch_m: &mut Vec<Monomial>,
+    ) -> Poly {
+        debug_assert!(c < ring.field().p());
+        if c == 0 || q.is_zero() {
+            return self;
+        }
+        let f = ring.field();
+        let q_c = q.live_coeffs();
+        let q_m = q.live_terms();
+
+        scratch_c.clear();
+        scratch_m.clear();
+        scratch_c.reserve(self.len() + q_c.len());
+        scratch_m.reserve(self.len() + q_c.len());
+
+        // Drain `self`'s live region by value — moves each surviving
+        // monomial out (POD memcpy, no Clone). The drain holds a mutable
+        // borrow of `self.terms` for its lifetime; we pair it with an
+        // index walk over the coefficient slice we copy out first
+        // (Coeff is a u32, trivially copied).
+        let head = self.head;
+        let self_c: Vec<Coeff> = self.coeffs[head..].to_vec();
+        let mut si = 0usize;
+        let mut sm = self.terms.drain(head..);
+        // Peekable-by-hand: hold the current drained monomial.
+        let mut cur_m: Option<Monomial> = sm.next();
+
+        let mut j = 0usize;
+        while cur_m.is_some() && j < q_m.len() {
+            let mq_mon = m.mul(&q_m[j], ring);
+            // SAFETY: cur_m is Some here.
+            match cur_m.as_ref().unwrap().cmp(&mq_mon, ring) {
+                std::cmp::Ordering::Greater => {
+                    scratch_c.push(self_c[si]);
+                    scratch_m.push(cur_m.take().unwrap());
+                    si += 1;
+                    cur_m = sm.next();
+                }
+                std::cmp::Ordering::Less => {
+                    let neg = f.neg(f.mul(c, q_c[j]));
+                    if neg != 0 {
+                        scratch_c.push(neg);
+                        scratch_m.push(mq_mon);
+                    }
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    let cmq = f.mul(c, q_c[j]);
+                    let diff = f.sub(self_c[si], cmq);
+                    let mono = cur_m.take().unwrap();
+                    if diff != 0 {
+                        scratch_c.push(diff);
+                        scratch_m.push(mono);
+                    }
+                    si += 1;
+                    j += 1;
+                    cur_m = sm.next();
+                }
+            }
+        }
+        while let Some(mono) = cur_m.take() {
+            scratch_c.push(self_c[si]);
+            scratch_m.push(mono);
+            si += 1;
+            cur_m = sm.next();
+        }
+        while j < q_m.len() {
+            let neg = f.neg(f.mul(c, q_c[j]));
+            if neg != 0 {
+                scratch_c.push(neg);
+                scratch_m.push(m.mul(&q_m[j], ring));
+            }
+            j += 1;
+        }
+        drop(sm);
+
+        self.finish_into(ring, scratch_c, scratch_m)
+    }
+
+    /// Destructive in-place `self + other` using caller-provided
+    /// reusable scratch buffers (ADR-030). The Vec-backend analogue of
+    /// Singular's `p_Add_q__T` node-splice merge. Same buffer-recycling
+    /// and move-not-clone discipline as
+    /// [`sub_mm_mult_qq_into`](Self::sub_mm_mult_qq_into): `self`'s
+    /// surviving terms are moved (not cloned) and `other`'s surviving
+    /// terms are moved out of `other` (also consumed by value). Result
+    /// takes the scratch buffers; the consumed buffers recycle back.
+    ///
+    /// The divmask is deferred (ADR-029).
+    pub(crate) fn add_into(
+        mut self,
+        mut other: Poly,
+        ring: &Ring,
+        scratch_c: &mut Vec<Coeff>,
+        scratch_m: &mut Vec<Monomial>,
+    ) -> Poly {
+        if other.is_zero() {
+            return self;
+        }
+        if self.is_zero() {
+            return other;
+        }
+        let f = ring.field();
+
+        scratch_c.clear();
+        scratch_m.clear();
+        scratch_c.reserve(self.len() + other.len());
+        scratch_m.reserve(self.len() + other.len());
+
+        let a_head = self.head;
+        let b_head = other.head;
+        let a_c: Vec<Coeff> = self.coeffs[a_head..].to_vec();
+        let b_c: Vec<Coeff> = other.coeffs[b_head..].to_vec();
+        let mut ai = 0usize;
+        let mut bi = 0usize;
+        let mut am = self.terms.drain(a_head..);
+        let mut bm = other.terms.drain(b_head..);
+        let mut cur_a: Option<Monomial> = am.next();
+        let mut cur_b: Option<Monomial> = bm.next();
+
+        while cur_a.is_some() && cur_b.is_some() {
+            match cur_a.as_ref().unwrap().cmp(cur_b.as_ref().unwrap(), ring) {
+                std::cmp::Ordering::Greater => {
+                    scratch_c.push(a_c[ai]);
+                    scratch_m.push(cur_a.take().unwrap());
+                    ai += 1;
+                    cur_a = am.next();
+                }
+                std::cmp::Ordering::Less => {
+                    scratch_c.push(b_c[bi]);
+                    scratch_m.push(cur_b.take().unwrap());
+                    bi += 1;
+                    cur_b = bm.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    let s = f.add(a_c[ai], b_c[bi]);
+                    let mono = cur_a.take().unwrap();
+                    if s != 0 {
+                        scratch_c.push(s);
+                        scratch_m.push(mono);
+                    }
+                    ai += 1;
+                    bi += 1;
+                    cur_a = am.next();
+                    cur_b = bm.next();
+                }
+            }
+        }
+        while let Some(mono) = cur_a.take() {
+            scratch_c.push(a_c[ai]);
+            scratch_m.push(mono);
+            ai += 1;
+            cur_a = am.next();
+        }
+        while let Some(mono) = cur_b.take() {
+            scratch_c.push(b_c[bi]);
+            scratch_m.push(mono);
+            bi += 1;
+            cur_b = bm.next();
+        }
+        drop(am);
+        drop(bm);
+        let _ = other; // `other`'s emptied buffers drop here (not recycled)
+
+        self.finish_into(ring, scratch_c, scratch_m)
+    }
+
+    /// Shared tail of the `*_into` destructive merges: move the
+    /// freshly-merged output out of the caller's scratch buffers into
+    /// `self`, recycle `self`'s drained buffers back into the scratch
+    /// slots, refresh the cheap cache fields (divmask deferred). `self`
+    /// arrives with its `terms`/`coeffs` already drained empty (length
+    /// 0) — only the allocation remains, which we hand back to the
+    /// scratch.
+    #[inline]
+    fn finish_into(
+        mut self,
+        ring: &Ring,
+        scratch_c: &mut Vec<Coeff>,
+        scratch_m: &mut Vec<Monomial>,
+    ) -> Poly {
+        // After `drain(head..)`, `self.terms` still holds the dead
+        // prefix `[0..head]`; `self.coeffs` is untouched (we copied,
+        // not drained, the live coeffs). Clear both so we hand back two
+        // empty (but allocated) Vecs to the scratch slots. `Monomial`
+        // and `Coeff` have no Drop side effects, so `clear` is a cheap
+        // length reset.
+        self.terms.clear();
+        self.coeffs.clear();
+        // Swap the merged scratch into `self`; `self`'s emptied buffers
+        // go back to the scratch slots for the next call. Net: zero
+        // steady-state allocation, buffers ping-pong.
+        std::mem::swap(&mut self.coeffs, scratch_c);
+        std::mem::swap(&mut self.terms, scratch_m);
+        self.head = 0;
+        self.refresh_lm_cheap(ring);
+        self
+    }
+
     /// Return a scalar multiple that makes the leading coefficient 1.
     /// Zero is returned unchanged. Requires a nonzero leading coefficient
     /// that's invertible (always true over a prime field for nonzero lc).

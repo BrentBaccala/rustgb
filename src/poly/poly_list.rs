@@ -912,6 +912,37 @@ impl Poly {
         }
     }
 
+    /// Scratch-buffer destructive subtract (ADR-030). The List backend
+    /// already splices nodes in place via the `*_consuming` path
+    /// (ADR-015), so it has no use for the Vec backend's reusable
+    /// scratch buffers — this is a thin forwarder that ignores them,
+    /// keeping `KBucket` backend-agnostic.
+    pub(crate) fn sub_mm_mult_qq_into(
+        self,
+        c: Coeff,
+        m: &Monomial,
+        q: &Poly,
+        ring: &Ring,
+        _scratch_c: &mut Vec<Coeff>,
+        _scratch_m: &mut Vec<Monomial>,
+    ) -> Poly {
+        self.sub_mm_mult_qq_consuming(c, m, q, ring)
+    }
+
+    /// Scratch-buffer destructive add (ADR-030). List-backend
+    /// forwarder to the splice-based `add_consuming` (ADR-015);
+    /// ignores the scratch buffers. See
+    /// [`Self::sub_mm_mult_qq_into`].
+    pub(crate) fn add_into(
+        self,
+        other: Poly,
+        ring: &Ring,
+        _scratch_c: &mut Vec<Coeff>,
+        _scratch_m: &mut Vec<Monomial>,
+    ) -> Poly {
+        self.add_consuming(other, ring)
+    }
+
     /// Hand-specialised inner reduction step for the rustgb-supported
     /// ring fingerprint (Z/p, degrevlex, ≤31 vars; ADR-023). The body
     /// is structurally identical to

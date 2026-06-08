@@ -5183,6 +5183,149 @@ end-to-end proof that no divisor was dropped.
 
 ---
 
+## ADR-030: Destructive in-place Vec subtract via reusable scratch buffers
+
+**Status:** Accepted
+**Date:** 2026-06-08
+
+### Context
+
+Lever #2 of the geobucket-pipeline optimization. The per-operation
+comparison (`~/project/reports/rustgb-nextopt-perop-comparison.md`)
+attributed ~1252 ms to `sub_mul_term`+`merge` on staging-5101449 — ~8×
+heavier per op than Singular's `p_Minus_mm_Mult_qq` (145 ms). The cost
+is **allocation and copying**, not op-count: the Vec backend's
+`sub_mul_term` (`poly_vec.rs:596`) and `merge` (`:820`) each allocate
+**two fresh `Vec`s** (`out_c`, `out_m`) per call and **clone every
+surviving 32/48-byte `Monomial`** into the output. Singular's templated
+`p_Minus_mm_Mult_qq__T` splices existing list nodes in place — zero
+allocation, zero monomial copy, one omalloc-bin node per genuinely-new
+`m·q` term.
+
+### Singular's approach
+
+`p_Minus_mm_Mult_qq__T.cc` is destructive on `p`: a surviving term's
+existing node is spliced into the result (`a = pNext(a) = p; pIter(p)`)
+with its coefficient mutated in place — zero alloc, zero copy. Only a
+genuinely-new `m·q[i]` term allocates one node from the per-ring
+omalloc bin (O(1) free-list). `p_Add_q__T.cc` does the same for the
+add path, with an O(1) tail-splice when one operand exhausts.
+
+### FLINT's approach
+
+**N/A for the destructive contract — FLINT has no linked-list backend
+and no GB engine.** FLINT's `nmod_mpoly` merges (`add.c`,
+`divrem_monagan_pearce.c`) fresh-allocate flat output arrays sized to
+the worst case and write by index (the pattern rustgb's *non*-
+destructive Vec `merge` already follows, ADR-006). FLINT never reuses
+the input arrays because its heap reducer operates on indices into
+immutable source arrays, so the "destructive merge into the same
+buffer" question doesn't arise there.
+
+### Decision
+
+Give the **Vec** backend a destructive merge — **not** a switch to the
+`linked_list_poly` backend. ADR-015 already ported Singular's
+node-splice contract to the List backend (731 s → ~126 s with
+ADR-016), but the 30 Apr staging bench measured it within ±2 % of the
+Vec backend *under the geobucket reducer*: the splice win is cancelled
+by ~2× list-walk pointer-chasing (ADR-015 leaves that half
+unaddressed). The win is the combination neither current backend has —
+**no allocation AND no pointer-chasing** — which only a destructive Vec
+merge delivers.
+
+**Shape chosen: reusable scratch buffers that also move (not clone)
+surviving monomials.** Of the two shapes the lever spec offered, this
+is the provably-correct one that captures *both* wins:
+
+* **A per-`KBucket` scratch buffer pair** (`scratch_c: Vec<Coeff>`,
+  `scratch_m: Vec<Monomial>`). The bucket is single-owner (`!Sync`), so
+  one pair amortises across every `minus_m_mult_p`/`absorb` merge it
+  performs. New Vec methods `Poly::sub_mm_mult_qq_into` and
+  `Poly::add_into` take `self` by value plus `&mut` scratch buffers,
+  merge the output into the (cleared, capacity-reused) scratch, then in
+  `finish_into` **swap** the merged scratch into the result `Poly` and
+  swap `self`'s drained-empty buffers back into the scratch slots. The
+  two buffer pairs ping-pong, so steady-state reduction allocates **no
+  new Vec**.
+* **Surviving monomials are moved, not cloned.** `self`'s live terms
+  are drained out of `self.terms` via `Vec::drain(head..)`, which moves
+  each `Monomial` by value (a `memcpy` of the POD struct — `Monomial`
+  has no `Drop`), rather than `clone()`. The add path drains `other`
+  too. Only genuinely-new `m·q[j]` terms are freshly built, by
+  `Monomial::mul` (constructs in place — no clone either). Coefficients
+  (`u32`) are copied trivially.
+
+**Why not the "true in-place into `self`'s own buffers" shape?** For
+`sub_mul_term` the output can be *longer* than `self` (new `m·q` terms
+that don't cancel), so a write cursor into `self.terms` would overtake
+the unread read cursor — the exact overtaking hazard the lever spec
+flags. The scratch-buffer shape sidesteps it: input and output are
+physically distinct buffers, so the merge is a trivially-correct
+two-run merge, while the swap-and-recycle still yields zero
+steady-state allocation. It copies *coefficients* (4 bytes each, into a
+recycled buffer) but **not** monomials, so the dominant
+clone/allocation cost is gone and the correctness proof is
+one-paragraph.
+
+The hot-path callers in `kbucket.rs` (`minus_m_mult_p`, the `absorb`
+cascade) are wired to the `*_into` methods the way ADR-015 wired the
+`*_consuming` methods, but on the Vec backend. The non-destructive
+`sub_mul_term` / `merge` / `add` / `sub` stay for the heap-backend and
+test callers (ADR-015 did the same). The List backend gets thin
+`*_into` forwarders that ignore the scratch and call the splice-based
+`*_consuming` path, keeping `KBucket` backend-agnostic.
+
+### Correctness
+
+The merge is a standard two-pointer merge of two strictly-descending
+runs (`self`'s live terms and `c·m·q`) into a third buffer — identical
+term selection / cancellation logic to the existing non-destructive
+`sub_mul_term`, verified bit-for-bit by the `KBucket` move/clone
+equivalence already covered in the kbucket unit tests and the staging
+fixtures. The move-out via `drain` is sound because `Monomial`/`Coeff`
+have no `Drop`, so a moved-from slot needs no cleanup and the source
+Vec is fully cleared before being recycled. The output divmask is
+deferred (ADR-029); the cheap fields are refreshed in `finish_into`.
+Output unchanged: 3/3 staging fixtures bit-for-bit; default 209/209,
+`--no-default-features --features redtail` 205/205, and the
+`linked_list_poly` backend 223/223 (forwarders).
+
+### Consequences
+
+* Zero steady-state allocation and zero surviving-monomial copies on
+  the Vec reduction hot path; only `Coeff` (u32) values are copied into
+  the recycled coefficient buffer. The per-bucket scratch grows once to
+  the high-water mark and is reused.
+* The scratch lives on `KBucket`, so its lifetime matches the
+  reduction; it is dropped with the bucket. No global/thread-local
+  state, no `Sync` concern (the bucket is `!Sync`).
+* `add_into`'s `self.is_zero()` / `other.is_zero()` fast paths return
+  the non-empty operand directly (no merge, no recycle) — the common
+  seed case.
+* Wall payoff intentionally **not** benchmarked here (task-runner
+  subagent under the 600 s stream watchdog); the external A/B pass
+  measures it.
+
+### References
+
+* `~/project/reports/rustgb-nextopt-perop-comparison.md` — the
+  ~1252 ms subtract frame and the lever spec (including the
+  scratch-vs-true-in-place trade-off).
+* ADR-015 — the List-backend splice contract this deliberately does
+  *not* switch to, and the `*_consuming` wiring pattern this mirrors.
+* ADR-006 — the non-destructive FLINT-style Vec merge (still used by
+  the heap-backend/test callers).
+* ADR-029 — the deferred-divmask policy the `*_into` outputs follow.
+* `~/rustgb/src/poly/poly_vec.rs` — `sub_mm_mult_qq_into`,
+  `add_into`, `finish_into`.
+* `~/rustgb/src/kbucket.rs` — `scratch_c`/`scratch_m`, the wired
+  `minus_m_mult_p` / `absorb`.
+* `~/Singular/libpolys/polys/templates/p_Minus_mm_Mult_qq__T.cc`,
+  `p_Add_q__T.cc` — the destructive node-splice reference.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
