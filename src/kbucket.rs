@@ -152,19 +152,6 @@ pub struct KBucket {
     /// Bitmask of slots changed since the last `leading()` call.
     /// Bit `i` (i < `NUM_SLOTS`) corresponds to slot `i`.
     dirty: u32,
-    /// Reusable scratch coefficient buffer for the destructive
-    /// in-place merges (ADR-030). The bucket is single-owner
-    /// (`!Sync`), so one buffer pair amortises across all the
-    /// `minus_m_mult_p` / `absorb` merges this bucket performs: the
-    /// `*_into` Poly methods merge into these buffers and swap them
-    /// with the consumed poly's drained buffers, so steady-state
-    /// reduction allocates no new Vec. Empty (zero-capacity) on the
-    /// List backend, where the `*_into` methods forward to the
-    /// list-splice `*_consuming` path (ADR-015) and ignore the
-    /// scratch.
-    scratch_c: Vec<Coeff>,
-    /// Reusable scratch monomial buffer. See [`Self::scratch_c`].
-    scratch_m: Vec<Monomial>,
     /// Force `!Sync`: `KBucket` is owned by at most one thread at a
     /// time. `PhantomData<Cell<()>>` is `Send` but not `Sync`.
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
@@ -180,8 +167,6 @@ impl KBucket {
             slots: std::array::from_fn(|_| None),
             lm_cache: None,
             dirty: 0,
-            scratch_c: Vec::new(),
-            scratch_m: Vec::new(),
             _not_sync: std::marker::PhantomData,
         }
     }
@@ -322,19 +307,12 @@ impl KBucket {
                 Some(existing) => {
                     // Both operands are already owned here (existing
                     // via `take()`, q by value), so use the
-                    // destructive variant. On the Vec backend (ADR-030)
-                    // `add_into` merges into the bucket's reusable
-                    // scratch buffers and recycles the consumed polys'
-                    // buffers — no per-call allocation, surviving
-                    // monomials moved not cloned. On the List backend
-                    // (ADR-015) it forwards to the splice-based
-                    // `add_consuming` and ignores the scratch.
-                    let merged = existing.add_into(
-                        q,
-                        &self.ring,
-                        &mut self.scratch_c,
-                        &mut self.scratch_m,
-                    );
+                    // destructive variant — on the List backend this
+                    // splices input nodes into the output chain
+                    // instead of allocating a fresh Box<Node> per
+                    // output term (ADR-015). On the Vec backend
+                    // `add_consuming` is a thin forwarder to `add`.
+                    let merged = existing.add_consuming(q, &self.ring);
                     if merged.is_zero() {
                         // Accumulated sum cancelled; nothing to
                         // place. The slot was emptied — pass None
@@ -409,21 +387,7 @@ impl KBucket {
         // that `m * p[i]` products stay in-range; release builds
         // do not check. Debug builds catch violations inside
         // `Monomial::mul` via `debug_assert!`.
-        //
-        // ADR-030: the Vec backend's `sub_mm_mult_qq_into` performs the
-        // `existing - c·m·p` merge destructively into the bucket's
-        // reusable scratch buffers (no per-call allocation; surviving
-        // monomials moved, not cloned) and recycles `existing`'s
-        // drained buffers. The List backend forwards to the
-        // splice-based consuming path (ADR-015).
-        let merged = existing.sub_mm_mult_qq_into(
-            c,
-            m,
-            p,
-            &self.ring,
-            &mut self.scratch_c,
-            &mut self.scratch_m,
-        );
+        let merged = existing.sub_mm_mult_qq_consuming(c, m, p, &self.ring);
         if merged.is_zero() {
             // Sum cancelled at this slot; no further work.
             self.mark_dirty(i, None);
