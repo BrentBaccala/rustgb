@@ -27,7 +27,8 @@
 //! switch to a lock-free design; that's not this task's problem.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use crate::fxhash::{FxHashMap, FxHashSet};
+use std::collections::BinaryHeap;
 
 use crate::pair::{Pair, PairKey};
 
@@ -68,8 +69,8 @@ impl PartialOrd for HeapEntry {
 #[derive(Debug, Default)]
 pub struct LSet {
     heap: BinaryHeap<Reverse<HeapEntry>>,
-    deleted: HashSet<PairKey>,
-    by_indices: HashMap<(u32, u32), PairKey>,
+    deleted: FxHashSet<PairKey>,
+    by_indices: FxHashMap<(u32, u32), PairKey>,
     next_key: u64,
     live: usize,
 }
@@ -79,8 +80,8 @@ impl LSet {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
-            deleted: HashSet::new(),
-            by_indices: HashMap::new(),
+            deleted: FxHashSet::default(),
+            by_indices: FxHashMap::default(),
             next_key: 1,
             live: 0,
         }

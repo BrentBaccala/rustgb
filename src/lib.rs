@@ -29,6 +29,7 @@ pub mod bset;
 pub mod computation;
 pub mod ffi;
 pub mod field;
+mod fxhash;
 pub mod gm;
 pub mod kbucket;
 pub mod lobject;

@@ -4904,6 +4904,89 @@ analogue.
 
 ---
 
+## ADR-028: FxHash for the L-set / B-set pair indices
+
+**Status:** Accepted
+**Date:** 2026-06-08
+
+### Context
+
+The `flat_lset` `LSet` (ADR-026) and the `BSet` each keep a
+`by_indices: HashMap<(u32, u32), usize>` mapping a pair's basis
+indices `(i, j)` to its slot, for O(1) "does this pair already
+exist?" dedup during pair generation and chain-criterion updates.
+The retained heap `LSet` (`src/lset.rs`) additionally keeps a
+`deleted: HashSet<PairKey>` tombstone set. All were constructed with
+`HashMap::new()` / `HashSet::new()` — i.e. the std default hasher
+`RandomState` = **SipHash-1-3**, a keyed cryptographic hash sized for
+HashDoS resistance.
+
+The 2026-06-08 rust-vs-`next-opt` per-operation profile comparison
+(staging-5101449, c200-1) attributed **~3.7 % of wall** to SipHash on
+these `(u32, u32)` keys — `core::hash::BuildHasher::hash_one`
+(1.95 %) + the inlined `DefaultHasher::write` (1.75 %). The keys are
+8 bytes and engine-internal (never attacker-controlled), so the DoS
+resistance buys nothing while the per-key cost is ~20× a trivial
+integer hash.
+
+This was first flagged in the 2026-05-01 flat-backend profile ("an
+`FxHashMap`/`ahash` swap on `BSet` is worth ~5–6 %") and confirmed,
+with a direct C++ precedent, by the per-operation comparison.
+
+### Decision
+
+Add a minimal `src/fxhash.rs` implementing the **rustc-hash FxHasher**
+algorithm (`hash = (hash.rotate_left(5) ^ word).wrapping_mul(SEED)`
+per machine word, `SEED = 0x517cc1b727220a95`) and `FxHashMap` /
+`FxHashSet` type aliases over `BuildHasherDefault<FxHasher>`. No
+external crate — the crate stays stdlib-only, and the algorithm is
+~30 lines.
+
+Switch all three pair-index maps to it: `flat_lset` `by_indices`
+(the default, profiled), `BSet` `by_indices`, and the heap `LSet`'s
+`by_indices` + `deleted`. Keys are `(u32, u32)` / `PairKey`, which
+route through `write_u32`, so each key is two multiply-rotates.
+
+### How Singular does it
+
+`next-opt`'s analogous `LSet::pair_index`
+(`std::unordered_map<std::pair<poly,poly>, iterator, PolyPairHash>`,
+`kernel/GBEngine/kutil.h:296-324`) hashes its key with a trivial
+`h1 ^ (h2 << 1)` over two `std::hash<poly>` pointer hashes —
+essentially free, which is why it never appears in the C++ profile.
+FxHash brings rustgb to the same regime (the key is 8 bytes either
+way). So this is *not* rustgb removing a structure Singular lacks —
+both maintain a pair index; rustgb was simply paying for a
+cryptographic hash where Singular pays for a pointer xor.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine** and no S-pair index.
+
+### Consequences
+
+- Identical reduced GB on all backends; `cargo test --release` (flat,
+  209/209) and `--no-default-features --features redtail` (heap,
+  205/205) pass unchanged. The hasher choice cannot affect output —
+  only iteration order of the maps, which the engine never depends on
+  (pop order comes from the sorted heap, not the index map).
+- **Measured payoff (c200-1 same-campaign A/B, SipHash vs FxHash, both
+  flat + SSE4.1):** _(filled in by the follow-on bench — see
+  `~/project/reports/rustgb-lset-flat-bench-report.md`)._
+- Not HashDoS-resistant — acceptable: keys are basis indices the
+  engine generates itself, never external input.
+
+### References
+
+- `~/rustgb/src/fxhash.rs` — the FxHasher + aliases.
+- `~/rustgb/src/{lset_flat,bset,lset}.rs` — the three swapped maps.
+- `~/Singular-next-opt/kernel/GBEngine/kutil.h:296-324` —
+  `PolyPairHash` + `pair_index`, the trivial-hash precedent.
+- `~/project/reports/rustgb-lset-flat-bench-report.md` — the
+  per-operation comparison that quantified the ~3.7 % SipHash cost.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

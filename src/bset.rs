@@ -11,7 +11,7 @@
 //! walks it linearly and the hash index is enough for
 //! remove-by-indices. No priority queue here.
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 
 use crate::pair::Pair;
 
@@ -40,7 +40,7 @@ pub struct BSet {
     /// (i, j) → index into `pairs`. Never holds a stale mapping: on
     /// removal the last element is swapped in and the hash for the
     /// swapped-in pair is updated.
-    by_indices: HashMap<(u32, u32), usize>,
+    by_indices: FxHashMap<(u32, u32), usize>,
 }
 
 impl BSet {
@@ -50,7 +50,7 @@ impl BSet {
             pairs: Vec::new(),
             lcm_sevs: Vec::new(),
             lcm_divmasks: Vec::new(),
-            by_indices: HashMap::new(),
+            by_indices: FxHashMap::default(),
         }
     }
 

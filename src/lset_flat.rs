@@ -78,7 +78,8 @@
 //! backend in a `Mutex` exactly the same way as the heap backend.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use crate::fxhash::FxHashMap;
+use std::collections::BinaryHeap;
 
 use crate::pair::{Pair, PairKey};
 
@@ -130,7 +131,7 @@ pub struct LSet {
     /// holds the live pair for those indices. Always points at a
     /// non-tombstoned slot; updated by `insert` (which tombstones
     /// the previous live slot for the same `(i, j)`) and `delete`.
-    by_indices: HashMap<(u32, u32), usize>,
+    by_indices: FxHashMap<(u32, u32), usize>,
     /// `BinaryHeap<Reverse<(sugar, arrival, idx)>>` for ordered pop.
     /// Entries for tombstoned slots are skipped on pop.
     sorted: BinaryHeap<Reverse<SortedKey>>,
@@ -150,7 +151,7 @@ impl LSet {
             pairs: Vec::new(),
             tombstones: Vec::new(),
             lcm_divmasks: Vec::new(),
-            by_indices: HashMap::new(),
+            by_indices: FxHashMap::default(),
             sorted: BinaryHeap::new(),
             next_key: 1,
             live: 0,
