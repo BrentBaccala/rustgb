@@ -4875,9 +4875,22 @@ analogue.
   `is_x86_feature_detected!`) against the scalar oracle, not only
   through dispatch — so coverage is real on both single-path and
   multi-path hosts.
-- Wall payoff is measured in a follow-up c200-1 re-bench
-  (`~/project/reports/rustgb-lset-flat-bench-report.md` is the prior
-  scalar-scan baseline to beat).
+- **Wall payoff (measured, c200-1, same-campaign A/B, 5 runs each):**
+  SSE4.1-flat (`08bb1a5`) vs scalar-flat (`91df020`) — the two builds
+  differ only in the SEV-scan dispatch:
+
+  | staging test | scalar (s) | SSE4.1 (s) | Δ wall | Δ instructions |
+  |---|---:|---:|---:|---:|
+  | 5101449 | 13.505 ± 0.009 | 12.612 ± 0.007 | **−6.61 %** | −7.83 % |
+  | 5104053 | 22.080 ± 0.070 | 20.883 ± 0.125 | **−5.42 %** | −7.92 % |
+  | 5106746 | 28.423 ± 0.011 | 25.714 ± 0.041 | **−9.53 %** | −11.68 % |
+
+  Δinstructions exceeds Δwall on every test (vectorisation retires
+  far fewer instructions), CVs < 0.6 %. Cumulative with ADR-026
+  (heap → flat → flat+SSE4.1): −14.8 / −13.7 / −18.1 %. The AVX2
+  path's payoff on a Zen/Haswell+ host is not yet measured (no quiet
+  AVX2 bench host); dispatch selects it there automatically. Full
+  write-up: `~/project/reports/rustgb-lset-flat-bench-report.md`.
 
 ### References
 
