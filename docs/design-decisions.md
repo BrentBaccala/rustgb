@@ -5326,6 +5326,100 @@ Output unchanged: 3/3 staging fixtures bit-for-bit; default 209/209,
 
 ---
 
+## ADR-031: Route `reduce_tail` through the shared `find_divisor_idx`
+
+**Status:** Accepted
+**Date:** 2026-06-08
+
+### Context
+
+Lever #3 of the geobucket-pipeline optimization. The per-operation
+comparison (`~/project/reports/rustgb-nextopt-perop-comparison.md`)
+attributed ~1186 ms to `reduce_tail` on staging-5101449, against
+Singular's `redtailBba` being effectively invisible (<82 ms). Most of
+that is the per-step cost (levers #1/#2) multiplied across every tail
+term, but `reduce_tail` (`bba.rs`) also had two tail-specific misses
+the head reducer doesn't:
+
+* it **hand-rolled a scalar divmask scan** (`for idx in 0..len { skip
+  redundant; divmask fast-reject; divides }`) instead of calling the
+  shared `find_divisor_idx`, so it **bypassed the SIMD-batched
+  `find_divmask_match`** (ADR-007 / ADR-025) and scanned the
+  ~3000-element basis scalar-ly per irreducible tail term;
+* it dereferenced `s_basis.poly(idx).leading()` for each candidate's
+  leading monomial — a `Box<Poly>` chase — instead of the contiguous
+  `s_basis.lms()` cache (ADR-010).
+
+### Singular's approach
+
+Singular's `redtailBba` (`kernel/GBEngine/kutil.cc:6398`) uses the
+*same* divisor-search machinery (`kFindDivisibleByInT` +
+`SetShortExpVector`) as the head reducer in `bba()` — it does not carry
+a second, divergent scan. Routing rustgb's tail reduction through the
+same `find_divisor_idx` the head reducer uses brings it to parity with
+that structure.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine** and no separate tail-reduction pass;
+its `nmod_mpoly_div` reduces all terms in one heap-based pass with no
+basis-sweep divisor search to share or diverge.
+
+### Decision
+
+Replace `reduce_tail`'s hand-rolled scalar scan with a call to the
+existing `find_divisor_idx(s_basis, lm_divmask, &m, ring)` — the same
+helper `reduce_lobject_geobucket` uses. This is a refactor, not a new
+algorithm, but it is recorded as an ADR because it makes a **divisor-
+eligibility contract** explicit: the two call sites must agree on which
+basis elements are eligible divisors, and they do —
+
+* **redundant entries:** both skip `redundant_flags()[idx]`.
+  `reduce_tail`'s callers rely on this for self-exclusion:
+  `tail_reduce_all` temporarily sets element `i` redundant while
+  reducing `f = basis[i]`'s tail (so `f` can't reduce by itself), and
+  `reduce_h_tail` reduces an `h` that is **not yet in the basis** (no
+  self-exclusion needed). `find_divisor_idx` honours the same flag, so
+  both cases work unchanged.
+* **fast-reject filter:** both apply the divmask reject
+  `(s_divmask & !lm_divmask) != 0`.
+* **ground truth:** both confirm survivors with `Monomial::divides`.
+
+No eligibility difference exists between head and tail reduction here
+(both search the full current basis minus redundant entries), so the
+shared helper is used directly rather than factoring a second variant.
+The per-leader `lm_divmask` is still computed once per distinct tail
+leader (`ring.divmask_of`): the tail bucket is a raw
+`KBucket::from_poly`, not an `LObject`, so unlike the head reducer
+there is no cached leader divmask to reuse — the reuse the lever
+contemplated does not apply to this call site.
+
+### Consequences
+
+* The tail divisor sweep now uses the runtime AVX2/SSE4.1/scalar
+  dispatch (ADR-027) and the contiguous `lms` cache (ADR-010), matching
+  the head reducer instead of running a slower scalar duplicate.
+* One fewer copy of the scan logic to keep in sync; future filter
+  changes (e.g. a 128-bit divmask) land in `find_divisor_idx` once and
+  cover both head and tail reduction.
+* Output unchanged: 3/3 staging fixtures bit-for-bit; default 209/209,
+  `--no-default-features --features redtail` 205/205. Wall payoff
+  intentionally **not** benchmarked here (external A/B pass).
+
+### References
+
+* `~/project/reports/rustgb-nextopt-perop-comparison.md` — the
+  ~1186 ms `reduce_tail` frame and the lever spec.
+* ADR-007 / ADR-025 — the SIMD `find_divmask_match` scan now reused.
+* ADR-010 — the contiguous `SBasis::lms()` cache `find_divisor_idx`
+  reads.
+* ADR-024 — the per-step `redTail` reduction whose inner search this
+  routes.
+* `~/rustgb/src/bba.rs` — `reduce_tail`, `find_divisor_idx`.
+* `~/Singular/kernel/GBEngine/kutil.cc:6398` — `redtailBba`.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

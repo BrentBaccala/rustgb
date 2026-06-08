@@ -593,33 +593,23 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
             break;
         };
         let m = m_ref.clone();
-        // ADR-025: per-leader divmask compute. One call per
-        // distinct leader of the tail reduction (amortised by the
-        // inner divmask-pre-filtered scan over the basis).
+        // ADR-025: per-leader divmask compute. One call per distinct
+        // leader of the tail reduction (the bucket here is a raw
+        // `KBucket::from_poly`, not an `LObject`, so there is no cached
+        // leader divmask to reuse — unlike the head reducer, whose
+        // `LObject::refresh` caches it).
         let lm_divmask = ring.divmask_of(&m);
 
-        // Divmask fast-reject + real divisibility check.
-        let divmasks = s_basis.divmasks();
-        let redund = s_basis.redundant_flags();
-        let mut divisor: Option<usize> = None;
-        for idx in 0..s_basis.len() {
-            if redund[idx] {
-                continue;
-            }
-            let s_divmask = divmasks[idx];
-            if (s_divmask & !lm_divmask) != 0 {
-                continue;
-            }
-            let s_lm = s_basis
-                .poly(idx)
-                .leading()
-                .expect("non-redundant basis element is nonzero")
-                .1;
-            if s_lm.divides(&m, ring) {
-                divisor = Some(idx);
-                break;
-            }
-        }
+        // ADR-031: route the tail-reduction divisor search through the
+        // shared `find_divisor_idx`, the same helper the head reducer
+        // (`reduce_lobject_geobucket`) uses. This picks up the
+        // SIMD-batched `find_divmask_match` scan (ADR-007 / ADR-025) and
+        // the contiguous `lms` cache read (ADR-010) instead of the
+        // hand-rolled scalar loop + per-leader `poly(idx).leading()`
+        // deref this used to run. The divisor-eligibility contract is
+        // identical: both honour `redundant_flags()`, both apply the
+        // divmask fast-reject, both confirm with `Monomial::divides`.
+        let divisor = find_divisor_idx(s_basis, lm_divmask, &m, ring);
         match divisor {
             None => {
                 // Term is in normal form; extract it and park.
