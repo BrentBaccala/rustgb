@@ -55,6 +55,17 @@ pub struct SBasis {
     lms: Vec<Monomial>,
     /// Leading total degrees. `lm_degs[i] == polys[i].lm_deg()`.
     lm_degs: Vec<u32>,
+    /// Polynomial lengths (term counts). `lengths[i] == polys[i].len()`.
+    /// Kept in lockstep with `polys` exactly like `lm_degs`. Read by
+    /// [`crate::bba::find_divisor_idx`]'s shortest-reducer selection
+    /// (ADR-032, `shortest_reducer` feature) so the per-step "pick the
+    /// fewest-term divisor" scan is a flat-array read instead of a
+    /// `Box<Poly>` pointer chase + `Poly::len()` per candidate. This is
+    /// the analog of Singular's `T[i].pLength`, which `redHoney` /
+    /// `redHomog` consult to find the shortest / lowest-ecart reducer.
+    /// The cache is maintained unconditionally (cheap); only the
+    /// selection logic that reads it is feature-gated.
+    lengths: Vec<u32>,
     /// Redundancy flags. `redundant[i] == true` means `polys[i]`'s
     /// leading monomial is divisible by some later `polys[j]`'s
     /// leading monomial, so `polys[i]` no longer produces useful
@@ -76,6 +87,7 @@ impl SBasis {
             divmasks: Vec::new(),
             lms: Vec::new(),
             lm_degs: Vec::new(),
+            lengths: Vec::new(),
             redundant: Vec::new(),
             arrival: Vec::new(),
             next_arrival: 0,
@@ -132,6 +144,15 @@ impl SBasis {
         &self.lm_degs
     }
 
+    /// Slice of cached polynomial lengths (term counts). Length equals
+    /// [`len`](Self::len); `lengths()[i] == polys[i].len()`. Used by
+    /// [`crate::bba::find_divisor_idx`]'s shortest-reducer selection
+    /// (ADR-032). The analog of Singular's `T[i].pLength`.
+    #[inline]
+    pub fn lengths(&self) -> &[u32] {
+        &self.lengths
+    }
+
     /// Slice of redundancy flags.
     #[inline]
     pub fn redundant_flags(&self) -> &[bool] {
@@ -184,6 +205,7 @@ impl SBasis {
         let lm_sev = h.lm_sev();
         let lm_divmask = h.lm_divmask();
         let lm_deg = h.lm_deg();
+        let length = h.len() as u32;
         // Capture the leading monomial before the poly moves into
         // the Box. `unwrap` is safe: we just checked is_zero above.
         let lm = h.leading().expect("non-zero").1.clone();
@@ -196,6 +218,7 @@ impl SBasis {
         self.divmasks.push(lm_divmask);
         self.lms.push(lm);
         self.lm_degs.push(lm_deg);
+        self.lengths.push(length);
         self.redundant.push(false);
         self.arrival.push(arrival);
         idx
@@ -279,6 +302,11 @@ impl SBasis {
         self.sevs[idx] = new_poly.lm_sev();
         self.divmasks[idx] = new_poly.lm_divmask();
         self.lm_degs[idx] = new_poly.lm_deg();
+        // Tail reduction changes the term count even though the
+        // leading monomial is preserved, so this is a real update
+        // (unlike `lms`, which is a no-op here). Keeps `lengths`
+        // truthful for the ADR-032 shortest-reducer selection.
+        self.lengths[idx] = new_poly.len() as u32;
         // ADR-010: refresh lms cache. Per the precondition above
         // the new leading monomial equals the old one, so this is
         // a no-op semantically; we update anyway in case a future
@@ -319,6 +347,11 @@ impl SBasis {
         );
         assert_eq!(self.lms.len(), n, "lms cache length mismatch (ADR-010)");
         assert_eq!(self.lm_degs.len(), n);
+        assert_eq!(
+            self.lengths.len(),
+            n,
+            "lengths cache length mismatch (ADR-032)"
+        );
         assert_eq!(self.redundant.len(), n);
         assert_eq!(self.arrival.len(), n);
         for (i, p) in self.polys.iter().enumerate() {
@@ -331,6 +364,13 @@ impl SBasis {
                 "divmasks mismatch at {i}"
             );
             assert_eq!(self.lm_degs[i], p.lm_deg(), "lm_degs mismatch at {i}");
+            // ADR-032: lengths cache must agree with the poly's own
+            // term count.
+            assert_eq!(
+                self.lengths[i] as usize,
+                p.len(),
+                "lengths mismatch at {i}"
+            );
             // ADR-010: lms cache must agree with the poly's
             // own leading monomial.
             let actual_lm = p.leading().expect("non-zero").1;
