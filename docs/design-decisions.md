@@ -5007,6 +5007,25 @@ cryptographic hash where Singular pays for a pointer xor.
 **Supersedes:** the SEV-field-drop portion of ADR-019.
 **Refines:** the refresh policy of ADR-021 / ADR-025.
 
+### Measured result (c200-1, same-campaign A/B, 5 runs)
+
+The largest win of the geobucket-lever chain — base (flat+SSE4.1+FxHash)
+→ +#1:
+
+| staging test | Δ wall | Δ instructions |
+|---|---:|---:|
+| 5101449 | **−13.71 %** | −17.7 % |
+| 5104053 | **−12.37 %** | −14.5 % |
+| 5106746 | **−13.01 %** | −16.3 % |
+
+Confirms the long-pending ADR-019 revert: restoring the cached
+per-`Monomial` SEV field (so `refresh_cache` reads a field instead of
+recomputing `compute_sev`) plus deferring the heavier `divmask_of` off
+the intermediate-merge path is a major win even in the post-redTail
+regime — the +13 s the April matrix measured for ADR-019 was real and
+still load-bearing. `Monomial` grows 40→48 bytes (the SEV field); the
+wall/instruction win dwarfs the memory cost at staging scale.
+
 ### Context
 
 The 2026-06-08 per-operation comparison against Singular `next-opt`
@@ -5185,8 +5204,35 @@ end-to-end proof that no divisor was dropped.
 
 ## ADR-030: Destructive in-place Vec subtract via reusable scratch buffers
 
-**Status:** Accepted
+**Status:** Accepted, then **reverted 2026-06-08** (measured regression;
+reverted in commit `b8f4e61`). Retained in the ledger — the attempt and
+its failure mode are the lesson.
 **Date:** 2026-06-08
+
+### Measured result — REGRESSION (c200-1, same-campaign A/B)
+
+In the 4-build lever chain (base → #1 → #2 → #3, 5 runs each) this
+lever (#2, on top of #1) **regressed wall on all three staging tests**,
+with instruction count up too:
+
+| staging test | Δ wall vs post-#1 | Δ instructions |
+|---|---:|---:|
+| 5101449 | **+4.04 %** | +3.8 % |
+| 5104053 | **+3.35 %** | +2.5 % |
+| 5106746 | **+4.61 %** | +4.3 % |
+
+The reusable-scratch-buffer scheme (per-`KBucket` `scratch_c`/`scratch_m`
+ping-ponged with `self`'s drained buffers, surviving monomials moved via
+`Vec::drain`) added more work than the two `Vec` allocations it removed:
+the per-call swap/recycle bookkeeping and the `drain` path cost more than
+`alloc` for these sizes, and the instruction-count rise shows genuine
+extra work, not a cache artifact. The premise — that the non-destructive
+`sub_mul_term`'s *allocation* was the dominant cost — did not hold; the
+cost is more likely the term-by-term merge + coeff arithmetic itself,
+which this lever did not change. **Lesson:** validate the cost premise
+(alloc vs compute) before a destructive rewrite; a reusable scratch
+buffer is not free. Levers #1 (ADR-029) and #3 (ADR-031) were kept; #2's
+code is independent of #3 and was reverted cleanly.
 
 ### Context
 
@@ -5330,6 +5376,25 @@ Output unchanged: 3/3 staging fixtures bit-for-bit; default 209/209,
 
 **Status:** Accepted
 **Date:** 2026-06-08
+
+### Measured result (c200-1, same-campaign A/B, 5 runs)
+
+Contribution on the final clean tree (post-#1, with #2 reverted) —
++#1 → +#3:
+
+| staging test | Δ wall | 
+|---|---:|
+| 5101449 | **−10.10 %** |
+| 5104053 | **−12.70 %** |
+| 5106746 | **−12.00 %** |
+
+Routing the tail-reduction divisor search through `find_divisor_idx`
+(picking up the SIMD `find_divmask_match` batching + the contiguous
+`lms` cache) and reusing the bucket leader's cached `lm_divmask` instead
+of recomputing it per tail leader is a consistent ~10–13 % win — the
+hand-rolled scalar per-leader scan over the ~3000-element basis was a
+real cost. Combined with #1, the clean chain (base → #1 → #3) is
+**−22.4 / −23.4 / −23.5 %** vs the FxHash base.
 
 ### Context
 
