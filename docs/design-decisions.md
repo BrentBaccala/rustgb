@@ -5487,8 +5487,31 @@ contemplated does not apply to this call site.
 
 ## ADR-032: Shortest-reducer divisor selection (`shortest_reducer` feature)
 
-**Status:** Accepted (feature OFF by default; wall A/B pending)
+**Status:** Accepted — **promoted to a default feature** after the wall
+A/B win below.
 **Date:** 2026-06-08
+
+### Measured result (wall, c200-1 same-campaign A/B)
+
+Same-campaign A/B on c200-1 (isolated core 11, `taskset -c 11 numactl
+--membind=1`, performance governor), 5 runs each, OFF (`target-off`,
+first-by-arrival) vs ON (`target-on`, `--features shortest_reducer`).
+Raw data: `~/project/profile-data/rustgb-shortest-reducer-ab-c200-1.csv`.
+
+| staging test | OFF wall | ON wall | Δ wall | OFF Ginstr | ON Ginstr | Δ instr | GB |
+|---|---:|---:|---:|---:|---:|---:|:--:|
+| 5101449 | 9.566 s | 8.585 s | **−10.3 %** | 46.67 | 42.06 | −9.9 % | identical (2972) |
+| 5104053 | 15.547 s | 15.564 s | +0.1 % | 78.48 | 79.24 | +1.0 % | identical (4532) |
+| 5106746 | 19.165 s | 17.324 s | **−9.6 %** | 98.69 | 90.61 | −8.2 % | identical (4198) |
+
+**−10 % wall on two of three staging cases, neutral on the third**
+(5104053's reductions don't shorten, so the scan's small cost shows as
++1 % instr / flat wall), **output bit-identical** on all three. Δwall ≈
+Δinstr everywhere — genuine work removed, not contention. The cached
+`SBasis::lengths` array + the divmask pre-filter keep the wider scan
+cheap enough that it doesn't eat the step savings. Cleared the
+`flat_lset` promotion bar (measured same-campaign win, output-identical)
+→ **flipped to a default feature** (`Cargo.toml`).
 
 ### Measured result (step-count, from the reduction-step audit)
 
@@ -5505,13 +5528,11 @@ bit-identical** to the first-by-arrival baseline:
 | mean reducer length | 10.3 | **7.1** | 6.3 |
 
 The −35 % subtract-step reduction brings rust's steps/term essentially
-to Singular's. The **wall** outcome is **pending an interactive c200-1
-same-campaign A/B** — the selection now scans all divmask-passing
-candidates instead of returning the first, trading a wider per-step scan
-for 35 % fewer steps, and only a real benchmark resolves the trade.
-This ADR ships the implementation behind a default-OFF feature so that
-A/B is a clean toggle; promotion to a default feature follows the wall
-result.
+to Singular's. The selection scans all divmask-passing candidates
+instead of returning the first, trading a wider per-step scan for 35 %
+fewer steps — the wall A/B above confirms the trade pays off (−10 % on
+2/3 cases). The feature was shipped default-OFF for the clean A/B toggle,
+then **promoted to default** once the wall win was measured.
 
 ### Context
 
