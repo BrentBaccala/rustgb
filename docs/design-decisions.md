@@ -4795,6 +4795,102 @@ will benchmark both backends on c200-1 against the
 
 ---
 
+## ADR-027: Runtime SIMD dispatch + SSE4.1 SEV-scan path
+
+**Status:** Accepted
+**Date:** 2026-06-08
+
+### Context
+
+The SEV/divmask scan primitives in `src/simd.rs` (`find_sev_match`,
+`find_sev_superset_match`, ADR-007/009/025) had two backends — an
+AVX2 implementation and a scalar fallback — selected at **build
+time** via `#[cfg(target_feature = "avx2")]`. The AVX2 path was
+therefore compiled in only when the whole crate was built with AVX2
+enabled (e.g. `RUSTFLAGS="-C target-cpu=native"`). Two problems
+surfaced when profiling the flat_lset backend (ADR-026) on c200-1:
+
+1. **The benchmark/compute fleet got the scalar path.** A plain
+   `cargo build --release` targets baseline x86-64 (SSE2), so the
+   AVX2 path was `cfg`-d out and the scan ran scalar. The
+   2026-06-08 flat_lset profile confirmed it:
+   `reduce_lobject_geobucket` self-time (16.18 %) was almost
+   entirely inlined `find_divisor_idx → find_sev_match_scalar`
+   (13.54 %) — a plain scalar linear scan. The entire Cisco C200
+   fleet (c200-1, edge, ragazzo — Xeon L5640, SSE4.2, no AVX2) is
+   the project's real compute/benchmark hardware; only samsung (the
+   Zen 1 dev laptop) has AVX2. So *every measurement host* ran the
+   slowest path.
+
+2. **A latent footgun even on AVX2 hosts.** On samsung, forgetting
+   `-C target-cpu=native` silently produced the scalar binary —
+   nothing warned.
+
+Singular's `next-opt`, by contrast, ships `kSevScanSSE4` *and*
+`kSevScanAVX2` and selects at runtime, so on the SSE4.2-only C200s
+it runs an SSE4-vectorised scan. The 5104053 next-opt profile shows
+`kSevScanSSE4` at 13.13 % — vectorised where rustgb was scalar.
+
+### Decision
+
+Replace build-time `cfg` gating with **runtime feature detection**
+and add an **SSE4.1 path**:
+
+- `simd_level()` resolves AVX2 → SSE4.1 → Scalar once
+  (`is_x86_feature_detected!`, cached in a `OnceLock`); the public
+  `find_sev_match` / `find_sev_superset_match` match on the cached
+  level. Dispatch cost is one cached load + branch per *array scan*
+  (not per element) — negligible against the scan itself.
+- The `#[target_feature(enable = "avx2")]` / `(enable = "sse4.1")`
+  functions always compile on x86_64 regardless of global codegen
+  flags, so one portable `cargo build --release` runs AVX2 on
+  Zen/Haswell+ and SSE4.1 on Westmere — no `target-cpu=native`
+  needed. (Verified: a plain-built `librustgb.so` contains both
+  `vpcmpeqq` and `pcmpeqq`.)
+- The SSE4.1 path is the AVX2 shape at half width: 8-entry main
+  loop (four 2-wide `_mm_cmpeq_epi64` batches), 2-wide tail, scalar
+  tail. `_mm_cmpeq_epi64` is the SSE4.1 instruction that gates it
+  (c200-1 has SSE4.2).
+- Non-x86_64 keeps a scalar-only dispatcher.
+
+### How Singular does it
+
+`next-opt`'s `kstd2.cc` has `kSevScanAVX2` and `kSevScanSSE4` chosen
+by runtime CPU detection in the kernel's dispatch setup — exactly
+this AVX2/SSE4 split. This ADR brings rustgb to parity, so a c200-1
+head-to-head compares SSE4-vs-SSE4 rather than scalar-vs-SSE4.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** The SEV scan is the GB-engine
+divisor/pair-search pre-filter; FLINT's `nmod_mpoly` has no
+analogue.
+
+### Consequences
+
+- Every C200-fleet build now runs SSE4.1-vectorised divisor search
+  with no special flags; AVX2 hosts run AVX2.
+- Cross-validation: `simd::tests::simd_backends_match_scalar`
+  exercises each backend explicitly (guarded by
+  `is_x86_feature_detected!`) against the scalar oracle, not only
+  through dispatch — so coverage is real on both single-path and
+  multi-path hosts.
+- Wall payoff is measured in a follow-up c200-1 re-bench
+  (`~/project/reports/rustgb-lset-flat-bench-report.md` is the prior
+  scalar-scan baseline to beat).
+
+### References
+
+- `~/rustgb/src/simd.rs` — the dispatcher + four `#[target_feature]`
+  implementations + per-backend tests.
+- `~/Singular-next-opt/kernel/GBEngine/kstd2.cc` — `kSevScanAVX2` /
+  `kSevScanSSE4` and their runtime selection.
+- `~/project/profile-reports/` — the 2026-06-08 flat-backend profile
+  showing the scalar `find_sev_match_scalar` hot frame this ADR
+  removes on the C200 fleet.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
