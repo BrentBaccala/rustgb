@@ -105,6 +105,29 @@ pub struct Monomial {
     /// `packed[3]` stores `min(total_deg, 255)` — the canonical
     /// total-degree for this Monomial (ADR-020).
     packed: [u64; WORDS_PER_MONO],
+    /// Cached short exponent vector (SEV): a 64-bit bloom filter with
+    /// bit `i % 64` set iff variable `i` has a nonzero exponent.
+    ///
+    /// ADR-029 re-introduces this field (it had been dropped in
+    /// ADR-019, which forced an O(nvars) byte scan on every
+    /// `compute_sev`). The cross-test matrix
+    /// (`~/project/reports/rustgb-adr-matrix-c200-report.md`) measured
+    /// ADR-019's drop as a +13 s regression on staging-5101449 and
+    /// recommended the revert; ADR-029 executes it as a forward change.
+    /// Maintained at every monomial-producing op:
+    /// * `from_exponents` / `one` — computed from the exponents.
+    /// * `mul` — `self.sev | other.sev` (a product's support is the
+    ///   union of the factors' supports; adding nonnegative exponents
+    ///   never zeroes a variable).
+    /// * `lcm` — `self.sev | other.sev` (componentwise max; nonzero iff
+    ///   either is nonzero).
+    /// * `div` — recomputed (subtraction can drive a variable to zero,
+    ///   so the support can shrink; a plain OR/AND would be wrong).
+    ///
+    /// The `i % 64` mapping depends only on `nvars`, so the cached value
+    /// is consistent across any two monomials of the same ring — the OR
+    /// combinators in `mul`/`lcm` are ring-independent.
+    sev: u64,
     /// Component index. Always 0 today.
     component: u32,
 }
@@ -131,6 +154,7 @@ impl Monomial {
 
         let mut packed = [0u64; WORDS_PER_MONO];
         let mut total: u64 = 0;
+        let mut sev: u64 = 0;
 
         for (i, &e) in exps.iter().enumerate() {
             total += e as u64;
@@ -141,6 +165,10 @@ impl Monomial {
             let byte_idx = byte_index_for_var(n, i);
             let (word, shift) = split_byte_index(byte_idx);
             packed[word] |= (e as u64) << shift;
+            // ADR-029: maintain the cached SEV bloom filter.
+            if e > 0 {
+                sev |= 1u64 << (i % 64);
+            }
         }
 
         // Top byte: capped total degree (full 8 bits, no guard). This
@@ -150,6 +178,7 @@ impl Monomial {
 
         Some(Self {
             packed,
+            sev,
             component: 0,
         })
     }
@@ -163,18 +192,31 @@ impl Monomial {
     // ----- Accessors -----
 
     /// Short exponent vector (bloom filter of nonzero variable
-    /// exponents). ADR-019: SEV is not cached per Monomial; compute
-    /// it on demand at the one point it's actually consumed — the
-    /// leading-term cache on `Poly` (`Poly::lm_sev`). Walking the
-    /// packed bytes is O(nvars). See ADR-019 for precedent
-    /// (Singular's `pGetShortExpVector` / `polyrec::pHash`) and the
-    /// rationale.
+    /// exponents).
+    ///
+    /// ADR-029 restores the per-`Monomial` cached SEV (reverting the
+    /// SEV-field portion of ADR-019), so this is now an O(1) field
+    /// read rather than an O(nvars) byte scan. The `ring` parameter is
+    /// retained for source compatibility with the ~20 call sites that
+    /// pass it; the cached value is ring-independent given that every
+    /// monomial in a computation lives in the same ring (the `i % 64`
+    /// bit mapping depends only on `nvars`). Debug builds cross-check
+    /// the cache against a fresh scan in `assert_canonical`.
     #[inline]
-    pub fn compute_sev(&self, ring: &Ring) -> u64 {
-        let n = ring.nvars() as usize;
+    pub fn compute_sev(&self, _ring: &Ring) -> u64 {
+        self.sev
+    }
+
+    /// Recompute the SEV from the packed bytes (the pre-ADR-029
+    /// O(nvars) scan). Used to (re)populate the cached `sev` field at
+    /// monomial construction in paths that don't have a cheap
+    /// combinator (currently `div`, where the support can shrink), and
+    /// by `assert_canonical` to validate the cache.
+    #[inline]
+    fn scan_sev(&self, nvars: usize) -> u64 {
         let mut sev: u64 = 0;
-        for i in 0..n {
-            let e = self.exponent_raw(n, i);
+        for i in 0..nvars {
+            let e = self.exponent_raw(nvars, i);
             if e > 0 {
                 sev |= 1u64 << (i % 64);
             }
@@ -333,12 +375,16 @@ impl Monomial {
         packed[WORDS_PER_MONO - 1] =
             (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (sum_cap << 56);
 
-        // ADR-019: no per-Monomial SEV to combine. SEV is computed
-        // on demand at the Poly-level cache refresh.
+        // ADR-029: a product's support is the union of the factors'
+        // supports — adding nonnegative exponents never zeroes a
+        // variable — so the SEV is the bitwise OR. (ADR-019 had dropped
+        // the field, forcing an O(nvars) rescan downstream; ADR-029
+        // restores the O(1) combinator.)
         // ADR-020: no per-Monomial u32 total-degree to maintain.
 
         Self {
             packed,
+            sev: self.sev | other.sev,
             component: 0,
         }
     }
@@ -379,6 +425,14 @@ impl Monomial {
         let last_var_byte = WORDS_PER_MONO * 8 - 2;
         let mut packed = [0u64; WORDS_PER_MONO];
         let mut total: u64 = 0;
+        let mut sev: u64 = 0;
+        // The variable bytes run from `first_var_byte` (variable 0,
+        // byte `31 - n`) up to `last_var_byte` (variable `n-1`, byte
+        // 30): `byte_index_for_var(n, i) = i + 31 - n`, so variable
+        // `i` sits at byte `first_var_byte + i`. Track the SEV bit per
+        // variable as we go — a subtracted exponent can hit zero, so
+        // the support can shrink and a plain OR/AND of the operand
+        // SEVs would be wrong.
         for byte_idx in first_var_byte..=last_var_byte {
             let (word, shift) = split_byte_index(byte_idx);
             let ea = (self.packed[word] >> shift) & 0x7F;
@@ -389,11 +443,17 @@ impl Monomial {
             let new_e = ea - eb;
             packed[word] |= new_e << shift;
             total += new_e;
+            if new_e > 0 {
+                // byte `first_var_byte + i` ⇒ variable i.
+                let var_i = byte_idx - first_var_byte;
+                sev |= 1u64 << (var_i % 64);
+            }
         }
         let capped = total.min(u8::MAX as u64);
         packed[WORDS_PER_MONO - 1] |= capped << 56;
         Some(Self {
             packed,
+            sev,
             component: 0,
         })
     }
@@ -598,8 +658,13 @@ impl Monomial {
             );
         }
 
-        // ADR-019: no SEV field to cross-check here; SEV lives on
-        // the enclosing Poly's `lm_sev` cache. See `compute_sev`.
+        // ADR-029: the cached SEV must match a fresh byte scan.
+        assert_eq!(
+            self.sev,
+            self.scan_sev(n),
+            "cached SEV {:#018x} disagrees with byte scan",
+            self.sev
+        );
         // ADR-020: no u32 total-degree cache to cross-check; the
         // top byte of packed[3] is the canonical total degree.
 

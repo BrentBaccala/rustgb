@@ -51,15 +51,32 @@ pub struct Poly {
     /// Cached leading-term sev (per ADR-019, computed via
     /// `Monomial::compute_sev` at every `refresh_cache`); 0 when empty.
     lm_sev: u64,
-    /// Cached leading-term divmask (ADR-025; computed via
-    /// `Ring::divmask_of` at every `refresh_cache`); 0 when empty.
-    /// Used as the primary fast-reject filter in
-    /// `bba::find_divisor_idx` and `gm::chain_crit_normal`. Coexists
-    /// with `lm_sev`: they're both 64-bit bloom filters with the same
-    /// `(a | b ⇒ mask_a ⊆ mask_b)` invariant, but divmask encodes
-    /// exponent ranges (not just nonzero/zero) so its false-positive
-    /// rate is lower.
+    /// Cached leading-term divmask (ADR-025); 0 when empty (or when
+    /// `lm_divmask_valid` is false — see below). Used as the primary
+    /// fast-reject filter in `bba::find_divisor_idx` and
+    /// `gm::chain_crit_normal`. Coexists with `lm_sev`: they're both
+    /// 64-bit bloom filters with the same `(a | b ⇒ mask_a ⊆ mask_b)`
+    /// invariant, but divmask encodes exponent ranges (not just
+    /// nonzero/zero) so its false-positive rate is lower.
     lm_divmask: u64,
+    /// Whether `lm_divmask` is up to date with the current leader
+    /// (ADR-029, part b). `Ring::divmask_of` is an O(nvars × n_bits)
+    /// loop — the heaviest part of a cache refresh — and the divmask
+    /// of an *intermediate* bucket-slot poly is never consulted (only
+    /// the bucket leader's divmask is read, recomputed once per step by
+    /// `LObject::refresh` from the raw leader). So the hot bucket-
+    /// internal producers (`merge`, `sub_mul_term`,
+    /// `drop_leading_in_place`) update the cheap cache fields (head,
+    /// `lm_coeff`, `lm_deg`, and the now-O(1) cached `lm_sev`) but
+    /// leave the divmask **deferred**, setting this flag false. The
+    /// divmask is materialised lazily exactly where a survivor poly's
+    /// divmask is actually read: `monic` (always called on the bba
+    /// survivor before basis insertion) calls `ensure_lm_divmask`, and
+    /// the survivor constructors (`from_descending_*`, `from_terms`,
+    /// `monomial`, `scale`, `neg`, `shift`, `drop_leading`) compute it
+    /// eagerly. `lm_divmask()` debug-asserts this flag; `assert_canonical`
+    /// only cross-checks the divmask when it is set.
+    lm_divmask_valid: bool,
     /// Cached leading coefficient (`coeffs[head]`); 0 when empty.
     lm_coeff: Coeff,
     /// Cached leading monomial degree (`terms[head].total_deg()`),
@@ -84,6 +101,11 @@ impl Clone for Poly {
             head: 0,
             lm_sev: self.lm_sev,
             lm_divmask: self.lm_divmask,
+            // Preserve the deferred-divmask flag: a clone of a poly
+            // whose divmask hasn't been materialised is itself
+            // deferred (the live leader is identical). monic / the
+            // survivor constructors materialise it where it's read.
+            lm_divmask_valid: self.lm_divmask_valid,
             lm_coeff: self.lm_coeff,
             lm_deg: self.lm_deg,
         }
@@ -101,6 +123,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         }
@@ -125,6 +148,7 @@ impl Poly {
             head: 0,
             lm_sev,
             lm_divmask,
+            lm_divmask_valid: true,
             lm_coeff: c,
             lm_deg,
         }
@@ -176,6 +200,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -217,6 +242,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -267,6 +293,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -276,22 +303,67 @@ impl Poly {
 
     // ----- Cache maintenance -----
 
-    /// ADR-019: SEV is computed on-demand at leading-term refresh,
-    /// not carried per Monomial. `ring` is required so `compute_sev`
-    /// can walk the ring's variable byte layout. ADR-025: divmask is
-    /// refreshed alongside SEV from the same leading monomial.
+    /// Full leading-term cache refresh: the cheap fields
+    /// (`lm_sev`, `lm_coeff`, `lm_deg`) **and** the divmask.
+    ///
+    /// ADR-029: `lm_sev` is now an O(1) field read on the cached
+    /// `Monomial.sev` (the ADR-019 drop was reverted). The divmask
+    /// (`Ring::divmask_of`, an O(nvars × n_bits) loop) is the heavy
+    /// part; this full refresh computes it and marks it valid. Used
+    /// by the survivor constructors and by `ensure_lm_divmask`.
     fn refresh_cache(&mut self, ring: &Ring) {
+        self.refresh_lm_cheap(ring);
+        if !self.is_zero() {
+            self.lm_divmask = ring.divmask_of(&self.terms[self.head]);
+            self.lm_divmask_valid = true;
+        }
+        // when zero, refresh_lm_cheap already zeroed lm_divmask and
+        // set lm_divmask_valid = true.
+    }
+
+    /// Cheap leading-term cache refresh: updates `lm_sev`
+    /// (O(1) field read), `lm_coeff`, `lm_deg` — but **defers** the
+    /// divmask, marking it invalid (ADR-029, part b). Used by the hot
+    /// bucket-internal producers (`merge`, `sub_mul_term`,
+    /// `drop_leading_in_place`) whose output is an intermediate
+    /// bucket slot whose divmask is never read. The divmask is
+    /// materialised later by `ensure_lm_divmask` / a full refresh at
+    /// the point a survivor's divmask is actually consulted.
+    #[inline]
+    fn refresh_lm_cheap(&mut self, ring: &Ring) {
         if let Some(m) = self.terms.get(self.head) {
             self.lm_sev = m.compute_sev(ring);
-            self.lm_divmask = ring.divmask_of(m);
             self.lm_deg = m.total_deg();
             self.lm_coeff = self.coeffs[self.head];
+            self.lm_divmask = 0;
+            self.lm_divmask_valid = false;
         } else {
+            // Zero poly: the divmask is unambiguously 0 and "valid"
+            // (no leader to defer). This keeps `lm_divmask()` callable
+            // on a zero poly without a spurious assert.
             self.lm_sev = 0;
             self.lm_divmask = 0;
+            self.lm_divmask_valid = true;
             self.lm_coeff = 0;
             self.lm_deg = 0;
         }
+    }
+
+    /// Materialise the deferred leading-term divmask if it isn't
+    /// already valid (ADR-029, part b). Idempotent and cheap when the
+    /// divmask is already valid. Called on the bba survivor before it
+    /// is read by the basis-insert path (`monic` invokes it).
+    #[inline]
+    pub fn ensure_lm_divmask(&mut self, ring: &Ring) {
+        if self.lm_divmask_valid {
+            return;
+        }
+        if let Some(m) = self.terms.get(self.head) {
+            self.lm_divmask = ring.divmask_of(m);
+        } else {
+            self.lm_divmask = 0;
+        }
+        self.lm_divmask_valid = true;
     }
 
     // ----- Accessors -----
@@ -340,8 +412,21 @@ impl Poly {
     /// Leading-term divmask (ADR-025). 0 when zero. Used by
     /// `bba::find_divisor_idx` and `gm::chain_crit_normal` as the
     /// primary fast-reject filter for divisibility tests.
+    ///
+    /// ADR-029 (b): the divmask may be **deferred** on an
+    /// intermediate bucket-slot poly. This getter debug-asserts that
+    /// the value is valid — every production reader is a survivor poly
+    /// whose divmask was materialised by `monic` / a survivor
+    /// constructor. If this assert ever fires, a new reader is
+    /// consulting a deferred divmask and must call `ensure_lm_divmask`
+    /// (or go through a full refresh) first.
     #[inline]
     pub fn lm_divmask(&self) -> u64 {
+        debug_assert!(
+            self.lm_divmask_valid,
+            "lm_divmask() read on a poly with a deferred (un-materialised) divmask; \
+             call ensure_lm_divmask first (ADR-029)"
+        );
         self.lm_divmask
     }
 
@@ -412,6 +497,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -441,7 +527,11 @@ impl Poly {
             return;
         }
         self.head += 1;
-        self.refresh_cache(ring);
+        // ADR-029 (b): `drop_leading_in_place` is the geobucket
+        // cancellation peel — fired many times per reduction step on
+        // bucket slots whose divmask is never read. Refresh only the
+        // cheap fields and defer the divmask.
+        self.refresh_lm_cheap(ring);
     }
 
     // ----- Arithmetic -----
@@ -504,6 +594,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -528,6 +619,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -554,6 +646,7 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
@@ -662,10 +755,14 @@ impl Poly {
             head: 0,
             lm_sev: 0,
             lm_divmask: 0,
+            lm_divmask_valid: false,
             lm_coeff: 0,
             lm_deg: 0,
         };
-        out.refresh_cache(ring);
+        // ADR-029 (b): `sub_mul_term` is the `p - c·m·q` inner step;
+        // its output feeds a bucket slot whose divmask is never read.
+        // Skip the divmask compute, refresh only the cheap fields.
+        out.refresh_lm_cheap(ring);
         out
     }
 
@@ -697,7 +794,14 @@ impl Poly {
         }
         let lc = self.lm_coeff;
         if lc == 1 {
-            return Some(self.clone());
+            // `monic` is the bba survivor's last stop before basis
+            // insertion (`into_poly().monic()`), and the insert path
+            // reads `lm_divmask()`. Materialise the deferred divmask
+            // here so the survivor leaves with a valid filter even on
+            // the already-monic fast path (ADR-029, part b).
+            let mut out = self.clone();
+            out.ensure_lm_divmask(ring);
+            return Some(out);
         }
         let inv = ring.field().inv(lc)?;
         Some(self.scale(inv, ring))
@@ -736,7 +840,14 @@ impl Poly {
             assert_eq!(self.lm_deg, 0);
         } else {
             assert_eq!(self.lm_sev, self.terms[self.head].compute_sev(ring));
-            assert_eq!(self.lm_divmask, ring.divmask_of(&self.terms[self.head]));
+            // ADR-029 (b): only cross-check the divmask when it has
+            // been materialised. A deferred divmask (on an
+            // intermediate bucket-slot poly) carries a placeholder 0
+            // that is never read; validating it would be a false
+            // positive.
+            if self.lm_divmask_valid {
+                assert_eq!(self.lm_divmask, ring.divmask_of(&self.terms[self.head]));
+            }
             assert_eq!(self.lm_coeff, self.coeffs[self.head]);
             assert_eq!(self.lm_deg, self.terms[self.head].total_deg());
         }
@@ -899,10 +1010,16 @@ fn merge(ring: &Ring, a: &Poly, b: &Poly, subtract: bool) -> Poly {
         head: 0,
         lm_sev: 0,
         lm_divmask: 0,
+        lm_divmask_valid: false,
         lm_coeff: 0,
         lm_deg: 0,
     };
-    out.refresh_cache(ring);
+    // ADR-029 (b): the divmask of an intermediate merge output is
+    // never consulted (only the bucket leader's divmask is read, once
+    // per step, by `LObject::refresh`). Skip the O(nvars × n_bits)
+    // `divmask_of` here; the cheap fields (lm_sev — now an O(1)
+    // field read — lm_coeff, lm_deg) are still refreshed.
+    out.refresh_lm_cheap(ring);
     out
 }
 

@@ -2979,7 +2979,10 @@ stages are separate, each a future ADR if pursued:
 
 ## ADR-019: Drop per-Monomial SEV; cache only at leading-term level
 
-**Status:** Accepted
+**Status:** Superseded by ADR-029 (the SEV-field-drop portion).
+ADR-029 restores the per-`Monomial` `sev: u64` field; the rest of
+ADR-019 (the `&Ring` parameter plumbing on `refresh_cache` /
+`drop_leading`, the `Pair::new(&Ring)` signature) stands.
 **Date:** 2026-04-24
 
 ### Context
@@ -4993,6 +4996,190 @@ cryptographic hash where Singular pays for a pointer xor.
   `PolyPairHash` + `pair_index`, the trivial-hash precedent.
 - `~/project/reports/rustgb-lset-flat-bench-report.md` — the
   per-operation comparison that quantified the ~3.7 % SipHash cost.
+
+---
+
+## ADR-029: Leaner refresh policy — cached SEV field + deferred divmask
+
+**Status:** Accepted
+**Date:** 2026-06-08
+
+**Supersedes:** the SEV-field-drop portion of ADR-019.
+**Refines:** the refresh policy of ADR-021 / ADR-025.
+
+### Context
+
+The 2026-06-08 per-operation comparison against Singular `next-opt`
+(`~/project/reports/rustgb-nextopt-perop-comparison.md`) found the
+entire 2.30× wall gap living in the geobucket reduction pipeline, of
+which the single largest frame was `Poly::refresh_cache` (~1460 ms on
+staging-5101449, c200-1). `refresh_cache` recomputes the per-`Poly`
+leading-term cache (`lm_sev` + `lm_divmask` + `lm_deg` + `lm_coeff`)
+at the end of **every** poly-producing op, and is fired ≥2× per
+reduction step — inside the `sub_mul_term`/`merge` that produces a new
+bucket slot, again per slot in the `absorb` cascade, again per peeled
+slot in `KBucket::leading`'s cancellation peel, and once more in
+`LObject::refresh`. Singular has no equivalent: the monomial is inline
+in the polynomial node (`bucket->buckets[0]` read O(1)), and it
+computes a single SEV per step via `SetShortExpVector`, with no cached
+per-poly divmask at all.
+
+Two cost sources, two provenances:
+
+* **SEV.** ADR-019 dropped the per-`Monomial` `sev: u64` field,
+  forcing `compute_sev` — an O(nvars) byte scan — on demand inside
+  `refresh_cache`. The April cross-test matrix
+  (`~/project/reports/rustgb-adr-matrix-c200-report.md`) measured
+  ADR-019 as a **+13 s regression** on staging-5101449 and recommended
+  reverting it; the revert was never executed.
+* **Divmask.** ADR-025 added `Ring::divmask_of` (an O(nvars × n_bits)
+  per-variable threshold loop, heavier than the SEV scan) alongside
+  the SEV in `refresh_cache`. ADR-025 net-won (+4.2 %) because the
+  divmask is a stronger fast-reject filter than SEV, so it is *kept* —
+  but its eager recompute on intermediate bucket-slot polys, whose
+  leader is overwritten moments later and whose divmask is never read,
+  is pure waste.
+
+### Singular's approach
+
+Singular's geobucket (`libpolys/polys/kbuckets.cc`) keeps the leading
+monomial inline in the linked-list poly node; `kBucketGetLm` /
+`GetLmTailRing` read it in O(1) with no derived per-poly cache to
+rebuild. The only derived bit is the SEV, computed **once per step**
+by `SetShortExpVector` (`kstd2.cc:1478`) at the divisor-search site.
+There is no cached per-poly divmask in `next-opt` — its analogous
+fast-reject is the SEV computed once per step. So Singular pays
+(1 SEV, 0 divmask) per step; pre-ADR-029 rustgb paid (≥2 SEV scans,
+≥2 divmask computes) per step.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** FLINT's `nmod_mpoly` layer has no
+SEV/divmask concept; those are divisor-search fast-reject filters
+internal to a Buchberger driver, which FLINT lacks. Its heap reducer
+(`divrem_monagan_pearce.c`) tests divisibility directly on packed
+exponent vectors with no bloom-filter pre-filter.
+
+### Decision
+
+Two coordinated sub-changes.
+
+**(a) Restore the cached per-`Monomial` SEV (revert the ADR-019
+field-drop, as a forward change).** Re-add `sev: u64` to `Monomial`
+(`src/monomial.rs`) and maintain it at every producing op:
+
+* `from_exponents` / `one` — accumulate `sev |= 1 << (i % 64)` for each
+  nonzero exponent, in the same loop that packs the bytes.
+* `mul` — `self.sev | other.sev`. A product's support is the union of
+  the factors' supports (adding nonnegative exponents never zeroes a
+  variable), so the OR is exact and ring-independent.
+* `lcm` — falls out of `from_exponents` (componentwise max).
+* `div` — **recomputed** in the existing per-byte loop, because
+  subtraction can drive a variable to zero (the support can shrink), so
+  an OR/AND combinator would be unsound.
+
+`Monomial::compute_sev(&Ring)` becomes an O(1) field read (the `&Ring`
+parameter is retained for source compatibility with its ~20 call
+sites; the cached value is ring-independent given a fixed `nvars`).
+`Monomial::assert_canonical` cross-checks the cached field against a
+fresh byte scan. The 020/022/023 surrounding changes are untouched —
+this is a targeted re-introduction of one field, not a `git revert`.
+`Monomial` grows from 40 to 48 bytes (`[u64;4]` + `u64` + `u32` +
+pad).
+
+**(b) Defer the divmask compute to once per step.** `Poly`
+(`src/poly/poly_vec.rs`) gains an `lm_divmask_valid: bool` flag.
+`refresh_cache` is split:
+
+* `refresh_lm_cheap` — updates `lm_sev` (now an O(1) field read),
+  `lm_coeff`, `lm_deg`; sets `lm_divmask_valid = false` (divmask
+  deferred). Used by the three hot bucket-internal producers:
+  `merge`, `sub_mul_term`, `drop_leading_in_place`. (A zero poly's
+  divmask is unambiguously 0 and marked valid, so `lm_divmask()` stays
+  callable on it.)
+* `refresh_cache` (full) — `refresh_lm_cheap` + `Ring::divmask_of`,
+  sets `lm_divmask_valid = true`. Used by the survivor constructors
+  (`from_descending_*`, `from_terms`, `monomial`, `scale`, `neg`,
+  `shift`, `drop_leading`).
+* `ensure_lm_divmask` — materialises the deferred divmask if invalid;
+  idempotent. Called by `monic` so that the bba survivor (always
+  `into_poly().monic()` before basis insertion) carries a valid
+  divmask even on the already-monic clone fast path.
+
+The bucket leader's divmask is computed exactly once per reduction
+step where it is actually read — `LObject::refresh` recomputes
+sev+divmask directly from the freshly-probed bucket leader (it always
+did; it does not read any intermediate poly's cache). So the deferred
+intermediates never need their divmask materialised.
+
+### Correctness argument (the part that can produce a WRONG GB)
+
+`lm_divmask`/`lm_sev` are divisibility fast-reject filters: a stale or
+wrong value can drop a *real* divisor and yield an incorrect GB. The
+audit of every reader:
+
+* `bba::find_divisor_idx` reads `LObject::lm_divmask()` (recomputed in
+  `LObject::refresh` from the raw leader — never a deferred Poly
+  cache) and `SBasis::divmasks()` (snapshotted from a survivor poly at
+  insert time — see below).
+* `bba::reduce_tail` recomputes the divmask per leader directly
+  (`ring.divmask_of`) and reads `SBasis::divmasks()`.
+* `gm::chain_crit_normal` reads `Pair::lcm_divmask` (computed in
+  `Pair::new`) and the survivor's `Poly::lm_divmask()`.
+* Basis insert (`sbasis.rs`, `computation.rs`, `gm.rs`,
+  `parallel.rs`) reads the **survivor** `h.lm_divmask()`.
+
+Every Poly whose `lm_divmask()` is read is a survivor: it reaches the
+reader through `into_poly().monic()` (→ `ensure_lm_divmask`) or a
+survivor constructor (`from_descending_*` in `reduce_h_tail` /
+`prepend_leading` / the heap reducer's result, or `scale` in the
+non-monic `monic` path). The only polys with a deferred divmask are
+*intermediate bucket slots*, whose `lm_divmask()` is never read.
+`Poly::lm_divmask()` `debug_assert!`s `lm_divmask_valid`, so any future
+reader that consults a deferred divmask trips a test immediately rather
+than silently corrupting the GB. `assert_canonical` cross-checks the
+divmask only when valid (a deferred slot carries a placeholder 0 that
+is never read). The SEV cached field (a) is always maintained exactly
+(union on mul/lcm, recompute on div, scan on construct), proven by the
+`assert_canonical` cross-check and the existing
+`tests/monomial_props.rs` SEV proptests.
+
+The staging fixtures (5101449 / 5104053 / 5106746) match bit-for-bit,
+which — given that the output is the unique reduced GB — is the
+end-to-end proof that no divisor was dropped.
+
+### Consequences
+
+* `compute_sev` is O(1); the SEV half of the ~1460 ms `refresh_cache`
+  frame is eliminated. `Ring::divmask_of` now fires once per step
+  (at `LObject::refresh`/`monic`) instead of ≥2× per step on
+  intermediates.
+* `Monomial` grows 40 → 48 bytes; for ~3×10⁶ peak live monomials on
+  staging that is ~24 MB more heap — the same trade ADR-019 made in
+  reverse, which the cross-test matrix showed is a net win on this
+  workload (the +13 s it cost dominates the memory saving).
+* Output unchanged on all backends; both required test configs stay
+  green (default 209/209, `--no-default-features --features redtail`
+  205/205). The `linked_list_poly` backend is unaffected by (b) — it
+  keeps the eager refresh — and benefits from (a)'s cached SEV through
+  the shared `Monomial`.
+* Wall payoff intentionally **not** benchmarked in the implementing
+  task (task-runner subagent under the 600 s stream watchdog); the
+  external A/B pass measures it.
+
+### References
+
+* `~/project/reports/rustgb-nextopt-perop-comparison.md` — the
+  `refresh_cache` 1460 ms frame and the lever spec.
+* `~/project/reports/rustgb-adr-matrix-c200-report.md` — ADR-019's
+  +13 s regression and the revert recommendation.
+* ADR-019 — the SEV-field drop this supersedes.
+* ADR-021 / ADR-025 — the refresh / divmask policy this refines.
+* `~/rustgb/src/monomial.rs` — the restored `sev` field + combinators.
+* `~/rustgb/src/poly/poly_vec.rs` — `refresh_lm_cheap`,
+  `ensure_lm_divmask`, the deferred-divmask flag.
+* `~/Singular-next-opt/kernel/GBEngine/kstd2.cc:1478` —
+  `SetShortExpVector` (one SEV per step, no per-poly divmask).
 
 ---
 
