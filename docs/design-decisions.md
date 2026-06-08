@@ -4971,8 +4971,17 @@ cryptographic hash where Singular pays for a pointer xor.
   only iteration order of the maps, which the engine never depends on
   (pop order comes from the sorted heap, not the index map).
 - **Measured payoff (c200-1 same-campaign A/B, SipHash vs FxHash, both
-  flat + SSE4.1):** _(filled in by the follow-on bench — see
-  `~/project/reports/rustgb-lset-flat-bench-report.md`)._
+  flat + SSE4.1, 5 runs each):**
+
+  | staging test | SipHash (s) | FxHash (s) | Δ wall | Δ instructions |
+  |---|---:|---:|---:|---:|
+  | 5101449 | 12.608 ± 0.013 | 12.180 ± 0.006 | **−3.40 %** | −5.90 % |
+  | 5104053 | 20.804 ± 0.118 | 19.873 ± 0.012 | **−4.48 %** | −7.83 % |
+  | 5106746 | 25.735 ± 0.049 | 24.939 ± 0.014 | **−3.09 %** | −5.72 % |
+
+  −3.1 to −4.5 % wall, matching the ~3.7 % the profile predicted;
+  Δinstructions exceeds Δwall (FxHash retires far fewer instructions
+  than SipHash's rounds), CVs < 0.5 %.
 - Not HashDoS-resistant — acceptable: keys are basis indices the
   engine generates itself, never external input.
 
