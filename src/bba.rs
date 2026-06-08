@@ -419,6 +419,20 @@ fn find_divisor_idx(
     let len = divmasks.len();
     let not_lm_divmask = !lm_divmask;
 
+    // ADR-032: with the `shortest_reducer` feature, the sweep scans
+    // ALL divmask-passing non-redundant dividing candidates and keeps
+    // the one with the fewest terms (Singular `redHoney`/`redHomog`
+    // shortest/lowest-ecart reducer, `kFindDivisibleByInT_ecart` /
+    // `TEST_OPT_LENGTH`), with Singular's `if (li<3) break;` early-out
+    // when a candidate of length ≤2 is found. The feature is OFF by
+    // default: with it off the loop returns the first match in arrival
+    // order, byte-for-byte the pre-ADR-032 behaviour.
+    #[cfg(feature = "shortest_reducer")]
+    let lengths = s_basis.lengths();
+
+    #[cfg(feature = "shortest_reducer")]
+    let mut best: Option<(usize, u32)> = None;
+
     let mut idx = 0;
     while idx < len {
         // Find the next divmask that passes the pre-filter
@@ -426,7 +440,7 @@ fn find_divisor_idx(
         // if none.
         idx = find_divmask_match(divmasks, not_lm_divmask, idx);
         if idx >= len {
-            return None;
+            break;
         }
         // Divmask passes; check redundant flag and the actual divides.
         // ADR-010: read the leading monomial from the lms cache
@@ -436,10 +450,32 @@ fn find_divisor_idx(
         // showed at 11 % of within-function cycles in
         // reduce_to_normal_form.
         if !redund[idx] && lms[idx].divides(lm, ring) {
-            return Some(idx);
+            #[cfg(not(feature = "shortest_reducer"))]
+            {
+                return Some(idx);
+            }
+            #[cfg(feature = "shortest_reducer")]
+            {
+                let li = lengths[idx];
+                // Singular's early-out: a 1- or 2-term reducer is the
+                // best possible (`redHomog`: `if (li<3) break;`).
+                if li <= 2 {
+                    return Some(idx);
+                }
+                match best {
+                    Some((_, blen)) if blen <= li => {}
+                    _ => best = Some((idx, li)),
+                }
+            }
         }
         idx += 1;
     }
+
+    #[cfg(feature = "shortest_reducer")]
+    {
+        return best.map(|(i, _)| i);
+    }
+    #[cfg(not(feature = "shortest_reducer"))]
     None
 }
 

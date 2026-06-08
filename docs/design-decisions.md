@@ -5485,6 +5485,132 @@ contemplated does not apply to this call site.
 
 ---
 
+## ADR-032: Shortest-reducer divisor selection (`shortest_reducer` feature)
+
+**Status:** Accepted (feature OFF by default; wall A/B pending)
+**Date:** 2026-06-08
+
+### Measured result (step-count, from the reduction-step audit)
+
+A throwaway `RUSTGB_SHORTEST` probe on staging-5101449 (the audit in
+`~/project/reports/rustgb-nextopt-perop-comparison.md`, "The
+reduction-step audit: it's reducer selection") measured, **output
+bit-identical** to the first-by-arrival baseline:
+
+| metric | first-by-arrival | shortest-reducer | Singular `bba` |
+|---|---:|---:|---:|
+| total subtracts | 2 771 773 | **1 803 118 (−35 %)** | — |
+| S-pair subtracts | 2 582 855 | 1 639 736 (−37 %) | — |
+| ZERO-reduction steps/term | 2.88 | **1.88** | 1.73 |
+| mean reducer length | 10.3 | **7.1** | 6.3 |
+
+The −35 % subtract-step reduction brings rust's steps/term essentially
+to Singular's. The **wall** outcome is **pending an interactive c200-1
+same-campaign A/B** — the selection now scans all divmask-passing
+candidates instead of returning the first, trading a wider per-step scan
+for 35 % fewer steps, and only a real benchmark resolves the trade.
+This ADR ships the implementation behind a default-OFF feature so that
+A/B is a clean toggle; promotion to a default feature follows the wall
+result.
+
+### Context
+
+The reduction-step audit resolved the rustgb ↔ Singular `next-opt`
+reduction gap: both engines reduce the **same ~30 K S-pairs** to the
+**same 2972-element basis** with the **same ~90 % zero-reduction rate**
+and the **same spoly sizes**, but rust took ~2.3× more reduction steps
+per pair due to **intermediate swell**. The mechanism is **reducer
+selection**: rust's `find_divisor_idx` returned the **first** divmask-
+passing divisor in `SBasis` arrival order (mean length 10.3 terms),
+while Singular picks the **shortest / lowest-ecart** reducer at each
+step (mean 6.3). Longer reducers inject more tail terms per subtract →
+more swell → more steps.
+
+### Singular's approach
+
+Singular's `bba` reduces via `redHoney`, which selects the **lowest-
+ecart** divisor with `kFindDivisibleByInT_ecart`
+(`kernel/GBEngine/kutil.cc`); `redHomog` does the equivalent
+**shortest-length** search under `TEST_OPT_LENGTH` (default on),
+scanning `T[]` for the candidate with the smallest `T[i].pLength` and
+breaking early on a 1- or 2-term reducer (`if (li<3) break;`).
+Singular keeps `T[i].pLength` cached on the `TObject` so this scan is
+cheap — it does not recompute a length per probe.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** Its `nmod_mpoly_div` reduces in a
+single heap-based pass with no running basis of divisor candidates to
+select among, so there is no "which reducer" decision to compare.
+
+### Decision
+
+1. **Cache poly lengths in `SBasis`** (`src/sbasis.rs`). Add
+   `lengths: Vec<u32>` kept in lockstep with `polys`/`lms`/`lm_degs`
+   (pushed in `insert_no_clear`, refreshed in `replace_poly` — where
+   tail reduction genuinely changes the term count — and checked in
+   `assert_canonical`). Exposed via `pub fn lengths(&self) -> &[u32]`.
+   This is the analog of Singular's `T[i].pLength`; the divmask
+   pre-filter already bounds the candidate set, exactly how Singular
+   keeps the length scan cheap. The cache is maintained
+   **unconditionally** (one `u32` push per insert — negligible), so the
+   feature gate is confined to the selection logic.
+
+2. **Shortest-reducer selection** in `find_divisor_idx` (`src/bba.rs`),
+   behind a new `shortest_reducer` cargo feature, **OFF by default**.
+   With the feature ON the sweep scans **all** divmask-passing,
+   non-redundant dividing candidates and returns the one with the
+   **smallest** `lengths[idx]`, with Singular's early-out: a candidate
+   of length ≤2 is returned immediately (`redHomog`'s `if (li<3)
+   break;`). With the feature OFF the hot path is **byte-for-byte the
+   pre-ADR-032 first-match return** — the new code is `#[cfg(feature =
+   "shortest_reducer")]`-gated so the default build's inner loop is
+   unchanged.
+
+**Length as the proxy for ecart.** This ADR selects by **term count**,
+not true ecart. Length is simpler (already a `u32` cache, no per-step
+ecart computation) and captures the bulk of the win: it brings
+steps/term to 1.88 vs Singular's ecart-driven 1.73. True ecart-based
+selection (`deg(reducer) − deg(lm(reducer))`) is a possible follow-up
+if the residual 1.88-vs-1.73 gap proves to matter on the wall.
+
+### Consequences
+
+* **Output is path-only, never result.** Shortest-reducer changes the
+  *reduction path*, never the reduced GB (it is the unique reduced
+  basis regardless of reducer-selection order). Verified: with the
+  feature ON, the cyclic-3/4/5 + katsura-3 Singular-reference fixtures
+  pass identically (209/209 tests both feature states), and a direct
+  head-to-head dump of `compute_gb` output for cyclic-3/4/5 is
+  **byte-for-byte identical** between the two builds. A differing basis
+  would be a bug.
+* **The `SBasis::lengths` cache is unconditional**, so the default
+  build carries one extra `Vec<u32>` (and its `assert_canonical` check)
+  but runs the identical first-match selection. Cost is one `u32` push
+  per basis insert.
+* **Wall is unresolved.** The −35 % is *step count*, not wall; the scan
+  is now wider per step. The c200-1 wall A/B (and the promote-to-default
+  decision) is run interactively — wall benches exceed the 600 s
+  subagent stream watchdog, so they are out of scope here.
+
+### References
+
+* `~/project/reports/rustgb-nextopt-perop-comparison.md` — the
+  reduction-step audit, the `RUSTGB_SHORTEST` probe, and the −35 %
+  step-count measurement this ADR makes permanent.
+* ADR-024 — per-step `redTail`; ADR-031 — the shared `find_divisor_idx`
+  this selection logic lives in.
+* ADR-010 — the contiguous `SBasis::lms()` cache the new `lengths`
+  cache mirrors; ADR-025 — the divmask pre-filter that bounds the
+  candidate set the selection scans.
+* `~/rustgb/src/sbasis.rs` — `lengths`, `lengths()`; `~/rustgb/src/bba.rs`
+  — `find_divisor_idx`.
+* `~/Singular/kernel/GBEngine/kutil.cc` — `kFindDivisibleByInT_ecart`;
+  `kernel/GBEngine/kstd2.cc` — `redHoney`, `redHomog` (`TEST_OPT_LENGTH`,
+  `if (li<3) break;`).
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

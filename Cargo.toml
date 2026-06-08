@@ -63,6 +63,20 @@ linked_list_poly_pool = []
 # `tests/lset_contract.rs` exercise whichever backend is selected.
 flat_lset = []
 
+# Shortest-reducer divisor selection (ADR-032). OFF by default. When
+# ON, `bba::find_divisor_idx` scans ALL divmask-passing non-redundant
+# dividing candidates and returns the one with the fewest terms
+# (cached in `SBasis::lengths`), with Singular's `if (li<3) break;`
+# early-out. This is the analog of Singular's `redHoney`/`redHomog`
+# shortest / lowest-ecart reducer selection. A throwaway probe measured
+# −35 % total reduction subtracts, output bit-identical
+# (`~/project/reports/rustgb-nextopt-perop-comparison.md`). With the
+# feature OFF, `find_divisor_idx` returns the first divisor in arrival
+# order, byte-for-byte the pre-ADR-032 behaviour. The `SBasis::lengths`
+# cache is maintained unconditionally (cheap); only the selection scan
+# is gated. Promote to a default only after the c200-1 wall A/B.
+shortest_reducer = []
+
 [dev-dependencies]
 proptest = "1"
 
