@@ -4576,9 +4576,35 @@ bloom-filter pre-filter.
 
 ## ADR-026: Flat-Vec `LSet` backend behind a `flat_lset` cargo feature
 
-**Status:** Accepted (implementation only — A/B perf measurement
-deferred to a follow-up task)
-**Date:** 2026-04-30
+**Status:** Accepted; **promoted to default 2026-06-08** after the
+c200-1 A/B (see "Measured result" below).
+**Date:** 2026-04-30 (implementation); 2026-06-08 (A/B + default flip)
+
+### Measured result (2026-06-08, c200-1, isolated core 11)
+
+The A/B deferred at implementation time was finally run as a single
+same-campaign bench (both backends back-to-back under identical
+machine state, 5 runs each), resolving the contaminated
+cross-campaign ~0–5 % estimate from 2026-05-01. Flat beats heap on
+all three staging tests:
+
+| staging test | heap wall (s) | flat wall (s) | Δ wall | Δ instructions |
+|---|---:|---:|---:|---:|
+| 5101449 | 14.796 ± 0.216 | 13.571 ± 0.140 | **−8.28 %** | −7.95 % |
+| 5104053 | 24.193 ± 0.068 | 22.141 ± 0.050 | **−8.48 %** | −8.49 % |
+| 5106746 | 31.414 ± 0.039 | 28.455 ± 0.015 | **−9.42 %** | −9.19 % |
+
+Δwall tracks Δinstructions within ~0.3 pp on every test, so the win
+is a genuine reduction in work retired (immune to the background
+memory-bandwidth contention present during the run), not a timing
+artifact. A perf DWARF profile confirmed the predicted cause:
+`chain_crit_normal` self-share fell from 10.25 % (rank #3) on heap
+to 7.80 % (rank #4) on flat — i.e. it dropped out of the top-3,
+exactly as designed. On c200-1 the scan runs the **scalar fallback**
+(no AVX2); an AVX2 host would compress that frame further. The win
+justified flipping `flat_lset` into the cargo `default` set. The
+heap backend is retained, compilable, and contract-tested. Full
+write-up: `~/project/reports/rustgb-lset-flat-bench-report.md`.
 
 ### Context
 

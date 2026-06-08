@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # stdlib only for now; add as needed.
 
 [features]
-default = ["redtail"]
+default = ["redtail", "flat_lset"]
 
 # Default reducer is the geobucket (ADR-002). Enabling this feature
 # switches `bba::reduce_lobject` to the heap-based Monagan-Pearce
@@ -50,12 +50,15 @@ linked_list_poly = []
 # ADR-016 for the rationale and measured impact.
 linked_list_poly_pool = []
 
-# Switch the public `LSet` type from the default heap-based backend
-# (`src/lset.rs`) to a flat-Vec backend (`src/lset_flat.rs`) with
-# parallel `lcm_divmasks: Vec<u64>` enabling SIMD-batched filtered
-# scans for the chain-criterion Phase-2 sweep. Off by default —
-# see ADR-026 for the rationale, parallel-array shape, and the
-# A/B story. Both backend modules always compile; only the public
+# Switch the public `LSet` type to the flat-Vec backend
+# (`src/lset_flat.rs`) with parallel `lcm_divmasks: Vec<u64>`
+# enabling SIMD-batched filtered scans for the chain-criterion
+# Phase-2 sweep. **On by default** since 2026-06-08: the c200-1 A/B
+# measured −8 to −9 % wall vs the heap backend on all three staging
+# tests (`~/project/reports/rustgb-lset-flat-bench-report.md`,
+# ADR-026). The heap backend (`src/lset.rs`) is retained and
+# compilable; build `--no-default-features --features redtail` to
+# select it. Both backend modules always compile; only the public
 # alias chosen by `lib.rs` differs. The contract tests under
 # `tests/lset_contract.rs` exercise whichever backend is selected.
 flat_lset = []
