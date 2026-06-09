@@ -84,22 +84,33 @@ use std::collections::BinaryHeap;
 use crate::pair::{Pair, PairKey};
 
 /// Heap entry for the sorted-pop index. `Ord` matches `Pair::cmp`'s
-/// ascending order on `(sugar, arrival)`, with `idx` as a final
-/// tie-break so two entries are never equal in the heap (the heap
-/// stores indices into a single `pairs` Vec, so `idx` is unique by
-/// construction).
+/// ascending order, with `idx` as a final tie-break so two entries are
+/// never equal in the heap (the heap stores indices into a single
+/// `pairs` Vec, so `idx` is unique by construction).
+///
+/// The tie-break among equal-sugar entries mirrors `Pair::cmp` under
+/// the `pairorder_lm` feature (ADR-034): `arrival` when OFF (default),
+/// `lcm_ord_key` (then `arrival`) when ON — Singular's `compareL15`
+/// `(sugar, then leading-monomial of the LCM)`. The `lcm_ord_key`
+/// field is only carried when the feature is on, so the OFF build is
+/// byte-for-byte identical to the prior `(sugar, arrival, idx)` shape.
+/// Keeping this consistent with `Pair::cmp` (used by the heap backend)
+/// means both LSet backends produce the same pair sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SortedKey {
     sugar: u32,
+    #[cfg(feature = "pairorder_lm")]
+    lcm_ord_key: [u64; 4],
     arrival: u64,
     idx: usize,
 }
 
 impl Ord for SortedKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sugar
-            .cmp(&other.sugar)
-            .then_with(|| self.arrival.cmp(&other.arrival))
+        let ord = self.sugar.cmp(&other.sugar);
+        #[cfg(feature = "pairorder_lm")]
+        let ord = ord.then_with(|| self.lcm_ord_key.cmp(&other.lcm_ord_key));
+        ord.then_with(|| self.arrival.cmp(&other.arrival))
             .then_with(|| self.idx.cmp(&other.idx))
     }
 }
@@ -198,6 +209,8 @@ impl LSet {
         let idx = self.pairs.len();
         let sorted_key = SortedKey {
             sugar: pair.sugar,
+            #[cfg(feature = "pairorder_lm")]
+            lcm_ord_key: pair.lcm_ord_key,
             arrival: pair.arrival,
             idx,
         };

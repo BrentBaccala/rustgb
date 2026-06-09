@@ -56,6 +56,14 @@ pub struct Pair {
     /// fast-reject — strictly stronger than `lcm_sev` (encodes
     /// exponent ranges, not just nonzero/zero).
     pub lcm_divmask: u64,
+    /// Order-preserving degrevlex key of `lcm` (ADR-034). Pre-computed
+    /// via `Monomial::degrevlex_key`. The L-queue uses this as the
+    /// tie-break among equal-sugar pairs when the `pairorder_lm`
+    /// feature is enabled, so that `pop()` yields the
+    /// smallest-degrevlex LCM (Singular's `compareL15` top()). Computed
+    /// unconditionally (it's cheap and the ring is in hand here); the
+    /// feature only chooses whether the L-queue *reads* it.
+    pub lcm_ord_key: [u64; 4],
     /// Sugar degree of the pair: `max(sugar(S[i]) + deg(m_i),
     /// sugar(S[j]) + deg(m_j))`. For the bootstrap where inputs
     /// carry `sugar = lm_deg`, this is equivalent to the LCM's total
@@ -97,12 +105,17 @@ impl Pair {
         // ADR-025: divmask alongside SEV.
         let lcm_sev = lcm.compute_sev(ring);
         let lcm_divmask = ring.divmask_of(&lcm);
+        // ADR-034: order-preserving degrevlex key for the (sugar, LCM)
+        // pair tie-break. Computed here unconditionally — the ring is
+        // in hand and the cost is one XOR-reorder of four words.
+        let lcm_ord_key = lcm.degrevlex_key(ring);
         Self {
             i,
             j,
             lcm,
             lcm_sev,
             lcm_divmask,
+            lcm_ord_key,
             sugar,
             arrival,
             key: PairKey(0),
@@ -123,16 +136,46 @@ impl Pair {
             ring.divmask_of(&self.lcm),
             "lcm_divmask cache mismatch (ADR-025)"
         );
+        assert_eq!(
+            self.lcm_ord_key,
+            self.lcm.degrevlex_key(ring),
+            "lcm_ord_key cache mismatch (ADR-034)"
+        );
     }
 }
 
-// Ordering: ascending on (sugar, arrival, i, j). Wrap in `Reverse`
+// Ordering: ascending on (sugar, <tie-break>, i, j). Wrap in `Reverse`
 // when using `BinaryHeap` so the smallest comes out first.
+//
+// The tie-break among equal-sugar pairs depends on the `pairorder_lm`
+// feature (ADR-034):
+// * OFF (default): `arrival` — insertion order, byte-for-byte the
+//   prior behaviour.
+// * ON: `lcm_ord_key` — the LCM's order-preserving degrevlex key, so
+//   `pop()` (the minimum) yields the smallest-degrevlex LCM, matching
+//   Singular's `compareL15`. `arrival` is folded in after `lcm_ord_key`
+//   as a final deterministic tie so two pairs with the same
+//   `(sugar, lcm)` still order stably (the LCM equality case the
+//   product/chain criteria allow).
+//
+// Both LSet backends must agree: `lset.rs`'s `HeapEntry` delegates here
+// via `Pair::cmp`, and `lset_flat.rs`'s `SortedKey` mirrors this exact
+// key under the same feature gate. Keeping them consistent ensures the
+// two backends produce the same pair sequence (the cross-backend
+// contract tests rely on it).
 impl Ord for Pair {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sugar
-            .cmp(&other.sugar)
-            .then_with(|| self.arrival.cmp(&other.arrival))
+        let by_sugar = self.sugar.cmp(&other.sugar);
+        #[cfg(not(feature = "pairorder_lm"))]
+        let tie = || self.arrival.cmp(&other.arrival);
+        #[cfg(feature = "pairorder_lm")]
+        let tie = || {
+            self.lcm_ord_key
+                .cmp(&other.lcm_ord_key)
+                .then_with(|| self.arrival.cmp(&other.arrival))
+        };
+        by_sugar
+            .then_with(tie)
             .then_with(|| self.i.cmp(&other.i))
             .then_with(|| self.j.cmp(&other.j))
     }

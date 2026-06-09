@@ -453,6 +453,130 @@ fn katsura3_matches_singular_fixture() {
     assert_eq!(got, expected, "katsura-3 fixture mismatch");
 }
 
+/// ADR-034 bit-identity gate. The `pairorder_lm` feature changes only
+/// *which order* S-pairs are reduced, never the result: the output is
+/// still **the** reduced Gröbner basis (unique). So `compute_gb` must
+/// produce the exact same basis whether the feature is on or off. A
+/// single compiled binary can only hold one feature state, so the
+/// cross-state proof is: this test asserts byte-identical output
+/// against the committed Singular reference, and the CI/task runs it
+/// under BOTH `cargo test --release` (feature off) and `cargo test
+/// --release --features pairorder_lm` (feature on). Both must pass the
+/// same `assert_eq!`, which (given `Poly: Eq` compares full
+/// coefficient+monomial term vectors) is exactly bit-identity of the
+/// basis across the feature toggle. cyclic-5 is non-trivial enough
+/// that the two pair orders genuinely diverge mid-computation.
+#[test]
+fn pairorder_lm_output_is_the_reduced_gb_cyclic5_katsura3() {
+    // cyclic-5
+    {
+        let r = mk_ring(5, 32003);
+        let m = |e: &[u32]| mono(&r, e);
+        let f1 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[1, 0, 0, 0, 0])),
+                (1, m(&[0, 1, 0, 0, 0])),
+                (1, m(&[0, 0, 1, 0, 0])),
+                (1, m(&[0, 0, 0, 1, 0])),
+                (1, m(&[0, 0, 0, 0, 1])),
+            ],
+        );
+        let f2 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[1, 1, 0, 0, 0])),
+                (1, m(&[0, 1, 1, 0, 0])),
+                (1, m(&[0, 0, 1, 1, 0])),
+                (1, m(&[0, 0, 0, 1, 1])),
+                (1, m(&[1, 0, 0, 0, 1])),
+            ],
+        );
+        let f3 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[1, 1, 1, 0, 0])),
+                (1, m(&[0, 1, 1, 1, 0])),
+                (1, m(&[0, 0, 1, 1, 1])),
+                (1, m(&[1, 0, 0, 1, 1])),
+                (1, m(&[1, 1, 0, 0, 1])),
+            ],
+        );
+        let f4 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[1, 1, 1, 1, 0])),
+                (1, m(&[0, 1, 1, 1, 1])),
+                (1, m(&[1, 0, 1, 1, 1])),
+                (1, m(&[1, 1, 0, 1, 1])),
+                (1, m(&[1, 1, 1, 0, 1])),
+            ],
+        );
+        let f5 = Poly::from_terms(
+            &r,
+            vec![(1, m(&[1, 1, 1, 1, 1])), (32002, m(&[0, 0, 0, 0, 0]))],
+        );
+        let got = compute_gb(Arc::clone(&r), vec![f1, f2, f3, f4, f5]);
+        let text = include_str!("fixtures/cyclic-5.gb.txt");
+        let expected = sort_gb_ascending(parse_fixture(text, &r, &["a", "b", "c", "d", "e"]), &r);
+        // Determinism within this feature state.
+        assert_eq!(
+            got,
+            sort_gb_ascending(got.clone(), &r),
+            "compute_gb output not in ascending leading-monomial order"
+        );
+        // Byte-identity against the unique reduced GB.
+        assert_eq!(got, expected, "cyclic-5 reduced GB differs under pairorder_lm");
+    }
+    // katsura-3
+    {
+        let r = mk_ring(4, 32003);
+        let m = |e: &[u32]| mono(&r, e);
+        let f1 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[1, 0, 0, 0])),
+                (2, m(&[0, 1, 0, 0])),
+                (2, m(&[0, 0, 1, 0])),
+                (2, m(&[0, 0, 0, 1])),
+                (32002, m(&[0, 0, 0, 0])),
+            ],
+        );
+        let f2 = Poly::from_terms(
+            &r,
+            vec![
+                (1, m(&[2, 0, 0, 0])),
+                (2, m(&[0, 2, 0, 0])),
+                (2, m(&[0, 0, 2, 0])),
+                (2, m(&[0, 0, 0, 2])),
+                (32002, m(&[1, 0, 0, 0])),
+            ],
+        );
+        let f3 = Poly::from_terms(
+            &r,
+            vec![
+                (2, m(&[1, 1, 0, 0])),
+                (2, m(&[0, 1, 1, 0])),
+                (2, m(&[0, 0, 1, 1])),
+                (32002, m(&[0, 1, 0, 0])),
+            ],
+        );
+        let f4 = Poly::from_terms(
+            &r,
+            vec![
+                (2, m(&[1, 0, 1, 0])),
+                (2, m(&[0, 2, 0, 0])),
+                (32002, m(&[0, 0, 1, 0])),
+                (2, m(&[0, 1, 0, 1])),
+            ],
+        );
+        let got = compute_gb(Arc::clone(&r), vec![f1, f2, f3, f4]);
+        let text = include_str!("fixtures/katsura-3.gb.txt");
+        let expected = sort_gb_ascending(parse_fixture(text, &r, &["u0", "u1", "u2", "u3"]), &r);
+        assert_eq!(got, expected, "katsura-3 reduced GB differs under pairorder_lm");
+    }
+}
+
 #[test]
 fn parser_round_trips_monomial_forms() {
     // Smoke-test for the parser: Singular emits both `x2` and `x^2`

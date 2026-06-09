@@ -77,6 +77,27 @@ flat_lset = []
 # is gated. Promote to a default only after the c200-1 wall A/B.
 shortest_reducer = []
 
+# S-pair processing order by (sugar, LCM) — Singular's compareL15
+# (ADR-034). OFF by default for a clean A/B. When ON, the L-queue's
+# tie-break among equal-sugar pairs is the LCM's order-preserving
+# degrevlex key (`Pair::lcm_ord_key`) instead of arrival order —
+# matching Singular's `compareL15` = (GetpFDeg + ecart, then pLmCmp)
+# = (sugar, then leading-monomial of the LCM). pop() takes the
+# minimum (sugar, lcm_ord_key, idx) = compareL15's top(). This is the
+# classic normal selection strategy: processing equal-sugar pairs in
+# LCM order builds the low part of the basis first, so later
+# S-polynomials reduce against a more-complete basis -> far less
+# intermediate swell. A throwaway probe measured −30 % total
+# reduction subtracts, output bit-identical
+# (`~/project/reports/rustgb-nextopt-perop-comparison.md`). With the
+# feature OFF, the tie-break is `arrival`, byte-for-byte the prior
+# (sugar, arrival, idx) behaviour. `lcm_ord_key` is computed
+# unconditionally in `Pair::new` (cheap, where the ring is in hand);
+# only the L-queue sort key selects between arrival and lcm_ord_key.
+# Stacks with ADR-032 (shortest_reducer) — independent levers.
+# Promote to a default only after the c200-1 wall A/B.
+pairorder_lm = []
+
 [dev-dependencies]
 proptest = "1"
 
