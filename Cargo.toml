@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # stdlib only for now; add as needed.
 
 [features]
-default = ["redtail", "flat_lset", "shortest_reducer"]
+default = ["redtail", "flat_lset", "shortest_reducer", "pairorder_lm"]
 
 # Default reducer is the geobucket (ADR-002). Enabling this feature
 # switches `bba::reduce_lobject` to the heap-based Monagan-Pearce

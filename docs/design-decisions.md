@@ -5634,9 +5634,29 @@ if the residual 1.88-vs-1.73 gap proves to matter on the wall.
 
 ## ADR-034: S-pair processing order by (sugar, LCM) — `compareL15` (`pairorder_lm` feature)
 
-**Status:** Accepted — **OFF by default**; promote to default only
-after the c200-1 wall A/B.
+**Status:** Accepted — **promoted to a default feature** after the
+c200-1 wall A/B below.
 **Date:** 2026-06-09
+
+### Measured result (wall, c200-1 same-campaign A/B)
+
+Same-campaign A/B on c200-1 (isolated core 11, `taskset -c 11 numactl
+--membind=1`, performance governor), 5 runs each, both on top of the
+shipped `shortest_reducer`. OFF = `(sugar, arrival)`, ON =
+`--features pairorder_lm` = `(sugar, lcm)`. Raw:
+`~/project/profile-data/rustgb-pairorder-lm-ab-c200-1.csv`.
+
+| staging test | OFF wall | ON wall | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 8.642 s | 7.337 s | **−15.1 %** | −17.7 % | identical |
+| 5104053 | 15.650 s | 13.561 s | **−13.3 %** | −14.1 % | identical |
+| 5106746 | 17.618 s | 13.276 s | **−24.6 %** | −26.2 % | identical |
+
+**−13 % to −25 % wall on every staging case**, output bit-identical,
+Δwall ≈ Δinstr (the −30 % step-count win from the probe translating to
+wall). Far exceeds the `flat_lset`/`shortest_reducer` promotion bar →
+**flipped to a default feature** (`Cargo.toml`). Stacks with ADR-032;
+narrows the gap to next-opt from ~1.5–1.65× to ~1.27–1.31× wall.
 
 ### Context
 
