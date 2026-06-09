@@ -5632,6 +5632,154 @@ if the residual 1.88-vs-1.73 gap proves to matter on the wall.
 
 ---
 
+## ADR-034: S-pair processing order by (sugar, LCM) — `compareL15` (`pairorder_lm` feature)
+
+**Status:** Accepted — **OFF by default**; promote to default only
+after the c200-1 wall A/B.
+**Date:** 2026-06-09
+
+### Context
+
+After ADR-032 (`shortest_reducer`) cut rust's reduction-step gap from
+~2.5× to **1.53×** vs Singular `next-opt`, a per-step/per-pair audit
+(`~/project/reports/rustgb-nextopt-perop-comparison.md`) localised the
+residual gap. Both engines reduce the **same ~30 K S-pairs** to the
+**same 2972-element basis** with the **same ~90 % zero-reduction rate**
+and the **same spoly sizes**. Reducer *selection* — both length and
+true ecart — was exhaustively **ruled out**: replicating Singular's
+exact `(ecart, length)` reducer choice made rust *worse* (+10 %). The
+cause is **structural**: the **S-pair selection order**, specifically
+the **tie-break among equal-sugar pairs**.
+
+- **Singular** orders its pair queue `L` by `compareL15`
+  (`kernel/GBEngine/kutil.cc:5856`) = `(GetpFDeg + ecart, then
+  pLmCmp)` = **(sugar, then leading-monomial of the LCM)**, and pops
+  the minimum (`strat->L.top()`).
+- **rust** ordered its L-queue by **(sugar, then arrival)** — same
+  primary key, but the tie-break was insertion order, not LCM order.
+
+A throwaway `(sugar, lcm)` linear-scan pop on staging-5101449 measured
+**total `minus_m_mult_p` 1 803 118 → 1 260 130 (−30 %)**, basis
+**bit-identical**, bringing rust's reduction steps to within ~6 % of
+Singular's (1.53× → ~1.06×).
+
+**Mechanism — the normal selection strategy.** Processing equal-sugar
+pairs in LCM (leading-monomial) order builds up the low part of the
+basis first, so later S-polynomials reduce against a more-complete
+basis → far less intermediate swell → fewer reduction steps. rust's
+`(sugar, arrival)` was a weaker proxy reducing pairs against
+less-complete bases. This retroactively explains why reducer
+selection was a red herring: with the wrong pair order, no per-step
+reducer choice can recover the lost basis-completeness. ADR-034 and
+ADR-032 are **independent levers** that stack.
+
+### Singular's approach
+
+`compareL15` (`kernel/GBEngine/kutil.cc:5856`) compares two L-entries
+by `pFDeg + ecart` (the sugar) first, and on a tie by `pLmCmp` — the
+degrevlex leading-monomial comparison of the pair's LCM. `strat->L`
+is kept sorted by this comparator and `bba` reduces `L.top()`, the
+minimum. So Singular processes equal-sugar pairs **smallest-LCM
+first** under the ring's monomial order.
+
+### FLINT's approach
+
+**N/A — FLINT has no GB engine.** `nmod_mpoly` has no Buchberger pair
+queue, so there is no S-pair selection order to compare.
+
+### The efficient key
+
+The experiment's O(live) linear scan per pop is unusable for wall. The
+efficient key exploits the monomial encoding (ADR-005): `Monomial` is
+`packed: [u64; 4]`, and `cmp_degrevlex` works by XOR-ing each word
+against `ring.cmp_flip_mask` then comparing words MSB→LSB,
+larger-wins. So an order-preserving degrevlex key is just the XOR'd
+packed words reordered MSB-first as a `[u64; 4]` — `Copy + Ord`, no
+ring needed at comparison time:
+
+```text
+key[0] = packed[3] ^ flip[3]   // MSB word
+key[1] = packed[2] ^ flip[2]
+key[2] = packed[1] ^ flip[1]
+key[3] = packed[0] ^ flip[0]   // LSB word
+```
+
+`[u64; 4]`'s default lexicographic `Ord` (element 0 first) on this key
+is exactly `cmp_degrevlex` on the non-saturated domain. A smaller key
+is a smaller-degrevlex monomial → the L-queue's minimum is
+`compareL15`'s `top()`. (`Monomial::degrevlex_key`, `src/monomial.rs`;
+asserted order-faithful over 5000 random 8-var pairs +
+canonical-sequence spot-check by `degrevlex_key_preserves_order`.)
+Saturation caveat: this mirrors only `cmp_degrevlex`'s fast path; the
+dispatch shim filters rings where total degree > 255, so on the
+dispatched workload the key is order-faithful.
+
+### Decision
+
+1. **`Monomial::degrevlex_key(&self, ring) -> [u64; 4]`** — the
+   order-preserving key above. Computed unconditionally; cheap (one
+   XOR-reorder of four words).
+2. **`Pair::lcm_ord_key: [u64; 4]`** — the LCM's `degrevlex_key`,
+   computed in `Pair::new` (`src/pair.rs`) where the ring is in hand,
+   alongside `lcm_sev` / `lcm_divmask`. Maintained unconditionally and
+   checked in `Pair::assert_canonical`.
+3. **`pairorder_lm` cargo feature, OFF by default.** When ON, the
+   L-queue tie-break among equal-sugar pairs is `lcm_ord_key` (then
+   `arrival` as a final deterministic tie), so `pop()` (the minimum)
+   yields the smallest-degrevlex LCM — `compareL15`'s `top()`. When
+   OFF, the tie-break is `arrival`, **byte-for-byte the prior
+   `(sugar, arrival, idx)` order**.
+4. **Both LSet backends gated consistently.** The heap backend
+   (`src/lset.rs`) orders via `HeapEntry`, which delegates to
+   `Pair::cmp`; the flat backend (`src/lset_flat.rs`, the default via
+   `flat_lset`) mirrors the same key in its `SortedKey` under the same
+   `#[cfg(feature = "pairorder_lm")]`, carrying `lcm_ord_key` only
+   when the feature is on (so the OFF build is byte-for-byte the prior
+   triple). Keeping them consistent means both backends produce the
+   same pair sequence — the cross-backend contract tests rely on it.
+
+### Consequences
+
+* **Output is path-only, never result.** The order changes only
+  *which order* S-pairs are reduced, never the (unique) reduced GB.
+  **Bit-identity gate:** with the feature ON, the cyclic-3/4/5 +
+  katsura-3 Singular-reference fixtures pass identically (full suite
+  green: default, `--features pairorder_lm`, heap backend, and heap +
+  `pairorder_lm`). The dedicated
+  `pairorder_lm_output_is_the_reduced_gb_cyclic5_katsura3` test asserts
+  byte-identical output against the Singular reference under both
+  feature states. A differing basis would be a bug.
+* **`lcm_ord_key` is unconditional**, so the default build carries one
+  extra `[u64; 4]` per pair (and its `assert_canonical` check) but runs
+  the identical arrival-order tie-break. Cost is one XOR-reorder per
+  `Pair::new`.
+* **Wall is unresolved.** The −30 % is *step count*, not wall. The
+  c200-1 same-campaign wall A/B (and the promote-to-default decision)
+  is run interactively — wall benches exceed the 600 s subagent stream
+  watchdog, so they are out of scope here.
+
+### References
+
+* `~/project/reports/rustgb-nextopt-perop-comparison.md` — "RESOLVED:
+  it's the pair-processing order (S-pair tie-break) — ADR-034": the
+  reducer-selection ruling-out, the `(sugar, lcm)` probe, and the
+  −30 % step-count measurement this ADR makes permanent.
+* ADR-005 — the packed `[u64; 4]` monomial encoding and `cmp_flip_mask`
+  the key exploits; ADR-008 — the reducer heap's `cmp_key`, the same
+  XOR-flip-packed-word trick at the term level.
+* ADR-032 — `shortest_reducer`, the independent reducer-selection lever
+  this stacks with; ADR-026 — the `flat_lset` backend whose `SortedKey`
+  carries the gated key.
+* `~/rustgb/src/monomial.rs` — `degrevlex_key`,
+  `degrevlex_key_preserves_order`; `~/rustgb/src/pair.rs` —
+  `lcm_ord_key`, `Pair::cmp`; `~/rustgb/src/lset_flat.rs` —
+  `SortedKey`; `~/rustgb/tests/bba_fixtures.rs` —
+  `pairorder_lm_output_is_the_reduced_gb_cyclic5_katsura3`.
+* `~/Singular/kernel/GBEngine/kutil.cc:5856` — `compareL15`
+  (`GetpFDeg + ecart`, then `pLmCmp`); `strat->L.top()` selection.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
