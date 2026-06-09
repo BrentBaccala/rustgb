@@ -261,6 +261,51 @@ impl Monomial {
         &self.packed
     }
 
+    /// Order-preserving degrevlex sort key (ADR-034).
+    ///
+    /// Returns the four packed words XOR'd against the ring's
+    /// `cmp_flip_mask` and **reordered MSB-first**, so that the
+    /// derived `[u64; 4]` is `Copy + Ord` and its default
+    /// (lexicographic, element 0 first) ordering is *exactly*
+    /// `cmp_degrevlex`:
+    ///
+    /// ```text
+    /// key[0] = packed[3] ^ flip[3]   // MSB word (total-deg cap + high vars)
+    /// key[1] = packed[2] ^ flip[2]
+    /// key[2] = packed[1] ^ flip[1]
+    /// key[3] = packed[0] ^ flip[0]   // LSB word
+    /// ```
+    ///
+    /// `cmp_degrevlex` compares the packed words MSB → LSB with each
+    /// word XOR'd against the flip mask, "larger XOR'd word wins"
+    /// (see `cmp_degrevlex`'s docstring). Array `Ord` compares
+    /// element 0 first, "larger element wins". So placing the MSB
+    /// word at element 0 makes `key(a).cmp(&key(b)) == a.cmp(b, ring)`
+    /// for non-saturated monomials — a smaller key is a
+    /// smaller-degrevlex monomial, which is exactly what
+    /// `compareL15`'s `top()` (the minimum of the L-queue) wants.
+    ///
+    /// **Saturation caveat:** this mirrors the *fast* path of
+    /// `cmp_degrevlex` only. When a monomial's top byte is the
+    /// saturated value `0xFF` (total degree > 255), `cmp_degrevlex`
+    /// diverts to a recompute slow path that this key cannot
+    /// reproduce. The dispatch shim filters rings where saturation
+    /// can occur (`n_vars × max_per_var_deg > 255`), so on the
+    /// dispatched workload the key is order-faithful; the
+    /// order-preservation test asserts this over the non-saturated
+    /// domain.
+    #[inline]
+    pub fn degrevlex_key(&self, ring: &Ring) -> [u64; 4] {
+        const _: () = assert!(WORDS_PER_MONO == 4);
+        let mask = ring.cmp_flip_mask();
+        [
+            self.packed[3] ^ mask[3],
+            self.packed[2] ^ mask[2],
+            self.packed[1] ^ mask[1],
+            self.packed[0] ^ mask[0],
+        ]
+    }
+
     /// Exponent of variable `i`. Returns `None` if `i >= ring.nvars()`.
     pub fn exponent(&self, ring: &Ring, i: u32) -> Option<u32> {
         if i >= ring.nvars() {
@@ -929,6 +974,66 @@ mod tests {
         // exponent is 1: a_1 = 50, b_1 = 127. Smaller exponent at
         // largest differing index wins degrevlex, so a > b.
         assert_eq!(a.cmp(&b, &r), Ordering::Greater);
+    }
+
+    #[test]
+    fn degrevlex_key_preserves_order() {
+        // ADR-034: the packed-word degrevlex_key must induce the same
+        // total order as cmp(). Generate a batch of pseudo-random
+        // monomial pairs and assert key(a).cmp(&key(b)) == a.cmp(b).
+        // Stick to the non-saturated domain (total degree <= 255),
+        // which is where the key is order-faithful and where the
+        // dispatched workload lives.
+        let r = mk_ring(8);
+        let n = r.nvars() as usize;
+        // Simple deterministic LCG so the test is reproducible
+        // without a dependency.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+        let mut mk = || {
+            // Per-var exponents in 0..=15 keep total degree well under
+            // the 255 saturation cap (8 vars * 15 = 120 max).
+            let exps: Vec<u32> = (0..n).map(|_| (next() % 16) as u32).collect();
+            Monomial::from_exponents(&r, &exps).unwrap()
+        };
+        for _ in 0..5000 {
+            let a = mk();
+            let b = mk();
+            let ka = a.degrevlex_key(&r);
+            let kb = b.degrevlex_key(&r);
+            assert_eq!(
+                ka.cmp(&kb),
+                a.cmp(&b, &r),
+                "degrevlex_key order disagrees with cmp for {:?} vs {:?}",
+                a.exponents(&r),
+                b.exponents(&r)
+            );
+        }
+        // Spot-check the canonical degree-2, 3-var sequence too.
+        let r3 = mk_ring(3);
+        let seq = [
+            Monomial::from_exponents(&r3, &[2, 0, 0]).unwrap(),
+            Monomial::from_exponents(&r3, &[1, 1, 0]).unwrap(),
+            Monomial::from_exponents(&r3, &[0, 2, 0]).unwrap(),
+            Monomial::from_exponents(&r3, &[1, 0, 1]).unwrap(),
+            Monomial::from_exponents(&r3, &[0, 1, 1]).unwrap(),
+            Monomial::from_exponents(&r3, &[0, 0, 2]).unwrap(),
+        ];
+        // seq is strictly descending in degrevlex; the key is
+        // order-preserving (smaller monomial == smaller key), so the
+        // keys must be strictly descending too. The L-queue takes the
+        // minimum key = the minimum (smallest-degrevlex) LCM, matching
+        // compareL15's top().
+        for w in seq.windows(2) {
+            assert_eq!(w[0].cmp(&w[1], &r3), Ordering::Greater);
+            assert!(
+                w[0].degrevlex_key(&r3) > w[1].degrevlex_key(&r3),
+                "key must preserve order: larger monomial -> larger key"
+            );
+        }
     }
 
     #[test]
