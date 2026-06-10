@@ -44,6 +44,8 @@ pub mod poly;
 pub mod reducer;
 pub mod ring;
 pub mod sbasis;
+#[cfg(feature = "scan_stats")]
+pub mod scan_stats;
 mod simd;
 
 pub use bba::compute_gb;

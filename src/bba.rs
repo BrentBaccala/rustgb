@@ -83,6 +83,12 @@ fn rustgb_threads() -> usize {
 /// env-var dispatch can pick between serial and parallel without
 /// changing the public API.
 pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
+    // scan_stats (task 389): reset per-call so a process running
+    // multiple std() calls reports the most recent computation's
+    // divisor-scan volume. Compiled out unless the feature is on.
+    #[cfg(feature = "scan_stats")]
+    crate::scan_stats::reset();
+
     let mut s_basis = SBasis::new();
     let mut l_set = LSet::new();
     let mut next_arrival: u64 = 0;
@@ -179,6 +185,13 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     // idempotent on already-tail-reduced input, so leaving it in
     // costs at most one O(basis_size × tail_size) scan.
     tail_reduce_all(&mut s_basis, &ring);
+
+    // scan_stats (task 389): dump per-call-site divisor-scan volume to
+    // stderr if RUSTGB_SCAN_STATS=1. Compiled out unless the feature is
+    // on. Placed after tail_reduce_all so the Tailall counters are
+    // included.
+    #[cfg(feature = "scan_stats")]
+    crate::scan_stats::dump_if_enabled();
 
     // Extract the surviving (non-redundant) polynomials, canonically
     // sorted. We sort **ascending** by leading monomial to match
@@ -282,7 +295,14 @@ pub fn reduce_lobject_geobucket(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc
             .1
             .clone();
 
-        let Some(idx) = find_divisor_idx(s_basis, lm_divmask, &lm, ring) else {
+        let Some(idx) = find_divisor_idx(
+            s_basis,
+            lm_divmask,
+            &lm,
+            ring,
+            #[cfg(feature = "scan_stats")]
+            crate::scan_stats::ScanSite::Head,
+        ) else {
             return;
         };
 
@@ -371,8 +391,15 @@ pub fn reduce_lobject_heap(lobj: &mut LObject, s_basis: &SBasis, ring: &Arc<Ring
         // which Singular's `kFindDivisibleByInT` divmask probe would
         // fire if Monagan-Pearce were used there.
         let leader_divmask = ring.divmask_of(leader);
-        find_divisor_idx(s_basis, leader_divmask, leader, ring)
-            .map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))
+        find_divisor_idx(
+            s_basis,
+            leader_divmask,
+            leader,
+            ring,
+            #[cfg(feature = "scan_stats")]
+            crate::scan_stats::ScanSite::Head,
+        )
+        .map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))
     });
 
     // Replace the LObject with one carrying the heap reducer's
@@ -412,6 +439,7 @@ fn find_divisor_idx(
     lm_divmask: u64,
     lm: &crate::monomial::Monomial,
     ring: &Ring,
+    #[cfg(feature = "scan_stats")] site: crate::scan_stats::ScanSite,
 ) -> Option<usize> {
     let divmasks = s_basis.divmasks();
     let lms = s_basis.lms();
@@ -433,6 +461,17 @@ fn find_divisor_idx(
     #[cfg(feature = "shortest_reducer")]
     let mut best: Option<(usize, u32)> = None;
 
+    // scan_stats accumulators (task 389, finding C). All cfg-gated so
+    // the production build pays nothing. `divmask_hits` counts each
+    // distinct divmask-passing candidate the driver inspected;
+    // `divides_hits` counts the ones `Monomial::divides` confirmed.
+    // `swept` is the final idx reached (elements covered), capped at
+    // len. `earlyout_pos` records where a `li<=2` early-out fired.
+    #[cfg(feature = "scan_stats")]
+    let mut divmask_hits: u64 = 0;
+    #[cfg(feature = "scan_stats")]
+    let mut divides_hits: u64 = 0;
+
     let mut idx = 0;
     while idx < len {
         // Find the next divmask that passes the pre-filter
@@ -442,6 +481,10 @@ fn find_divisor_idx(
         if idx >= len {
             break;
         }
+        #[cfg(feature = "scan_stats")]
+        {
+            divmask_hits += 1;
+        }
         // Divmask passes; check redundant flag and the actual divides.
         // ADR-010: read the leading monomial from the lms cache
         // (flat Vec<Monomial>, contiguous) instead of dereferencing
@@ -450,8 +493,21 @@ fn find_divisor_idx(
         // showed at 11 % of within-function cycles in
         // reduce_to_normal_form.
         if !redund[idx] && lms[idx].divides(lm, ring) {
+            #[cfg(feature = "scan_stats")]
+            {
+                divides_hits += 1;
+            }
             #[cfg(not(feature = "shortest_reducer"))]
             {
+                #[cfg(feature = "scan_stats")]
+                crate::scan_stats::record_scan(
+                    site,
+                    len,
+                    idx.min(len),
+                    divmask_hits,
+                    divides_hits,
+                    None,
+                );
                 return Some(idx);
             }
             #[cfg(feature = "shortest_reducer")]
@@ -460,6 +516,15 @@ fn find_divisor_idx(
                 // Singular's early-out: a 1- or 2-term reducer is the
                 // best possible (`redHomog`: `if (li<3) break;`).
                 if li <= 2 {
+                    #[cfg(feature = "scan_stats")]
+                    crate::scan_stats::record_scan(
+                        site,
+                        len,
+                        idx.min(len),
+                        divmask_hits,
+                        divides_hits,
+                        Some(idx),
+                    );
                     return Some(idx);
                 }
                 match best {
@@ -470,6 +535,10 @@ fn find_divisor_idx(
         }
         idx += 1;
     }
+
+    // Loop exhausted the basis (no early-out). `swept` = len.
+    #[cfg(feature = "scan_stats")]
+    crate::scan_stats::record_scan(site, len, len, divmask_hits, divides_hits, None);
 
     #[cfg(feature = "shortest_reducer")]
     {
@@ -524,7 +593,13 @@ fn reduce_h_tail(h: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
         (c, m.clone())
     };
     let tail = h.drop_leading(ring);
-    let reduced_tail = reduce_tail(tail, s_basis, ring);
+    let reduced_tail = reduce_tail(
+        tail,
+        s_basis,
+        ring,
+        #[cfg(feature = "scan_stats")]
+        crate::scan_stats::ScanSite::Redtail,
+    );
     let combined = prepend_leading(lc, &lm, reduced_tail, ring);
     // `combined` already has lc=1 because `h` was monic and the
     // leading term is preserved verbatim, so this `monic` is a
@@ -585,7 +660,13 @@ fn tail_reduce_all(s_basis: &mut SBasis, ring: &Arc<Ring>) {
         // accidentally reduce by ourselves.
         s_basis.set_redundant(i, true);
 
-        let reduced_tail = reduce_tail(tail, s_basis, ring);
+        let reduced_tail = reduce_tail(
+            tail,
+            s_basis,
+            ring,
+            #[cfg(feature = "scan_stats")]
+            crate::scan_stats::ScanSite::Tailall,
+        );
 
         // Unmark.
         s_basis.set_redundant(i, false);
@@ -609,7 +690,12 @@ fn tail_reduce_all(s_basis: &mut SBasis, ring: &Arc<Ring>) {
 /// `done` and re-scan the bucket for its new leader. The parked
 /// terms accumulate in strict descending order because
 /// `extract_leading` always yields the bucket's current max.
-fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
+fn reduce_tail(
+    tail: Poly,
+    s_basis: &SBasis,
+    ring: &Arc<Ring>,
+    #[cfg(feature = "scan_stats")] site: crate::scan_stats::ScanSite,
+) -> Poly {
     if tail.is_zero() {
         return tail;
     }
@@ -635,6 +721,13 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
         // leader divmask to reuse — unlike the head reducer, whose
         // `LObject::refresh` caches it).
         let lm_divmask = ring.divmask_of(&m);
+        // scan_stats: count the redtail per-leader divmask_of (finding-A
+        // shaped sub-hypothesis). Only the Redtail site is the ADR-024
+        // per-step path; Tailall is the post-hoc pass. Count both under
+        // the same redtail_divmask_of bucket since the cost structure is
+        // identical (a raw KBucket leader, no cached divmask either way).
+        #[cfg(feature = "scan_stats")]
+        crate::scan_stats::record_redtail_divmask_of();
 
         // ADR-031: route the tail-reduction divisor search through the
         // shared `find_divisor_idx`, the same helper the head reducer
@@ -645,7 +738,14 @@ fn reduce_tail(tail: Poly, s_basis: &SBasis, ring: &Arc<Ring>) -> Poly {
         // deref this used to run. The divisor-eligibility contract is
         // identical: both honour `redundant_flags()`, both apply the
         // divmask fast-reject, both confirm with `Monomial::divides`.
-        let divisor = find_divisor_idx(s_basis, lm_divmask, &m, ring);
+        let divisor = find_divisor_idx(
+            s_basis,
+            lm_divmask,
+            &m,
+            ring,
+            #[cfg(feature = "scan_stats")]
+            site,
+        );
         match divisor {
             None => {
                 // Term is in normal form; extract it and park.

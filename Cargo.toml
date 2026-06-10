@@ -117,6 +117,19 @@ pairorder_lm = []
 # identity in `Pair::assert_canonical`.
 pair_mask_or = []
 
+# Divisor-scan volume counters (task 389, finding C). OFF by default;
+# every counter is `#[cfg(feature = "scan_stats")]`-gated so the
+# production build pays nothing. When ON, `bba::find_divisor_idx` and
+# `reduce_tail` accumulate per-call-site scan-volume statistics
+# (scans, eligible/swept elements, divmask/divides hit counts,
+# early-out counts+positions, plus the redtail per-leader
+# `divmask_of` count). Dumped to stderr at the end of
+# `compute_gb_serial` when the `RUSTGB_SCAN_STATS=1` env var is set,
+# one machine-greppable `SCANSTAT ...` line per call site. Pure
+# instrumentation — does not change the computed basis. See
+# `~/project/reports/rustgb-divscan-probe-report.md`.
+scan_stats = []
+
 [dev-dependencies]
 proptest = "1"
 
