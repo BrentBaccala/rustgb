@@ -61,6 +61,36 @@ fn ring_mono2_strategy() -> impl Strategy<Value = (Ring, Monomial, Monomial)> {
     })
 }
 
+/// Ring strategy that sweeps the packing regimes explicitly:
+/// `nvars ∈ {5, 25, 31}`. 5 vars gives a wide divmask budget
+/// (`64/5 = 12` bits/var); 25 is the staging size; 31 is the
+/// dispatch-shim maximum (`64/31 = 2` bits/var, the tightest divmask
+/// packing). ADR-035 / ADR-036 identities are exponent-threshold and
+/// componentwise-max facts, so they must hold across all three.
+fn packing_regime_ring_strategy() -> impl Strategy<Value = Ring> {
+    prop::sample::select(vec![5u32, 25u32, 31u32]).prop_map(|nvars| {
+        let f = Field::new(32003).unwrap();
+        Ring::new(nvars, MonoOrder::DegRevLex, f).unwrap()
+    })
+}
+
+/// Two monomials over a packing-regime ring (nvars ∈ {5, 25, 31}).
+fn regime_mono2_strategy() -> impl Strategy<Value = (Ring, Monomial, Monomial)> {
+    packing_regime_ring_strategy().prop_flat_map(|r| {
+        let n = r.nvars() as usize;
+        (
+            Just(r),
+            prop::collection::vec(0u32..25, n),
+            prop::collection::vec(0u32..25, n),
+        )
+            .prop_map(|(r, ae, be)| {
+                let a = Monomial::from_exponents(&r, &ae).unwrap();
+                let b = Monomial::from_exponents(&r, &be).unwrap();
+                (r, a, b)
+            })
+    })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
@@ -227,5 +257,70 @@ proptest! {
             "mask(a) has bit not in mask(a*b)");
         prop_assert_eq!(mb & !mab, 0,
             "mask(b) has bit not in mask(a*b)");
+    }
+}
+
+// ADR-035 / ADR-036 identities. These are exact (not fast-reject
+// approximations): if any of these falsifies, the corresponding lever's
+// premise is wrong and the feature must NOT ship. The packing-regime
+// sweep (nvars ∈ {5, 25, 31}) covers the divmask budget extremes.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// ADR-035: `sev(lcm(a,b)) == sev(a) | sev(b)` exactly. Both schemes
+    /// are threshold-monotone and lcm is the componentwise max, so the
+    /// OR composition is exact, not just a sound over-approximation.
+    #[test]
+    fn lcm_sev_is_or_of_operands((r, a, b) in regime_mono2_strategy()) {
+        let l = a.lcm(&b, &r);
+        prop_assert_eq!(
+            l.compute_sev(&r),
+            a.compute_sev(&r) | b.compute_sev(&r),
+            "sev(lcm) != sev(a) | sev(b); a={:?} b={:?}",
+            a.exponents(&r), b.exponents(&r)
+        );
+    }
+
+    /// ADR-035: `divmask(lcm(a,b)) == divmask(a) | divmask(b)` exactly.
+    /// This is the load-bearing identity for finding A — if it fails,
+    /// the divmask scheme is not threshold-monotone and the profile
+    /// report's finding A is wrong.
+    #[test]
+    fn lcm_divmask_is_or_of_operands((r, a, b) in regime_mono2_strategy()) {
+        let l = a.lcm(&b, &r);
+        prop_assert_eq!(
+            r.divmask_of(&l),
+            r.divmask_of(&a) | r.divmask_of(&b),
+            "divmask(lcm) != divmask(a) | divmask(b); a={:?} b={:?}",
+            a.exponents(&r), b.exponents(&r)
+        );
+    }
+
+    /// ADR-036: `lcm_equals(a, b, m) == (lcm(a,b) == m)` for arbitrary
+    /// `m`. Covers the common mismatch branch (random `m` rarely equals
+    /// the true lcm).
+    #[test]
+    fn lcm_equals_matches_build_and_compare(
+        (r, a, b) in regime_mono2_strategy(),
+        me in prop::collection::vec(0u32..25, 31usize),
+    ) {
+        let n = r.nvars() as usize;
+        let m = Monomial::from_exponents(&r, &me[..n]).unwrap();
+        let fused = Monomial::lcm_equals(&a, &b, &m, &r);
+        let built = a.lcm(&b, &r) == m;
+        prop_assert_eq!(fused, built,
+            "lcm_equals disagrees with build-and-compare; a={:?} b={:?} m={:?}",
+            a.exponents(&r), b.exponents(&r), m.exponents(&r));
+    }
+
+    /// ADR-036: force the equal branch — `m` IS the true lcm — so the
+    /// fused test must return `true` and the loop must run to
+    /// completion (no early-exit false-negative).
+    #[test]
+    fn lcm_equals_true_when_m_is_the_lcm((r, a, b) in regime_mono2_strategy()) {
+        let l = a.lcm(&b, &r);
+        prop_assert!(Monomial::lcm_equals(&a, &b, &l, &r),
+            "lcm_equals returned false when m IS lcm(a,b); a={:?} b={:?}",
+            a.exponents(&r), b.exponents(&r));
     }
 }

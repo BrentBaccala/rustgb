@@ -49,6 +49,7 @@ pub fn enter_one_pair_normal(
     h_idx: u32,
     h_lm: &Monomial,
     h_lm_sev: u64,
+    h_lm_divmask: u64,
     h_sugar: u32,
     arrival: u64,
 ) -> Option<Pair> {
@@ -94,7 +95,25 @@ pub fn enter_one_pair_normal(
     let sugar_s_side = s_deg + (deg_lcm - s_deg);
     let sugar = sugar_h_side.max(sugar_s_side);
 
-    Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
+    // ADR-035: mask(lcm(a,b)) = mask(a) | mask(b) exactly (both schemes
+    // threshold-monotone, lcm = componentwise max). Behind the
+    // `pair_mask_or` feature we OR the two operands' cached masks
+    // instead of recomputing from the LCM's exponents. The h-side masks
+    // are passed in; the s-side comes from the SBasis caches.
+    #[cfg(feature = "pair_mask_or")]
+    {
+        let s_lm_divmask = s_basis.divmasks()[s_idx as usize];
+        let lcm_sev = h_lm_sev | s_lm_sev;
+        let lcm_divmask = h_lm_divmask | s_lm_divmask;
+        Some(Pair::new_from_masks(
+            s_idx, h_idx, lcm, ring, lcm_sev, lcm_divmask, sugar, arrival,
+        ))
+    }
+    #[cfg(not(feature = "pair_mask_or"))]
+    {
+        let _ = h_lm_divmask;
+        Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
+    }
 }
 
 /// Coprime check on monomials: no variable has nonzero exponent in
@@ -217,13 +236,30 @@ pub fn chain_crit_normal(
             .leading()
             .expect("basis element in a live pair is nonzero")
             .1;
-        let lcm_ih = lm_i.lcm(h_lm, ring);
-        if lcm_ih == pair.lcm {
-            continue;
+        // ADR-036: test lcm(lm_i, h) == pair.lcm without building the
+        // LCM. `Monomial::lcm_equals` fuses the per-variable max-compare
+        // with early exit (the common mismatch case terminates in a few
+        // variables). Behind `fused_chain_crit`; feature-off rebuilds
+        // and compares, byte-for-byte the prior behaviour.
+        #[cfg(feature = "fused_chain_crit")]
+        {
+            if Monomial::lcm_equals(lm_i, h_lm, &pair.lcm, ring) {
+                continue;
+            }
+            if Monomial::lcm_equals(lm_j, h_lm, &pair.lcm, ring) {
+                continue;
+            }
         }
-        let lcm_jh = lm_j.lcm(h_lm, ring);
-        if lcm_jh == pair.lcm {
-            continue;
+        #[cfg(not(feature = "fused_chain_crit"))]
+        {
+            let lcm_ih = lm_i.lcm(h_lm, ring);
+            if lcm_ih == pair.lcm {
+                continue;
+            }
+            let lcm_jh = lm_j.lcm(h_lm, ring);
+            if lcm_jh == pair.lcm {
+                continue;
+            }
         }
         to_drop.push((pair.i, pair.j));
     }
@@ -267,7 +303,7 @@ pub fn enterpairs(
             continue;
         }
         if let Some(pair) = enter_one_pair_normal(
-            ring, s_basis, s_idx, h_idx, &h_lm, h_lm_sev, h_sugar, arrival,
+            ring, s_basis, s_idx, h_idx, &h_lm, h_lm_sev, h_lm_divmask, h_sugar, arrival,
         ) {
             arrival += 1;
             b.push(pair);
@@ -312,7 +348,7 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 0, 0])));
         let h = Poly::monomial(&r, 1, mono(&r, &[0, 1, 0]));
         let h_lm = h.leading().unwrap().1.clone();
-        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), 1, 0);
+        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 1, 0);
         assert!(got.is_none(), "coprime LMs must be pruned by product crit");
     }
 
@@ -323,7 +359,7 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 1, 0])));
         let h = Poly::monomial(&r, 1, mono(&r, &[0, 1, 1]));
         let h_lm = h.leading().unwrap().1.clone();
-        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), 2, 0).unwrap();
+        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 2, 0).unwrap();
         assert_eq!(got.i, 0);
         assert_eq!(got.j, 1);
         // LCM = xyz (exp [1,1,1]).

@@ -405,6 +405,10 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
     let mut b = BSet::new();
     let basis_len;
     let sevs_snapshot: Vec<u64>;
+    // ADR-035: s-side divmask cache, OR'd with h's divmask to obtain the
+    // LCM's divmask without recompute (only needed under `pair_mask_or`).
+    #[cfg(feature = "pair_mask_or")]
+    let divmasks_snapshot: Vec<u64>;
     let lm_degs_snapshot: Vec<u32>;
     let polys_snapshot: Vec<Arc<Poly>>;
     let redundant_snapshot: Vec<bool>;
@@ -412,6 +416,10 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
         let snap = comp.basis.read_snapshot();
         basis_len = snap.polys.len();
         sevs_snapshot = snap.sevs.clone();
+        #[cfg(feature = "pair_mask_or")]
+        {
+            divmasks_snapshot = snap.divmasks.clone();
+        }
         lm_degs_snapshot = snap.lm_degs.clone();
         polys_snapshot = snap.polys.clone();
         let r = comp.basis.redundant.read().unwrap();
@@ -439,10 +447,14 @@ pub fn insert_and_enterpairs(comp: &Computation, h: Poly, h_sugar: u32) {
             s_idx as u32,
             h_idx,
             &sevs_snapshot,
+            #[cfg(feature = "pair_mask_or")]
+            &divmasks_snapshot,
             &lm_degs_snapshot,
             &polys_snapshot,
             &h_lm,
             h_lm_sev,
+            #[cfg(feature = "pair_mask_or")]
+            h_lm_divmask,
             h_sugar,
             // arrival is assigned later under the L-lock, so the
             // arrival ordering is coherent with the actual merge
@@ -583,10 +595,12 @@ fn build_pair(
     s_idx: u32,
     h_idx: u32,
     sevs: &[u64],
+    #[cfg(feature = "pair_mask_or")] divmasks: &[u64],
     lm_degs: &[u32],
     polys: &[Arc<Poly>],
     h_lm: &Monomial,
     h_lm_sev: u64,
+    #[cfg(feature = "pair_mask_or")] h_lm_divmask: u64,
     h_sugar: u32,
     arrival: u64,
 ) -> Option<Pair> {
@@ -610,6 +624,16 @@ fn build_pair(
     let sugar_h = h_sugar + (deg_lcm - deg_h);
     let sugar_s = s_deg + (deg_lcm - s_deg);
     let sugar = sugar_h.max(sugar_s);
+    // ADR-035: OR-compose the LCM masks instead of recomputing.
+    #[cfg(feature = "pair_mask_or")]
+    {
+        let lcm_sev = h_lm_sev | s_lm_sev;
+        let lcm_divmask = h_lm_divmask | divmasks[s_idx as usize];
+        Some(Pair::new_from_masks(
+            s_idx, h_idx, lcm, ring, lcm_sev, lcm_divmask, sugar, arrival,
+        ))
+    }
+    #[cfg(not(feature = "pair_mask_or"))]
     Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
 }
 
@@ -706,13 +730,26 @@ fn chain_crit_l_side(
             .leading()
             .expect("non-empty")
             .1;
-        let lcm_ih = lm_i.lcm(h_lm, ring);
-        if lcm_ih == pair.lcm {
-            continue;
+        // ADR-036: fused lcm-equality (see `gm::chain_crit_normal`).
+        #[cfg(feature = "fused_chain_crit")]
+        {
+            if Monomial::lcm_equals(lm_i, h_lm, &pair.lcm, ring) {
+                continue;
+            }
+            if Monomial::lcm_equals(lm_j, h_lm, &pair.lcm, ring) {
+                continue;
+            }
         }
-        let lcm_jh = lm_j.lcm(h_lm, ring);
-        if lcm_jh == pair.lcm {
-            continue;
+        #[cfg(not(feature = "fused_chain_crit"))]
+        {
+            let lcm_ih = lm_i.lcm(h_lm, ring);
+            if lcm_ih == pair.lcm {
+                continue;
+            }
+            let lcm_jh = lm_j.lcm(h_lm, ring);
+            if lcm_jh == pair.lcm {
+                continue;
+            }
         }
         to_drop.push((pair.i, pair.j));
     }

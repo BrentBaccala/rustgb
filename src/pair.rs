@@ -91,6 +91,13 @@ impl Pair {
     /// overwritten by [`LSet::insert`](crate::lset::LSet::insert);
     /// callers that never hand the pair to an `LSet` may read a stale
     /// key, which is harmless.
+    ///
+    /// ADR-035: `lcm_sev` / `lcm_divmask` are recomputed from the
+    /// LCM's exponents here. The OR-composed fast path
+    /// ([`Pair::new_from_masks`], `pair_mask_or` feature) instead
+    /// passes them in as `mask(a) | mask(b)`; see that constructor and
+    /// ADR-035. This base constructor is the canonical recompute path
+    /// and is always available regardless of feature state.
     pub fn new(
         i: u32,
         j: u32,
@@ -99,12 +106,64 @@ impl Pair {
         sugar: u32,
         arrival: u64,
     ) -> Self {
-        let (i, j) = if i < j { (i, j) } else { (j, i) };
-        debug_assert!(i != j, "degenerate pair with i == j");
         // ADR-019: SEV computed on demand from lcm; ring required.
         // ADR-025: divmask alongside SEV.
         let lcm_sev = lcm.compute_sev(ring);
         let lcm_divmask = ring.divmask_of(&lcm);
+        Self::from_parts(i, j, lcm, ring, lcm_sev, lcm_divmask, sugar, arrival)
+    }
+
+    /// ADR-035: build a pair with the LCM's masks supplied by the
+    /// caller as the OR of the two operands' cached masks.
+    ///
+    /// Because both the SEV (ADR-019/029) and divmask (ADR-025)
+    /// schemes are *threshold-monotone* — a bit is set iff the
+    /// exponent meets a fixed per-variable threshold — and the LCM is
+    /// the componentwise max of the operands, the LCM's masks are
+    /// **exactly** the bitwise OR of the operands' masks:
+    ///
+    /// ```text
+    /// sev(lcm(a,b))     = sev(a)     | sev(b)
+    /// divmask(lcm(a,b)) = divmask(a) | divmask(b)
+    /// ```
+    ///
+    /// (`max(e_a, e_b) ≥ t  ⟺  e_a ≥ t ∨ e_b ≥ t`.) This replaces the
+    /// per-pair `compute_sev` + `divmask_of` recompute with two ORs at
+    /// the call site, where both operand masks are already cached.
+    /// Debug builds re-verify the identity via
+    /// [`Pair::assert_canonical`].
+    #[inline]
+    pub fn new_from_masks(
+        i: u32,
+        j: u32,
+        lcm: Monomial,
+        ring: &crate::ring::Ring,
+        lcm_sev: u64,
+        lcm_divmask: u64,
+        sugar: u32,
+        arrival: u64,
+    ) -> Self {
+        Self::from_parts(i, j, lcm, ring, lcm_sev, lcm_divmask, sugar, arrival)
+    }
+
+    /// Shared body of [`Pair::new`] and [`Pair::new_from_masks`]:
+    /// index-swap, `lcm_ord_key` computation, struct assembly. The two
+    /// public constructors differ only in how `lcm_sev` / `lcm_divmask`
+    /// are obtained (recompute vs OR).
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn from_parts(
+        i: u32,
+        j: u32,
+        lcm: Monomial,
+        ring: &crate::ring::Ring,
+        lcm_sev: u64,
+        lcm_divmask: u64,
+        sugar: u32,
+        arrival: u64,
+    ) -> Self {
+        let (i, j) = if i < j { (i, j) } else { (j, i) };
+        debug_assert!(i != j, "degenerate pair with i == j");
         // ADR-034: order-preserving degrevlex key for the (sugar, LCM)
         // pair tie-break. Computed here unconditionally — the ring is
         // in hand and the cost is one XOR-reorder of four words.
@@ -123,6 +182,14 @@ impl Pair {
     }
 
     /// Debug-only invariant check.
+    ///
+    /// The recompute-and-compare on `lcm_sev` / `lcm_divmask` doubles
+    /// as the ADR-035 OR-identity check: when the pair was built via
+    /// [`Pair::new_from_masks`] (`pair_mask_or` feature) the cached
+    /// masks were obtained by OR-ing the operands' masks, so these
+    /// asserts verify `mask(a) | mask(b) == mask(lcm(a,b))` at every
+    /// debug-build construction. A failure here means the mask scheme
+    /// is not threshold-monotone (which would invalidate ADR-035).
     pub fn assert_canonical(&self, ring: &crate::ring::Ring) {
         assert!(self.i < self.j, "pair indices not ordered");
         self.lcm.assert_canonical(ring);

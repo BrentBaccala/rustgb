@@ -98,6 +98,36 @@ shortest_reducer = []
 # Promote to a default only after the c200-1 wall A/B.
 pairorder_lm = []
 
+# OR-composed pair LCM masks (ADR-035). OFF by default. When ON,
+# `Pair::new_from_masks` obtains the LCM's SEV and divmask as the
+# bitwise OR of the two operands' cached masks — exact, because both
+# schemes are threshold-monotone and the LCM is the componentwise max
+# (`mask(lcm(a,b)) = mask(a) | mask(b)`). This replaces the per-pair
+# `compute_sev` + `divmask_of` recompute (the profile's finding A:
+# `Ring::divmask_of` alone is 7.96 % of wall) with two ORs at the
+# `enter_one_pair_normal` / `build_pair` call sites, where both operand
+# masks are already in hand. With the feature OFF, `Pair::new`
+# recomputes from the LCM exponents, byte-for-byte the pre-ADR-035
+# behaviour. Output is bit-identical either way — the masks are equal
+# values, only cheaper to obtain. Debug builds re-verify the OR
+# identity in `Pair::assert_canonical`. Promote to a default only
+# after the c200-1 wall A/B.
+pair_mask_or = []
+
+# Fused chain-criterion LCM equality test (ADR-036). OFF by default.
+# When ON, `gm::chain_crit_normal` phase 2 (and the parallel
+# `chain_crit_l_side`) test `lcm(lm_i, h) == pair.lcm` via
+# `Monomial::lcm_equals` — a per-variable `max(e_i, e_h) == e_lcm`
+# scan with early exit on first mismatch (the common case) — instead
+# of materializing the full LCM monomial only to compare it (the
+# profile's finding B: `Monomial::lcm` is 9.83 % of wall, partly from
+# this chain-crit site). This is the analog of Singular's
+# `pCompareChain`. With the feature OFF, the two sites build the LCM
+# and compare, byte-for-byte the pre-ADR-036 behaviour. Output is
+# bit-identical (the predicate is exactly equivalent). Promote to a
+# default only after the c200-1 wall A/B.
+fused_chain_crit = []
+
 [dev-dependencies]
 proptest = "1"
 

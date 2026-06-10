@@ -5800,6 +5800,229 @@ dispatched workload the key is order-faithful.
 
 ---
 
+## ADR-035: OR-composed pair LCM masks (`pair_mask_or` feature)
+
+**Status:** Implemented behind default-off feature; promotion
+decision deferred to the interactive c200-1 wall A/B.
+**Date:** 2026-06-10
+
+### Context
+
+The 10 Jun 2026 comparative profile (rustgb master post-ADR-032/034 vs
+Singular next-opt on staging-5101449,
+`~/project/profile-reports/profile-rustgb-master-adr034-vs-nextopt-staging-5101449.md`,
+finding A) localized **~0.6 s / ~8 % of rust's wall** to `Pair::new`:
+for every created S-pair it recomputed the LCM's two bloom masks from
+the LCM's exponents —
+
+```rust
+let lcm_sev = lcm.compute_sev(ring);     // O(nvars) — but cached field now
+let lcm_divmask = ring.divmask_of(&lcm); // O(nvars × bits/var)
+```
+
+`Ring::divmask_of` alone profiled at **7.96 % of wall** (inlined under
+`Pair::new`'s 8.47 %). On a 2972-element basis over ~30 K created pairs
+this is pure recompute of values both operands already carry.
+
+### Decision
+
+Both mask schemes are **threshold-monotone**: a bit is set iff the
+exponent meets a fixed per-variable threshold. For the SEV (ADR-019/029)
+the threshold is `exp > 0`; for the divmask (ADR-025) the bit for
+`(v, t)` is set iff `exp[v] > t` (geometric thresholds 0,1,2,4,…). The
+LCM is the **componentwise max** of its operands. Since
+`max(e_a, e_b) ≥ t  ⟺  e_a ≥ t ∨ e_b ≥ t`, the LCM's mask is **exactly**
+the bitwise OR of the operands' masks:
+
+```text
+sev(lcm(a,b))     = sev(a)     | sev(b)
+divmask(lcm(a,b)) = divmask(a) | divmask(b)
+```
+
+This is an exact identity, not a fast-reject over-approximation. The
+whole `compute_sev` + `divmask_of` recompute collapses to two ORs of
+values already cached at the call site.
+
+A new constructor `Pair::new_from_masks(i, j, lcm, ring, lcm_sev,
+lcm_divmask, sugar, arrival)` takes the pre-OR'd masks; `Pair::new`
+retains the recompute and both share a private `from_parts` body (so
+the index-swap and `lcm_ord_key` computation are not duplicated). Behind
+the default-off `pair_mask_or` feature:
+
+- `gm::enter_one_pair_normal` ORs the h-side masks (`h_lm_sev`,
+  `h_lm_divmask`, already passed in — the parameter list gained
+  `h_lm_divmask`) with the s-side masks from the `SBasis` caches
+  (`sevs()[s_idx]`, `divmasks()[s_idx]`).
+- `parallel::build_pair` ORs the same, sourcing the s-side divmask from
+  a new `divmasks_snapshot` clone (the SEV snapshot already existed) and
+  the h-side from `h_arc.lm_divmask()` (already in hand for the L-side
+  chain crit).
+
+No call site recomputes a mask just to pass it in — every operand mask
+is read from a cache that already existed. `Pair::assert_canonical`'s
+recompute-and-compare is kept and now doubles as the OR-identity check
+at every debug-build construction. With the feature OFF, `Pair::new`
+recomputes, byte-for-byte the pre-ADR-035 behaviour. `lcm_ord_key`
+(ADR-034) is untouched — it is cheap and not part of this lever.
+
+### Singular comparison
+
+Singular does **not** do this. `enterOnePairNormal`
+(`~/Singular/kernel/GBEngine/kutil.cc`) calls
+`p_GetShortExpVector(Lp.lcm, …)` fresh on the LCM per pair — the profile
+attributes **6.92 %** of Singular's own wall to that recompute (under
+`enterOnePairNormal`). So this is a place rust goes **structurally
+cheaper** than the reference: two ORs vs a per-pair sev recompute.
+Singular carries no per-monomial divmask of the mathicgb kind (its
+`r->divmask` is a per-word top-bit borrow mask used inside
+`_p_LmDivisibleByNoComp`, ADR-025), so the divmask half has no Singular
+analog at all.
+
+### FLINT comparison
+
+N/A — FLINT has no GB engine, hence no S-pair construction and no LCM
+bloom masks.
+
+### Consequences
+
+* **Output bit-identical.** The masks produced are *equal values*, only
+  obtained more cheaply; no pair ordering, criterion outcome, or basis
+  element can change. The cyclic-3/4/5 + katsura-3 fixtures pass
+  byte-identical with the feature on and off, on both LSet backends.
+* **Exactness is load-bearing and tested.** `tests/monomial_props.rs`
+  adds `lcm_sev_is_or_of_operands` and `lcm_divmask_is_or_of_operands`
+  (4096 cases each) over the packing-regime sweep nvars ∈ {5, 25, 31}
+  (the divmask budget extremes: 12 bits/var down to 2 bits/var). If
+  either falsifies, the scheme is not threshold-monotone and the
+  feature must not ship — this ADR's premise (and the profile's finding
+  A) would be wrong.
+* **One extra cache read per pair on the s-side** (the divmask
+  snapshot in `parallel.rs`), negligible vs the recompute removed.
+* **Wall unresolved here.** Projected −7 to −8 % wall from the profile;
+  the promote-to-default decision is the interactive c200-1 same-campaign
+  A/B (wall benches exceed the 600 s subagent stream watchdog, out of
+  scope for the implementing task).
+
+### References
+
+* `~/project/profile-reports/profile-rustgb-master-adr034-vs-nextopt-staging-5101449.md`
+  — finding A, the motivating measurement (`divmask_of` 7.96 % of wall).
+* `~/rustgb/src/pair.rs` — `new_from_masks`, `from_parts`,
+  `assert_canonical` (OR-identity check); `~/rustgb/src/gm.rs` —
+  `enter_one_pair_normal` OR path; `~/rustgb/src/parallel.rs` —
+  `build_pair` OR path + `divmasks_snapshot`.
+* `~/rustgb/src/ring.rs:225` — `divmask_of` and the threshold-monotone
+  divmask invariant proof; `~/rustgb/src/monomial.rs` — cached SEV
+  (ADR-029).
+* ADR-019 / ADR-029 (SEV), ADR-025 (divmask) — the two
+  threshold-monotone schemes this OR-composes; ADR-034 — `lcm_ord_key`,
+  left as is.
+* `~/rustgb/tests/monomial_props.rs` — `lcm_sev_is_or_of_operands`,
+  `lcm_divmask_is_or_of_operands`.
+
+---
+
+## ADR-036: Fused chain-criterion LCM equality (`fused_chain_crit` feature)
+
+**Status:** Implemented behind default-off feature; promotion
+decision deferred to the interactive c200-1 wall A/B.
+**Date:** 2026-06-10
+
+### Context
+
+The same 10 Jun 2026 profile (finding B) attributes **~0.3–0.4 s** to
+the chain criterion's phase 2 (`gm::chain_crit_normal`, mirrored in
+`parallel::chain_crit_l_side`). For each L-pair surviving the divmask
+superset scan and the `lm(h) | lcm` divides check, the code built two
+full LCM monomials only to test equality against the pair's LCM:
+
+```rust
+let lcm_ih = lm_i.lcm(h_lm, ring);   // build: max-loop + from_exponents repack + degree recompute
+if lcm_ih == pair.lcm { continue; }
+let lcm_jh = lm_j.lcm(h_lm, ring);
+if lcm_jh == pair.lcm { continue; }
+```
+
+`Monomial::lcm` is rust's #2 self-time entry on this workload (**9.83 %,
+0.73 s**), and a share of that is this build-then-discard.
+
+### Decision
+
+Add `Monomial::lcm_equals(a, b, m, ring) -> bool`, equivalent to
+`a.lcm(b, ring) == *m` but fused: it walks the variable bytes once,
+testing `max(e_a[v], e_b[v]) == e_m[v]` per variable with **early exit
+on the first mismatch**. In the chain criterion a mismatch is the
+*common* case, so most scans terminate after a few variables and never
+touch the rest. This removes the build + `from_exponents` repack +
+top-byte degree recompute + full-width `Monomial::eq` that the previous
+shape paid on every scanned pair.
+
+Behind the default-off `fused_chain_crit` feature, both phase-2 sites
+(`gm::chain_crit_normal` and `parallel::chain_crit_l_side`) call
+`lcm_equals` instead of building and comparing. With the feature OFF the
+two sites build and compare, byte-for-byte the prior behaviour.
+
+**Scalar loop, not SWAR.** The packed `[u64; 4]` encoding (ADR-005)
+admits a word-at-a-time formulation in principle, but it is awkward
+here and was **not** adopted: the LCM's top byte holds the *capped total
+degree* (written by `from_exponents`), which is **not** `max(cap_a,
+cap_b)` in general — so a plain four-word compare against a recomputed
+per-byte-max word would need the total-degree byte masked out and
+handled separately, removing the simplicity that would justify SWAR.
+The scalar per-variable loop (the same variable-byte range `divides`
+walks, guard-bit-masked `& 0x7F`) already captures ADR-036's win, which
+is *not building the monomial* — not vectorization. The early exit
+makes the common mismatch case touch only a few bytes.
+
+### Singular comparison
+
+This is a direct port of Singular's `pCompareChain`
+(`~/Singular/kernel/GBEngine/kutil.cc`, near `pDivComp`), which the
+chain criterion uses precisely to avoid materializing the LCM: it checks
+`max(e_a, e_h) == e_lcm` per variable with early exit on first mismatch.
+Our `lcm_equals` is the same predicate over the packed byte layout.
+
+### FLINT comparison
+
+N/A — FLINT has no GB engine, hence no chain criterion and no
+`pCompareChain` analog.
+
+### Consequences
+
+* **Output bit-identical.** `lcm_equals(a, b, m)` is *exactly*
+  equivalent to `a.lcm(b) == m` — the chain-criterion decisions and the
+  resulting basis are unchanged. Fixtures pass byte-identical on/off,
+  both LSet backends.
+* **Equivalence is tested.** `tests/monomial_props.rs` adds
+  `lcm_equals_matches_build_and_compare` (random `m`, forcing the common
+  mismatch branch) and `lcm_equals_true_when_m_is_the_lcm` (forcing the
+  equal branch so the loop must run to completion without an early-exit
+  false-negative), both over the packing-regime sweep nvars ∈ {5, 25,
+  31}.
+* **Wall unresolved here.** Projected −0.3–0.4 s from the profile;
+  promotion is the interactive c200-1 A/B (out of scope here for the
+  watchdog reason).
+
+### References
+
+* `~/project/profile-reports/profile-rustgb-master-adr034-vs-nextopt-staging-5101449.md`
+  — finding B, the motivating measurement (`Monomial::lcm` 9.83 % of
+  wall).
+* `~/Singular/kernel/GBEngine/kutil.cc` — `pCompareChain` (the fused
+  per-variable max-compare with early exit).
+* `~/rustgb/src/monomial.rs` — `lcm_equals`; `~/rustgb/src/gm.rs` —
+  `chain_crit_normal` phase 2; `~/rustgb/src/parallel.rs` —
+  `chain_crit_l_side`.
+* ADR-005 — the packed `[u64; 4]` layout and the reason SWAR is awkward
+  here (capped total-degree top byte); `~/rustgb/src/monomial.rs`
+  `lcm` / `divides` — the build path replaced and the byte-walk shape
+  reused.
+* `~/rustgb/tests/monomial_props.rs` —
+  `lcm_equals_matches_build_and_compare`,
+  `lcm_equals_true_when_m_is_the_lcm`.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.
