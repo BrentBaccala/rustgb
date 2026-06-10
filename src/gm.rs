@@ -236,30 +236,17 @@ pub fn chain_crit_normal(
             .leading()
             .expect("basis element in a live pair is nonzero")
             .1;
-        // ADR-036: test lcm(lm_i, h) == pair.lcm without building the
-        // LCM. `Monomial::lcm_equals` fuses the per-variable max-compare
-        // with early exit (the common mismatch case terminates in a few
-        // variables). Behind `fused_chain_crit`; feature-off rebuilds
-        // and compares, byte-for-byte the prior behaviour.
-        #[cfg(feature = "fused_chain_crit")]
-        {
-            if Monomial::lcm_equals(lm_i, h_lm, &pair.lcm, ring) {
-                continue;
-            }
-            if Monomial::lcm_equals(lm_j, h_lm, &pair.lcm, ring) {
-                continue;
-            }
+        // lcm(i, h) and lcm(j, h) — build and compare. A fused
+        // `lcm_equals` per-variable compare (ADR-036) was tried and
+        // REJECTED: the c200-1 wall A/B measured flat to +0.5 % — this
+        // site is too cold for the fusion to matter. See ADR-036.
+        let lcm_ih = lm_i.lcm(h_lm, ring);
+        if lcm_ih == pair.lcm {
+            continue;
         }
-        #[cfg(not(feature = "fused_chain_crit"))]
-        {
-            let lcm_ih = lm_i.lcm(h_lm, ring);
-            if lcm_ih == pair.lcm {
-                continue;
-            }
-            let lcm_jh = lm_j.lcm(h_lm, ring);
-            if lcm_jh == pair.lcm {
-                continue;
-            }
+        let lcm_jh = lm_j.lcm(h_lm, ring);
+        if lcm_jh == pair.lcm {
+            continue;
         }
         to_drop.push((pair.i, pair.j));
     }

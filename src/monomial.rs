@@ -517,48 +517,6 @@ impl Monomial {
     /// ADR-036: fused test of `lcm(a, b) == m` without materializing
     /// `lcm(a, b)`.
     ///
-    /// Equivalent to `a.lcm(b, ring) == *m`, but checks
-    /// `max(e_a[v], e_b[v]) == e_m[v]` per variable with **early exit
-    /// on the first mismatch** — and a mismatch is the common case in
-    /// the chain criterion (`gm::chain_crit_normal` phase 2), where
-    /// most scanned L-pairs have an LCM that differs from the chain's.
-    /// This is the analog of Singular's `pCompareChain`
-    /// (`~/Singular/kernel/GBEngine/kutil.cc`), which walks the exponent
-    /// vector once and never builds the monomial.
-    ///
-    /// Scalar per-variable loop over the variable bytes (the same byte
-    /// range `divides` walks). A word-at-a-time SWAR formulation is
-    /// possible in principle but awkward here: the LCM's top byte
-    /// (capped total degree, written by `from_exponents`) is *not*
-    /// `max(cap_a, cap_b)` in general, so a plain four-word compare
-    /// against a recomputed `max` word would need the total-degree byte
-    /// masked out and recomputed separately — removing the simplicity
-    /// that would justify SWAR. The scalar loop already removes the
-    /// build + repack + degree-recompute + full-width eq that the
-    /// previous `lcm(...) == m` shape paid; ADR-036's win is that, not
-    /// vectorization. The early exit means most calls touch only a few
-    /// variable bytes.
-    ///
-    /// Reads guard-bit-masked exponents (`& 0x7F`) so it is correct
-    /// even if a non-canonical monomial sneaks a guard bit in; in
-    /// canonical form the guard is always zero.
-    #[inline]
-    pub fn lcm_equals(a: &Self, b: &Self, m: &Self, ring: &Ring) -> bool {
-        let n = ring.nvars() as usize;
-        let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // 31 - n
-        let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
-        for byte_idx in first_var_byte..=last_var_byte {
-            let (word, shift) = split_byte_index(byte_idx);
-            let ea = (a.packed[word] >> shift) & 0x7F;
-            let eb = (b.packed[word] >> shift) & 0x7F;
-            let em = (m.packed[word] >> shift) & 0x7F;
-            if ea.max(eb) != em {
-                return false;
-            }
-        }
-        true
-    }
-
     // ----- Ordering -----
 
     /// Compare under the ring's ordering.

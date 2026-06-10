@@ -296,31 +296,4 @@ proptest! {
         );
     }
 
-    /// ADR-036: `lcm_equals(a, b, m) == (lcm(a,b) == m)` for arbitrary
-    /// `m`. Covers the common mismatch branch (random `m` rarely equals
-    /// the true lcm).
-    #[test]
-    fn lcm_equals_matches_build_and_compare(
-        (r, a, b) in regime_mono2_strategy(),
-        me in prop::collection::vec(0u32..25, 31usize),
-    ) {
-        let n = r.nvars() as usize;
-        let m = Monomial::from_exponents(&r, &me[..n]).unwrap();
-        let fused = Monomial::lcm_equals(&a, &b, &m, &r);
-        let built = a.lcm(&b, &r) == m;
-        prop_assert_eq!(fused, built,
-            "lcm_equals disagrees with build-and-compare; a={:?} b={:?} m={:?}",
-            a.exponents(&r), b.exponents(&r), m.exponents(&r));
-    }
-
-    /// ADR-036: force the equal branch — `m` IS the true lcm — so the
-    /// fused test must return `true` and the loop must run to
-    /// completion (no early-exit false-negative).
-    #[test]
-    fn lcm_equals_true_when_m_is_the_lcm((r, a, b) in regime_mono2_strategy()) {
-        let l = a.lcm(&b, &r);
-        prop_assert!(Monomial::lcm_equals(&a, &b, &l, &r),
-            "lcm_equals returned false when m IS lcm(a,b); a={:?} b={:?}",
-            a.exponents(&r), b.exponents(&r));
-    }
 }

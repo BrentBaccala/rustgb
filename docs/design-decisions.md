@@ -5802,9 +5802,29 @@ dispatched workload the key is order-faithful.
 
 ## ADR-035: OR-composed pair LCM masks (`pair_mask_or` feature)
 
-**Status:** Implemented behind default-off feature; promotion
-decision deferred to the interactive c200-1 wall A/B.
+**Status:** Accepted — **promoted to a default feature** after the
+c200-1 wall A/B below.
 **Date:** 2026-06-10
+
+### Measured result (wall, c200-1 same-campaign A/B)
+
+Same-campaign 4-arm A/B on c200-1 (isolated core 11, `taskset -c 11
+numactl --membind=1`, performance governor), 5 runs per arm
+interleaved, on top of the shipped ADR-032/034 defaults. Raw:
+`~/project/profile-data/rustgb-pair-mask-or-fused-chaincrit-ab-c200-1.csv`.
+
+| staging test | base wall | `pair_mask_or` wall | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 7.394 s | 6.785 s | **−8.2 %** | −7.2 % | identical |
+| 5104053 | 13.723 s | 12.261 s | **−10.7 %** | −8.7 % | identical |
+| 5106746 | 13.447 s | 12.109 s | **−10.0 %** | −7.9 % | identical |
+
+Matches the profile's −7 to −8 % projection. Output md5-identical to
+the canonical fixtures on all three tests. Clears the promotion bar
+(same bar as ADR-032's −10/0/−9.6) → **flipped to a default feature**
+(`Cargo.toml`). Stacks with ADR-032/034; the `both` arm (with the
+rejected ADR-036 lever) showed no additional change, confirming the
+entire win is this lever.
 
 ### Context
 
@@ -5924,8 +5944,25 @@ bloom masks.
 
 ## ADR-036: Fused chain-criterion LCM equality (`fused_chain_crit` feature)
 
-**Status:** Implemented behind default-off feature; promotion
-decision deferred to the interactive c200-1 wall A/B.
+**Status:** **Rejected — measured null** in the c200-1 wall A/B
+(2026-06-10); code removed (same handling as ADR-030). The fused
+compare measured **flat to +0.5 % wall** (5101449 +0.1 %, 5104053
+−0.0 %, 5106746 +0.5 %) with instruction deltas of ±0.1 %, and the
+`pair_mask_or + fused_chain_crit` arm was consistently no better than
+`pair_mask_or` alone. Raw:
+`~/project/profile-data/rustgb-pair-mask-or-fused-chaincrit-ab-c200-1.csv`.
+**Why the profile's ~0.3–0.4 s attribution to this site was wrong:**
+`Monomial::lcm`'s 9.83 % self time is almost entirely the
+per-candidate LCM built in `enter_one_pair_normal` — which must be
+materialized anyway to store in the `Pair` — not the chain-crit
+phase-2 build-then-compare. The phase-2 site runs only on L-pairs
+surviving the divmask superset scan + `divides` check, far too few
+calls for the fusion to matter. Lesson: self-time of a function
+shared by a hot and a cold call site cannot be attributed to the
+cold site without a per-call-site split (the same granularity trap
+as the perop report's "5.65×" artifact). The implementation below is
+retained as documentation; the code lives in git history at
+`2211a68`.
 **Date:** 2026-06-10
 
 ### Context

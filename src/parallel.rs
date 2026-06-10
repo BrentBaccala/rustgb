@@ -730,26 +730,15 @@ fn chain_crit_l_side(
             .leading()
             .expect("non-empty")
             .1;
-        // ADR-036: fused lcm-equality (see `gm::chain_crit_normal`).
-        #[cfg(feature = "fused_chain_crit")]
-        {
-            if Monomial::lcm_equals(lm_i, h_lm, &pair.lcm, ring) {
-                continue;
-            }
-            if Monomial::lcm_equals(lm_j, h_lm, &pair.lcm, ring) {
-                continue;
-            }
+        // Build-and-compare; the fused ADR-036 variant was rejected
+        // after the c200-1 A/B (see `gm::chain_crit_normal`).
+        let lcm_ih = lm_i.lcm(h_lm, ring);
+        if lcm_ih == pair.lcm {
+            continue;
         }
-        #[cfg(not(feature = "fused_chain_crit"))]
-        {
-            let lcm_ih = lm_i.lcm(h_lm, ring);
-            if lcm_ih == pair.lcm {
-                continue;
-            }
-            let lcm_jh = lm_j.lcm(h_lm, ring);
-            if lcm_jh == pair.lcm {
-                continue;
-            }
+        let lcm_jh = lm_j.lcm(h_lm, ring);
+        if lcm_jh == pair.lcm {
+            continue;
         }
         to_drop.push((pair.i, pair.j));
     }
