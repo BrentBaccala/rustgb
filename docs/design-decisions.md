@@ -6062,9 +6062,31 @@ N/A — FLINT has no GB engine, hence no chain criterion and no
 
 ## ADR-037: Compact the divisor-scan arrays (`compact_scan` feature)
 
-**Status:** Implemented behind a default-off feature; promotion deferred
-to the interactive c200-1 wall A/B.
+**Status:** Accepted — **promoted to a default feature** after the
+c200-1 wall A/B below.
 **Date:** 2026-06-10
+
+### Measured result (wall, c200-1 same-campaign A/B)
+
+Same-campaign 3-arm A/B on c200-1 (isolated core 11, `taskset -c 11
+numactl --membind=1`, performance governor), 5 runs per arm
+interleaved, measured ON TOP of ADR-038 (master `e38eda7`-equivalent
+default build). Raw:
+`~/project/profile-data/rustgb-scan-compact-swar-ab-c200-1.csv`.
+
+| staging test | ADR-038 only | + `compact_scan` | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 5.363 s | 5.231 s | **−2.5 %** | −4.4 % | identical |
+| 5104053 | 8.904 s | 8.792 s | **−1.3 %** | −1.7 % | identical |
+| 5106746 | 9.255 s | 8.906 s | **−3.8 %** | −5.4 % | identical |
+
+Smaller than earlier promotions but consistent on all three cases,
+Δwall tracks Δinstr, output bit-identical, and the lever is
+unconditional (pure scan-set reduction, no strategy trade) →
+**flipped to a default feature** (`Cargo.toml`). Matches the task-389
+probe projection (~23 % of the head-scan excess; the probe's
+scan_stats re-dump showed head `sum_len` 2747 M → 2391 M, at/below
+next-opt's 2425 M).
 
 ### Context
 
@@ -6254,10 +6276,50 @@ feature is gated on that A/B clearing the same bar ADR-032/035 used
 
 ## ADR-038: Byte-parallel SWAR/SIMD monomial kernels (`lcm`, `divides`, `coprime`)
 
-**Status:** Implemented unconditionally (no feature gate — the three
-kernels are provably-exact drop-ins backed by proptests, matching how
-ADR-022's cmp specialisation shipped).
+**Status:** Accepted, shipped unconditionally (no feature gate — the
+three kernels are provably-exact drop-ins backed by proptests,
+matching how ADR-022's cmp specialisation shipped). **Measured −21 to
+−27 % wall** in the c200-1 before/after A/B below — the largest
+single-ADR win since ADR-008.
 **Date:** 2026-06-10
+
+### Measured result (wall, c200-1 same-campaign A/B)
+
+Before = `4f48e6f` default build (ADR-037 present but off → pre-SWAR
+behaviour); after = master default build. 5 runs per arm interleaved,
+isolated core 11. Raw:
+`~/project/profile-data/rustgb-scan-compact-swar-ab-c200-1.csv`.
+
+| staging test | before | after | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 6.784 s | 5.363 s | **−20.9 %** | **−32.2 %** | identical |
+| 5104053 | 12.261 s | 8.904 s | **−27.4 %** | **−39.3 %** | identical |
+| 5106746 | 12.108 s | 9.255 s | **−23.6 %** | **−33.4 %** | identical |
+
+Far beyond the −0.5 s projection. The instruction cuts show the
+scalar per-variable loops were a much larger share than `lcm`'s
+11.5 % flat self-time suggested: the scalar `divides` confirm loop
+was inlined inside the SIMD scan kernels (`find_sev_match_sse41`,
+`find_divmask_superset_match`) and its cost was attributed to them
+in the flat profile.
+
+### Milestone — parity crossed (2026-06-10)
+
+With ADR-037 + ADR-038 both on (master defaults), rustgb is **faster
+than Singular next-opt on all three staging tests** (next-opt
+measured same session, same pinning):
+
+| staging test | rustgb | next-opt `2515b6466` | ratio |
+|---|---:|---:|---:|
+| 5101449 | 5.231 s | 5.796 s | **0.90×** |
+| 5104053 | 8.792 s | 10.658 s | **0.82×** |
+| 5106746 | 8.906 s | 10.679 s | **0.83×** |
+
+First time the port is ahead of the reference on the staging suite,
+output bit-identical throughout. Remaining known waste on rust's
+side: the eager input-seeding divergence (+12–22 % pair pops vs
+Singular, task-392 step-trace finding) — closing it is upside beyond
+parity.
 
 ### Context
 
