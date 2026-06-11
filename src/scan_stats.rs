@@ -130,20 +130,40 @@ pub fn record_redtail_divmask_of() {
     STATS.with(|s| s.borrow_mut().redtail_divmask_of += 1);
 }
 
-/// If `RUSTGB_SCAN_STATS=1`, dump the counters to stderr, one labelled
-/// line per site (machine-greppable), then a redtail-divmask line.
+/// If `RUSTGB_SCAN_STATS=1`, dump the counters, one labelled line per
+/// site (machine-greppable), then a redtail-divmask line. Output goes
+/// to stderr; if `RUSTGB_SCAN_STATS_FILE` names a path, the same lines
+/// are *also* appended there (the file sink is robust against a host
+/// — e.g. the Singular dispatch — that redirects or swallows the
+/// dylib's stderr).
 pub fn dump_if_enabled() {
     if std::env::var("RUSTGB_SCAN_STATS").as_deref() != Ok("1") {
         return;
     }
+    use std::io::Write;
+    let mut file_sink = std::env::var("RUSTGB_SCAN_STATS_FILE")
+        .ok()
+        .and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
     STATS.with(|s| {
         let g = s.borrow();
+        let mut emit = |line: &str| {
+            eprintln!("{line}");
+            if let Some(f) = file_sink.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+        };
         for (label, c) in [
             ("head", &g.head),
             ("redtail", &g.redtail),
             ("tailall", &g.tailall),
         ] {
-            eprintln!(
+            emit(&format!(
                 "SCANSTAT site={label} scans={} sum_len={} sum_swept={} \
                  divmask_hits={} divides_hits={} earlyouts={} sum_earlyout_pos={}",
                 c.scans,
@@ -153,11 +173,14 @@ pub fn dump_if_enabled() {
                 c.divides_hits,
                 c.earlyouts,
                 c.sum_earlyout_pos,
-            );
+            ));
         }
-        eprintln!(
+        emit(&format!(
             "SCANSTAT redtail_divmask_of={}",
             g.redtail_divmask_of
-        );
+        ));
     });
+    if let Some(f) = file_sink.as_mut() {
+        let _ = f.flush();
+    }
 }
