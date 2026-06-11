@@ -260,6 +260,16 @@ pub fn chain_crit_normal(
     // semantics; we just delegate the divmask test.
     let mut to_drop: Vec<(u32, u32)> = Vec::new();
     for pair in l.iter_filtered_subset(h_lm_divmask) {
+        // ADR-039: input L-entries (sentinel `i == u32::MAX`) are not
+        // S-pairs and are never chain-pruned — they carry no `p1`/`p2`
+        // basis indices to look up, and Singular's L-side chain crit
+        // likewise guards `it->p1 != NULL` (kutil.cc chainCritNormal).
+        // Skip them before the `s_basis.poly(pair.i)` lookup, which
+        // would otherwise index out of bounds on `u32::MAX`.
+        #[cfg(feature = "seed_in_l")]
+        if pair.is_input() {
+            continue;
+        }
         if pair.i == h_idx || pair.j == h_idx {
             continue;
         }

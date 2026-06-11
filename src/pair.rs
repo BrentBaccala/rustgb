@@ -77,6 +77,23 @@ pub struct Pair {
     /// constructor [`Pair::new`] sets this to a sentinel value; the
     /// `LSet` overwrites it at insert time.
     pub key: PairKey,
+    /// ADR-039 (`seed_in_l` feature): the input-generator payload for
+    /// an **input L-entry**. `None` for a real S-pair; `Some(poly)`
+    /// for an input seeded into `L` (Singular's `initSL` push of a
+    /// `p1==NULL` LObject). When `Some`, the entry's `i`/`j` are the
+    /// sentinel `(u32::MAX, input_seq)` (so `by_indices` keys never
+    /// collide across distinct inputs and never alias a real pair),
+    /// `lcm` is the input's own leading monomial (so `lcm_ord_key`
+    /// yields the `compareL15` `pLmCmp` tie-break), and `sugar` is the
+    /// input's `pFDeg` = leading-monomial total degree (matching
+    /// `initEcartBBA`, which sets `ecart = 0`, so the L-order key is
+    /// `pFDeg + 0`). The main loop pops it, reduces the carried `Poly`
+    /// against the current basis, and inserts the survivor — without
+    /// emitting a `POP` trace event (Singular suppresses POP for
+    /// `p1==NULL` entries) and without ever being chain-pruned
+    /// (Singular's L-side chain crit guards `it->p1 != NULL`).
+    #[cfg(feature = "seed_in_l")]
+    pub input: Option<crate::poly::Poly>,
 }
 
 impl Pair {
@@ -178,7 +195,64 @@ impl Pair {
             sugar,
             arrival,
             key: PairKey(0),
+            #[cfg(feature = "seed_in_l")]
+            input: None,
         }
+    }
+
+    /// ADR-039 (`seed_in_l`): build an **input L-entry** carrying the
+    /// pre-reduction input generator `poly`.
+    ///
+    /// `input_seq` is a fresh per-input sentinel (0, 1, 2, …) used as
+    /// the entry's `j` while `i == u32::MAX`. The `(u32::MAX,
+    /// input_seq)` index pair is unique per input and disjoint from
+    /// every real pair's `(i, j)` (real basis indices are `< u32::MAX`),
+    /// so the `LSet`'s `by_indices` map never tombstones one input
+    /// against another, never aliases a pair, and the chain
+    /// criterion's `delete(i, j)` / `contains(i, j)` (only ever called
+    /// with real basis indices) never touch input entries.
+    ///
+    /// `lm` is the input's leading monomial; it becomes the entry's
+    /// `lcm`, so the `(sugar, lcm_ord_key)` L-ordering reproduces
+    /// `compareL15` = `(pFDeg + ecart, pLmCmp)` with `ecart = 0`
+    /// (`initEcartBBA`). `sugar` must be the input's `pFDeg` (its
+    /// leading-monomial total degree).
+    ///
+    /// `arrival` is handed out from the same monotonic counter as real
+    /// pairs, so the final `(sugar, lcm_ord_key, arrival)` tie-break is
+    /// deterministic.
+    #[cfg(feature = "seed_in_l")]
+    pub fn new_input(
+        input_seq: u32,
+        lm: Monomial,
+        poly: crate::poly::Poly,
+        ring: &crate::ring::Ring,
+        sugar: u32,
+        arrival: u64,
+    ) -> Self {
+        let lcm_sev = lm.compute_sev(ring);
+        let lcm_divmask = ring.divmask_of(&lm);
+        let lcm_ord_key = lm.degrevlex_key(ring);
+        Self {
+            i: u32::MAX,
+            j: input_seq,
+            lcm: lm,
+            lcm_sev,
+            lcm_divmask,
+            lcm_ord_key,
+            sugar,
+            arrival,
+            key: PairKey(0),
+            input: Some(poly),
+        }
+    }
+
+    /// ADR-039: `true` iff this entry is an input L-entry (carries an
+    /// input-generator `Poly` rather than describing an S-pair).
+    #[cfg(feature = "seed_in_l")]
+    #[inline]
+    pub fn is_input(&self) -> bool {
+        self.input.is_some()
     }
 
     /// Debug-only invariant check.
@@ -191,6 +265,16 @@ impl Pair {
     /// debug-build construction. A failure here means the mask scheme
     /// is not threshold-monotone (which would invalidate ADR-035).
     pub fn assert_canonical(&self, ring: &crate::ring::Ring) {
+        // ADR-039: an input L-entry uses the sentinel `i == u32::MAX`
+        // and is not subject to the `i < j` pair invariant.
+        #[cfg(feature = "seed_in_l")]
+        if self.is_input() {
+            self.lcm.assert_canonical(ring);
+            assert_eq!(self.lcm_sev, self.lcm.compute_sev(ring), "input lcm_sev cache mismatch");
+            assert_eq!(self.lcm_divmask, ring.divmask_of(&self.lcm), "input lcm_divmask cache mismatch");
+            assert_eq!(self.lcm_ord_key, self.lcm.degrevlex_key(ring), "input lcm_ord_key cache mismatch");
+            return;
+        }
         assert!(self.i < self.j, "pair indices not ordered");
         self.lcm.assert_canonical(ring);
         assert_eq!(
@@ -316,5 +400,36 @@ mod tests {
         assert_eq!(b.arrival, 10);
         let c = h.pop().unwrap().0;
         assert_eq!(c.arrival, 20);
+    }
+
+    /// ADR-039: an input L-entry is recognised via `is_input`, uses the
+    /// sentinel `i == u32::MAX`, and orders by `(sugar, lcm_ord_key)`
+    /// alongside real pairs (so a lower-sugar input pops before a
+    /// higher-sugar pair). `assert_canonical` tolerates the sentinel.
+    #[cfg(feature = "seed_in_l")]
+    #[test]
+    fn input_entry_orders_by_sugar_and_is_recognised() {
+        use crate::field::{Coeff, Field};
+        let r = Ring::new(3, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap();
+        // A degree-1 input (sugar 1) and a degree-2 pair (sugar 2).
+        let in_lm = Monomial::from_exponents(&r, &[1, 0, 0]).unwrap();
+        let in_poly = crate::poly::Poly::monomial(&r, 1 as Coeff, in_lm.clone());
+        let input = Pair::new_input(0, in_lm, in_poly, &r, 1, 0);
+        assert!(input.is_input());
+        assert_eq!(input.i, u32::MAX);
+        input.assert_canonical(&r);
+
+        let pair_lcm = Monomial::from_exponents(&r, &[1, 1, 0]).unwrap();
+        let pair = Pair::new(0, 1, pair_lcm, &r, 2, 1);
+        assert!(!pair.is_input());
+
+        let mut h = BinaryHeap::new();
+        h.push(Reverse(pair));
+        h.push(Reverse(input));
+        // Lower-sugar input pops first.
+        let first = h.pop().unwrap().0;
+        assert!(first.is_input(), "sugar-1 input must pop before sugar-2 pair");
+        let second = h.pop().unwrap().0;
+        assert!(!second.is_input());
     }
 }

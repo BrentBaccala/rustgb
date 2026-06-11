@@ -109,6 +109,40 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     // end, because the SBasis redundancy marking only triggers when
     // the *newer* element's LM divides an older one, not vice versa.
     // Singular's bba() pre-reduces inputs via the same reducer loop.
+    //
+    // ADR-039: under the `seed_in_l` feature the eager up-front seed
+    // loop is replaced by pushing every input into the pair queue `L`
+    // as an *input L-entry* (`Pair::new_input`). The reduce → monic →
+    // redtail → insert+enterpairs body that ran here is moved into the
+    // main loop and dispatched on entry kind (see below), so inputs are
+    // processed interleaved with S-pairs in `(sugar, lcm)` order —
+    // mirroring Singular's `initSL` + `compareL15`. Feature-off keeps
+    // the original eager loop below verbatim.
+    #[cfg(feature = "seed_in_l")]
+    {
+        // Push all inputs into L. The input's sort key is
+        // `(pFDeg, pLmCmp)` with `ecart = 0` (Singular `initEcartBBA`);
+        // for the homogeneous degrevlex data here `pFDeg == lm_deg`, so
+        // `sugar = lm_deg` already matches. `arrival` is drawn from the
+        // same monotonic counter that real pairs use.
+        let mut input_seq: u32 = 0;
+        for p in input {
+            if p.is_zero() {
+                continue;
+            }
+            let sugar = p.lm_deg();
+            let lm = p
+                .leading()
+                .expect("nonzero input has a leading monomial")
+                .1
+                .clone();
+            let pair = crate::pair::Pair::new_input(input_seq, lm, p, &ring, sugar, next_arrival);
+            input_seq += 1;
+            next_arrival += 1;
+            l_set.insert(pair);
+        }
+    }
+    #[cfg(not(feature = "seed_in_l"))]
     for p in input {
         if p.is_zero() {
             continue;
@@ -151,6 +185,40 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     // physically deleted; our design preserves pointers, so there's
     // nothing to skip here.
     while let Some(pair) = l_set.pop() {
+        // ADR-039 (`seed_in_l`): an input L-entry carries its
+        // pre-reduction generator instead of describing an S-pair.
+        // Popping one runs exactly the eager seed-step body (reduce
+        // against the basis accreted so far, drop if zero, monic,
+        // per-step redtail, insert + enterpairs) — but emits NO `POP`
+        // trace event (Singular suppresses POP for `p1==NULL` entries;
+        // task-392 instrumentation note), so the phase-A skeleton shows
+        // the input as an INS only, matching the reference trace.
+        #[cfg(feature = "seed_in_l")]
+        if pair.is_input() {
+            let mut pair = pair;
+            let p = pair.input.take().expect("input entry carries a poly");
+            let sugar = pair.sugar;
+            let mut lobj = LObject::from_poly_with_sugar(Arc::clone(&ring), p, sugar);
+            reduce_lobject(&mut lobj, &s_basis, &ring);
+            if lobj.is_zero() {
+                continue;
+            }
+            let h_sugar = lobj.sugar();
+            let h = lobj
+                .into_poly()
+                .monic(&ring)
+                .expect("nonzero poly has invertible lc");
+            let h = reduce_h_tail(h, &s_basis, &ring);
+            next_arrival = insert_and_generate_pairs_with_sugar(
+                &ring,
+                &mut s_basis,
+                &mut l_set,
+                h,
+                h_sugar,
+                next_arrival,
+            );
+            continue;
+        }
         // step_trace (task 392): POP — a pair is selected from L for
         // reduction. Emitted for every popped pair, before the spoly is
         // built, in strict stream order (the load-bearing phase-A skeleton).

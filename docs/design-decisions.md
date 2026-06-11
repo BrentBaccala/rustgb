@@ -6483,6 +6483,187 @@ the c200-1 same-campaign A/B is the wall confirmation.
 
 ---
 
+## ADR-039: Interleaved input seeding through the L-queue (`seed_in_l` feature)
+
+**Status:** Implemented behind a **default-OFF** `seed_in_l` cargo
+feature. Trace-validated (closes the top step-trace divergence; INS
+excess collapses to ~0 on all three staging cases); GB output
+bit-identical with the feature on (all three staging md5s match the
+fixtures, all four feature-state test suites green). **Promotion to a
+default feature is deferred to the interactive c200-1 wall A/B** — this
+is an intermediate-trajectory change with no wall measured here.
+**Date:** 2026-06-10
+
+### Context — the divergence this closes
+
+The task-392 step-trace diagnosis
+(`~/project/reports/rustgb-step-trace-report.md`) found the engines'
+operation streams diverge at **skeleton index 0** on every staging
+case, with a single structural cause: **input seeding**. rust's bba
+seed loop eagerly reduced and inserted **all** input generators up
+front, in raw input order, before popping any S-pair — **583 INS
+before the first POP** on staging-5101449, vs Singular's **11**. Because
+each input was reduced only against the inputs that happened to arrive
+earlier, rust materialised **345 extra transient basis elements** (3322
+distinct INS leading monomials vs Singular's 2993) whose pairs drove a
+**+12.5 / +21.8 / +11.9 %** S-pair-pop excess, ~92 % of it
+zero-reducing.
+
+Singular's `bba()` instead pushes every input into the pair queue `L`
+and processes them **interleaved** with S-pairs through the single
+sugar-ordered main loop, so each input reduces against the
+more-complete basis accreted so far.
+
+### Decision
+
+Add a default-OFF `seed_in_l` feature that replaces rust's eager
+up-front seed loop with Singular's interleaved model:
+
+1. **Input L-entry variant.** `Pair` gains an `Option<Poly> input`
+   field (gated behind the feature, so the feature-off build is
+   byte-for-byte unchanged). An input entry carries the
+   pre-reduction generator, uses the sentinel index pair
+   `(i = u32::MAX, j = input_seq)` — disjoint from every real pair's
+   `(i, j)` (real basis indices are `< u32::MAX`) so the `LSet`'s
+   `by_indices` never aliases or tombstones across inputs — and stores
+   the input's **own leading monomial** as `lcm`, so the existing
+   `(sugar, lcm_ord_key)` L-ordering (ADR-034) reproduces
+   `compareL15`'s `pLmCmp` tie-break. (`Pair::new_input` in
+   `src/pair.rs`.)
+2. **Both LSet backends handle it for free.** The variant rides the
+   existing `Pair` ordering and `LSet` machinery — `lset.rs` (heap)
+   and `lset_flat.rs` (flat, default) need no backend-specific change;
+   the sentinel `(MAX, seq)` key flows through `by_indices`,
+   `SortedKey`/`HeapEntry`, and the SIMD divmask scan unmodified
+   (`assert_canonical` skips the `i < j` invariant for input entries).
+3. **Main loop dispatches on entry kind.** `compute_gb_serial` pushes
+   all inputs into `L`; popping an input entry runs exactly the former
+   seed-step body (reduce against current basis → drop if zero → monic
+   → per-step redtail → insert + `enterpairs`) — but emits **no `POP`
+   trace event** (Singular suppresses POP for `p1==NULL` entries, so
+   the phase-A skeleton shows the input as an INS only) and the entry
+   is **never chain-pruned** (`gm.rs`'s phase-2 L-side chain crit skips
+   `is_input()` entries, mirroring Singular's `it->p1 != NULL` guard in
+   `chainCritNormal`). (`src/bba.rs`, `src/gm.rs`.)
+
+### Verified Singular input-entry key semantics (corrected)
+
+The task-392 report's note that an input's ecart is `pLDeg − pFDeg`
+(`initEcartNormal`) was **wrong for the bba path**. The homogeneous
+`bba()` path uses **`initEcartBBA`** (`kutil.cc:1332`), which sets
+`ecart = 0`. `compareL15` (`kutil.cc:5921`) keys on
+`GetpFDeg() + ecart`, so an input L-entry's primary key is just
+`pFDeg()` = its leading-monomial total degree, tie-broken by `pLmCmp`
+(degrevlex LM order). For the homogeneous degrevlex staging data
+`pFDeg == lm_deg`, so rust's existing `sugar = lm_deg` **already
+matches** — no sugar adjustment was needed. The input L-entry pushed by
+`initSL` (`kutil.cc:7288-7314`) carries `p1 == NULL`; the next-opt
+trace instrumentation deliberately suppresses its POP event ("rustgb
+models them as direct basis seeds (INS, no POP)"), which rust now
+matches by not emitting POP for input pops.
+
+### Trace result (the acceptance instrument)
+
+`step_trace` + `seed_in_l`, phase-A, diffed against the task-392
+next-opt references with `tools/trace-diff.py`. Raw traces:
+`~/project/test-logs/steptrace-393/rust-seed_in_l-{tag}.trace.gz`.
+
+| test | first-div idx (was 0) | INS-before-1st-POP rust/sing (was 583/11 etc.) | rust INS / sing INS (was) | POP rust/sing (was) | POP gap (was) | LCS (capped) |
+|---|---:|---|---|---|---:|---:|
+| 5101449 | **11** | 13 / 11 | 2992 / 2993 (was 3322) | 32 279 / 29 324 (was 32 990) | **+10.1 %** (was +12.5 %) | 25.0 % |
+| 5104053 | **14** | 14 / 44 | 4620 / 4571 (was 4754) | 49 548 / 40 878 (was 49 796) | **+21.2 %** (was +21.8 %) | 17.2 % |
+| 5106746 | **14** | 18 / 18 | 4620 / 4410 (was 4873) | 47 827 / 43 148 (was 48 289) | **+10.8 %** (was +11.9 %) | 27.4 % |
+
+The structural deliverable is achieved on all three: the first
+divergence moved off index 0, the seeding INS-skeleton matches
+(13/11, 18/18; the inputs now interleave), and — most decisively — the
+**345-element transient-insertion excess collapsed**: rust INS deltas
+went from **+329 / +183 / +463** to **−1 / +49 / +210**. The
+zero-reduction excess (the wasted work this ADR targets) shrinks
+proportionally on 5101449 (+12.5 → +10.1 %) and 5106746 (+11.9 →
++10.8 %).
+
+### Next divergence cause exposed (characterized, NOT fixed)
+
+Behind the closed seeding cause sits a **secondary L-ordering
+difference at equal sugar**, now the first divergence:
+
+- **First occurrence:** 5101449 skeleton index 11 — rust INSerts a
+  **degree-4 input** (`0.1…0.1…1.0.0.1`) where Singular POPs a
+  **degree-4 S-pair** (`0.1…1.1…1.0.0.0`); the two are *tied at
+  sugar/degree 4*.
+- **Evidence:** rust's input entries get their `arrival` counters
+  during seeding (before any pair exists), so on a `(sugar,
+  lcm_ord_key)` tie rust's final `arrival` tie-break always orders the
+  input *before* the pair. Singular's single `compareL15` queue compares
+  the input's **LM** against the pair's **LCM** directly (no arrival
+  term), breaking the tie the other way. On 5104053 this dominates:
+  Singular defers its first POP for **44** INS while rust pops at 14,
+  and the pair gap barely moves (+21.8 → +21.2 %) — the residual excess
+  there is driven by this tie-break, not by transient insertions (whose
+  excess fell from +183 to +49).
+- **Suspected rule:** the input-vs-pair tie-break key. Singular keys an
+  input on `pLmCmp(input.p)` and a pair on `pLmCmp(pair.p)` within one
+  comparator; rust keys both on `(sugar, lcm_ord_key)` but then falls
+  through to `arrival`, which is not order-equivalent across the
+  input/pair boundary at exact `(sugar, lcm_ord_key)` ties.
+- **Disposition:** out of scope for this ADR (the task scopes ADR-039
+  to the seeding cause). A future ADR could align the input-entry
+  tie-break with Singular's `compareL15` exactly (drop the
+  arrival fallback for input entries, or seed input arrivals so the
+  comparison matches) — but that needs its own A/B, since it is again
+  an order change that must keep the GB bit-identical.
+
+### Singular
+
+- `initSL` (`kernel/GBEngine/kutil.cc:7288-7314`) — pushes each input
+  `F[i]` into `strat->L` as a `p1==NULL` LObject after `initEcart`
+  (= `initEcartBBA`, `ecart = 0`) and `pNorm`.
+- `compareL15` (`kutil.cc:5921-5928`) — L-order key
+  `(GetpFDeg() + ecart, pLmCmp)`; the homogeneous bba path's `ecart=0`
+  makes the input key `(pFDeg, pLmCmp)`.
+- Main loop pop + input handling (`kernel/GBEngine/kstd2.cc:2990` +
+  `2997-3033`) — `strat->P = strat->L.top()`; `strat->P.p1 == NULL`
+  branch calls `PrepareRed` and reduces the input against the current
+  basis, interleaved with S-pairs.
+- `chainCritNormal` L-side guard (`kutil.cc:3534`, the
+  `it->p1 != NULL` test) — input L-entries are exempt from L-side
+  chain pruning, matched by rust's `is_input()` skip.
+
+### FLINT
+
+**N/A — FLINT has no GB engine.** The input-seeding order is a
+Buchberger-loop selection-strategy decision with no analog in FLINT's
+polynomial layer.
+
+### Parallel path disposition
+
+`parallel.rs` is left on **eager seeding** even when `seed_in_l` is on;
+the feature only rewires the serial driver. Adapting the parallel
+continuous-cursor sweep to L-seeded inputs is invasive (the sweep has
+no single ordered L-pop point and its worker-drain seeding predates the
+L-entry variant), and the parallel path is not yet staging-validated
+(`RUSTGB_THREADS=1` is the only validated config). Its contract tests
+stay green (the `seed_in_l` field is `None` for every pair the parallel
+path constructs). When the parallel path is taken to staging
+validation, matching its seeding to this model is a follow-up.
+
+### References
+
+- `~/project/reports/rustgb-step-trace-report.md` — task-392 diagnosis
+  that ranked this the top divergence; the +12.5/+21.8/+11.9 % baseline
+  and 583-vs-11 INS-before-POP evidence.
+- `~/project/reports/rustgb-interleaved-seeding-report.md` — this
+  task's report (trace before/after, residual cause, parallel
+  disposition).
+- `~/Singular-next-opt` branch `next-opt-steptrace` — the reference
+  trace instrumentation (POP suppressed for `p1==NULL`).
+- ADR-034 — fixed the *S-pair* tie-break to `(sugar, lcm)`; this ADR
+  extends the same `compareL15` order to *input* seeding, which ADR-034
+  did not touch.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

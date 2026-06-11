@@ -142,6 +142,23 @@ scan_stats = []
 # the computed basis. See `~/project/reports/rustgb-step-trace-report.md`.
 step_trace = []
 
+# Interleaved input seeding through the L-queue (ADR-039, task 393).
+# **Default-OFF.** When OFF, byte-for-byte the prior behaviour: the bba
+# seed loop eagerly reduces and inserts every input generator up front,
+# in raw input order, before popping any S-pair. When ON, inputs are
+# pushed into the pair queue `L` as input L-entries (`Pair::new_input`,
+# sentinel `i == u32::MAX`) and processed *interleaved* with S-pairs
+# through the single `(sugar, lcm)`-ordered main loop — mirroring
+# Singular's `initSL` + `compareL15` (`kutil.cc` initSL / kstd2.cc main
+# loop). This closes the top step-trace divergence (rust 583 vs Singular
+# 11 INS-before-first-POP on staging-5101449; task 392 report). The
+# final reduced GB is identical either way (canonical sort) — toggling
+# must NOT change fixture-match outcomes; only the intermediate
+# trajectory (pop count, transient insertions) changes. The parallel
+# path (`parallel.rs`) keeps eager seeding even under this feature; see
+# ADR-039.
+seed_in_l = []
+
 # Compacted divisor-scan arrays (ADR-037, task 390). **On by default**
 # since 2026-06-10: the c200-1 same-campaign A/B measured −2.5 / −1.3 /
 # −3.8 % wall on the three staging tests on top of ADR-038, Δwall ≈
