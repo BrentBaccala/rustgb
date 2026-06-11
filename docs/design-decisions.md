@@ -6716,6 +6716,52 @@ Singular's** — a *distinct* divergence (sugar-band composition) drives
 the residual +10/+21 % excess; characterized below, deliberately not
 fixed here. Promotion is joint with ADR-039. **Date:** 2026-06-11
 
+### Measured result — the decisive A/B (c200-1, 2026-06-11): REJECTED
+
+The experiment ADR-039/040 were built for: {eager seeding, shipped
+defaults} vs {full ordering alignment = `seed_in_l` +
+`input_tiebreak`}. 5 runs/arm interleaved, isolated core 11,
+performance governor. Raw:
+`~/project/profile-data/rustgb-full-alignment-ab-c200-1.csv`.
+
+| staging test | eager wall | aligned wall | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 5.28 s | 9.47 s | **+79 %** | +119 % | identical |
+| 5104053 | 8.85 s | 19.20 s | **+117 %** | +163 % | identical |
+| 5106746 | 8.93 s | 17.95 s | **+101 %** | +137 % | identical |
+
+**Faithfully matching Singular's L-order roughly doubles rust's
+work.** Pops stayed ~+10/+21/+10 % (the order change never bought
+pop parity — the sugar-band/prune-timing driver is untouched), and
+each reduction got far more expensive: spoly-LM-ordered popping
+reduces pairs against a much less-complete basis in rust's pipeline.
+ADR-034's LCM key — measured −13 to −25 % wall — is the better order
+for THIS engine, even though it is *not* what Singular does. The
+fourth and conclusive instance of the
+match-the-rule-without-the-surrounding-state pattern (faithful-ecart
++10 %, ADR-036 null, ADR-039 +4 %, ADR-040 +117 %).
+
+**Program verdict — "same operations, same order" closes as
+*deliberately NOT*.** The step-trace program (tasks 392/393/394)
+ends with every cross-engine divergence either closed or understood
+and whitelisted:
+
+- *whitelisted, rust better:* LCM-keyed pair order (ADR-034 vs
+  Singular's spoly-LM key); shortest-reducer selection (ADR-032 vs
+  Singular's (ecart, length) first-hit); eager input seeding
+  (vs `initSL` interleaving); the resulting +10/+21/+10 % pop excess
+  is the price of an order that makes every pop cheaper — rust is
+  0.82–0.90× Singular's wall with all of it.
+- *closed (rust matched Singular and won):* sugar-primary pair order
+  (ADR-034), per-step redtail (ADR-024), GM criteria, `li ≤ 2`
+  early-out (ADR-032).
+- *open but characterized:* sugar-band composition × prune timing
+  (task-394 finding 5) — only worth revisiting as a full
+  sugar/selection redesign, not an order tweak.
+
+`seed_in_l` and `input_tiebreak` remain available, default-off, as
+the documented experimental apparatus behind this verdict.
+
 ### Decision
 
 When `input_tiebreak` is on, the L-queue keys an S-pair on the
