@@ -68,6 +68,17 @@ pub fn enter_one_pair_normal(
     // sev check alone is exact; we keep the explicit coprime check
     // after it so the code remains correct if MAX_VARS grows.
     if (h_lm_sev & s_lm_sev) == 0 {
+        // step_trace: product criterion (sev fast-path coprime).
+        #[cfg(feature = "step_trace")]
+        {
+            let s_lm = s_basis
+                .poly(s_idx as usize)
+                .leading()
+                .expect("non-redundant basis element is nonzero")
+                .1;
+            let lcm = h_lm.lcm(s_lm, ring);
+            crate::step_trace::kill_pair(&lcm, "prodcrit", ring);
+        }
         return None;
     }
     let s_lm = s_basis
@@ -76,6 +87,12 @@ pub fn enter_one_pair_normal(
         .expect("non-redundant basis element is nonzero")
         .1;
     if monomials_are_coprime(h_lm, s_lm, ring) {
+        // step_trace: product criterion (exact coprime check).
+        #[cfg(feature = "step_trace")]
+        {
+            let lcm = h_lm.lcm(s_lm, ring);
+            crate::step_trace::kill_pair(&lcm, "prodcrit", ring);
+        }
         return None;
     }
 
@@ -211,9 +228,15 @@ pub fn chain_crit_normal(
                 let equal = a.lcm == c.lcm;
                 if equal {
                     if j > i {
+                        // step_trace: chain crit phase-1, equal-LCM dedup.
+                        #[cfg(feature = "step_trace")]
+                        crate::step_trace::kill_pair(&c.lcm, "chainB-eq", ring);
                         kill[j] = true;
                     }
                 } else if a.lcm.divides(&c.lcm, ring) {
+                    // step_trace: chain crit phase-1, lcm(a) | lcm(c).
+                    #[cfg(feature = "step_trace")]
+                    crate::step_trace::kill_pair(&c.lcm, "chainB-div", ring);
                     kill[j] = true;
                 }
                 j += 1;
@@ -266,6 +289,9 @@ pub fn chain_crit_normal(
         if lcm_jh == pair.lcm {
             continue;
         }
+        // step_trace: chain crit phase-2, L-side G-M elimination.
+        #[cfg(feature = "step_trace")]
+        crate::step_trace::kill_pair(&pair.lcm, "chainL", ring);
         to_drop.push((pair.i, pair.j));
     }
     for (i, j) in to_drop {
@@ -311,6 +337,9 @@ pub fn enterpairs(
             ring, s_basis, s_idx, h_idx, &h_lm, h_lm_sev, h_lm_divmask, h_sugar, arrival,
         ) {
             arrival += 1;
+            // step_trace: NEW — candidate pair created (survived product crit).
+            #[cfg(feature = "step_trace")]
+            crate::step_trace::new_pair(&pair.lcm, pair.sugar, ring);
             b.push(pair);
         }
     }

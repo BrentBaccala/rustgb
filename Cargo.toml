@@ -130,6 +130,18 @@ pair_mask_or = []
 # `~/project/reports/rustgb-divscan-probe-report.md`.
 scan_stats = []
 
+# Per-event operation trace (task 392). OFF by default; every call
+# site is `#[cfg(feature = "step_trace")]`-gated so the production
+# build has no trace code. When ON, `compute_gb_serial` emits a
+# canonical, index-free trace of the bba run (POP/RES/INS for the
+# trajectory skeleton; NEW/KILL pair events behind verbosity level 2)
+# to the file named by `RUSTGB_TRACE_FILE`, for diffing against an
+# equivalently-instrumented Singular run to localize where the two
+# engines' operation streams diverge. Verbosity is `RUSTGB_TRACE_LEVEL`
+# (1 = phase A, 2 = +phase B). Pure instrumentation — does not change
+# the computed basis. See `~/project/reports/rustgb-step-trace-report.md`.
+step_trace = []
+
 # Compacted divisor-scan arrays (ADR-037, task 390). OFF by default for
 # a clean A/B; feature-off is byte-for-byte the current behaviour. When
 # ON, `SBasis` maintains parallel scan arrays

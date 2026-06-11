@@ -89,6 +89,12 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     #[cfg(feature = "scan_stats")]
     crate::scan_stats::reset();
 
+    // step_trace (task 392): reset the trace sink per-call so a process
+    // running multiple std() calls writes a fresh trace file. Compiled
+    // out unless the feature is on.
+    #[cfg(feature = "step_trace")]
+    crate::step_trace::reset();
+
     let mut s_basis = SBasis::new();
     let mut l_set = LSet::new();
     let mut next_arrival: u64 = 0;
@@ -145,14 +151,26 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     // physically deleted; our design preserves pointers, so there's
     // nothing to skip here.
     while let Some(pair) = l_set.pop() {
+        // step_trace (task 392): POP — a pair is selected from L for
+        // reduction. Emitted for every popped pair, before the spoly is
+        // built, in strict stream order (the load-bearing phase-A skeleton).
+        #[cfg(feature = "step_trace")]
+        crate::step_trace::pop(&pair.lcm, pair.sugar, &ring);
         let s_i = s_basis.poly(pair.i as usize);
         let s_j = s_basis.poly(pair.j as usize);
         let mut lobj = match LObject::from_spoly(Arc::clone(&ring), s_i, s_j, &pair) {
             Some(l) => l,
-            None => continue,
+            None => {
+                // S-polynomial vanished by construction: a zero result.
+                #[cfg(feature = "step_trace")]
+                crate::step_trace::res_zero();
+                continue;
+            }
         };
         reduce_lobject(&mut lobj, &s_basis, &ring);
         if lobj.is_zero() {
+            #[cfg(feature = "step_trace")]
+            crate::step_trace::res_zero();
             continue;
         }
         let h_sugar = lobj.sugar();
@@ -160,6 +178,13 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
             .into_poly()
             .monic(&ring)
             .expect("nonzero lobject has invertible lc");
+        // step_trace (task 392): RES nonzero — the pre-redtail reduction
+        // outcome (leading monomial + term count).
+        #[cfg(feature = "step_trace")]
+        {
+            let (_, rlm) = h.leading().expect("nonzero survivor has a leader");
+            crate::step_trace::res_nonzero(rlm, h.len(), &ring);
+        }
         // ADR-024: per-step redTail. See note above in the seed loop.
         let h = reduce_h_tail(h, &s_basis, &ring);
         next_arrival = insert_and_generate_pairs_with_sugar(
@@ -192,6 +217,11 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
     // included.
     #[cfg(feature = "scan_stats")]
     crate::scan_stats::dump_if_enabled();
+
+    // step_trace (task 392): flush the trace sink. Placed after
+    // tail_reduce_all so the trace is complete. Compiled out unless on.
+    #[cfg(feature = "step_trace")]
+    crate::step_trace::flush();
 
     // Extract the surviving (non-redundant) polynomials, canonically
     // sorted. We sort **ascending** by leading monomial to match
@@ -234,6 +264,14 @@ fn insert_and_generate_pairs_with_sugar(
     sugar: u32,
     next_arrival: u64,
 ) -> u64 {
+    // step_trace (task 392): INS — element enters the basis in its
+    // post-redtail shape (what becomes a reducer). Emitted before
+    // enterpairs so the INS precedes this batch's NEW/KILL events.
+    #[cfg(feature = "step_trace")]
+    {
+        let (_, ilm) = h.leading().expect("inserted element is nonzero");
+        crate::step_trace::ins(ilm, h.len(), ring);
+    }
     let h_idx = s_basis.insert_no_clear(h) as u32;
     let h_ref = s_basis.poly(h_idx as usize);
     let created = enterpairs(ring, s_basis, h_idx, h_ref, sugar, l_set, next_arrival);

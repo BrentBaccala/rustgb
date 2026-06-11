@@ -46,6 +46,8 @@ pub mod ring;
 pub mod sbasis;
 #[cfg(feature = "scan_stats")]
 pub mod scan_stats;
+#[cfg(feature = "step_trace")]
+pub mod step_trace;
 mod simd;
 
 pub use bba::compute_gb;
