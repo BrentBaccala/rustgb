@@ -514,9 +514,6 @@ impl Monomial {
         Self::from_exponents(ring, &exps).expect("lcm per-var exponents ≤ MAX_VAR_EXP")
     }
 
-    /// ADR-036: fused test of `lcm(a, b) == m` without materializing
-    /// `lcm(a, b)`.
-    ///
     // ----- Ordering -----
 
     /// Compare under the ring's ordering.
