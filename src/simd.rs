@@ -488,6 +488,289 @@ pub(crate) unsafe fn find_sev_superset_match_sse41(
     find_sev_superset_match_scalar(sevs, subset_mask, j)
 }
 
+// =====================================================================
+// Byte-parallel monomial kernels (ADR-038).
+//
+// The three hot per-variable monomial loops — `lcm` (componentwise
+// max + capped-degree recompute), `divides` (componentwise ≤), and
+// `monomials_are_coprime` (no variable positive in both) — operate on
+// the 32-byte packed `[u64; 4]` block (ADR-005). With direct
+// per-variable byte storage, each is a byte-parallel SIMD primitive:
+//
+// * `lcm`   → `_mm_max_epu8` per variable byte, then rewrite byte 31
+//             (capped total-degree) from `_mm_sad_epu8` of the variable
+//             bytes.
+// * `divides` → `_mm_subs_epu8(self, other)` is all-zero over the
+//             variable bytes iff every `e_i(self) ≤ e_i(other)`.
+// * `coprime` → `_mm_min_epu8(a, b)` is all-zero over the variable
+//             bytes iff no variable is positive in both.
+//
+// All three are SSE2 (baseline x86-64 — no runtime dispatch needed:
+// `_mm_max_epu8`, `_mm_subs_epu8`, `_mm_min_epu8`, `_mm_sad_epu8` are
+// all SSE2). A scalar-SWAR fallback keeps the crate portable to
+// non-x86 targets. Each is a provably-exact drop-in for its scalar
+// predecessor, validated by the proptests in `tests/monomial_props.rs`.
+//
+// `var_mask` is the ring's `cmp_flip_mask`: `0x7F` in every variable
+// byte slot, `0x00` in byte 31 (total-degree cap) and the unused low
+// bytes. ANDing a canonical packed block against it isolates the
+// variable bytes (guard bit 7 is already zero, so `0x7F` loses
+// nothing) and zeroes the degree byte — exactly the selector these
+// kernels need.
+//
+// Singular comparison: `p_Lcm` (`libpolys/polys/monomials/p_polys.cc`)
+// is a scalar per-variable loop; `p_LmShortDivisibleBy` is a SEV
+// pre-filter plus a scalar confirm. Rust goes *past* Singular here
+// (like ADR-035's divscan): the confirm step itself is vectorized.
+// FLINT comparison: `mpoly` monomial ops (`mpoly_monomial_max`,
+// `mpoly_monomials_cmp`) operate word-at-a-time over a packed limb
+// array but FLINT's packing crosses field boundaries within a limb,
+// so it cannot use saturating byte ops — it carries an explicit
+// overflow-bit mask instead. Our fixed one-byte-per-variable layout
+// (ADR-005) lets us use the byte-saturating SSE2 ops directly, which
+// FLINT's variable-width bit-packing cannot.
+// =====================================================================
+
+/// Componentwise byte-max of two packed monomial blocks, returning the
+/// raw `[u64; 4]` (variable bytes maxed; the degree byte is **not**
+/// fixed up here — the caller recomputes it). Low/unused bytes are zero
+/// in both inputs so their max stays zero.
+#[inline]
+pub(crate) fn packed_byte_max(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SSE2 is baseline on x86-64; `_mm_max_epu8` is unconditionally
+        // available, so no runtime dispatch.
+        // SAFETY: SSE2 is guaranteed on every x86_64 target.
+        return unsafe { packed_byte_max_sse2(a, b) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        packed_byte_max_swar(a, b)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn packed_byte_max_sse2(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    use std::arch::x86_64::*;
+    // SAFETY: the two 16-byte loads cover exactly the 32-byte packed
+    // blocks; `a`/`b` are `&[u64; 4]` so the reads are in-bounds and
+    // aligned to at least 8 bytes (loadu tolerates any alignment).
+    unsafe {
+        let a0 = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+        let a1 = _mm_loadu_si128(a.as_ptr().add(2) as *const __m128i);
+        let b0 = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+        let b1 = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
+        let m0 = _mm_max_epu8(a0, b0);
+        let m1 = _mm_max_epu8(a1, b1);
+        let mut out = [0u64; 4];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, m0);
+        _mm_storeu_si128(out.as_mut_ptr().add(2) as *mut __m128i, m1);
+        out
+    }
+}
+
+/// SWAR byte-max fallback: per-byte unsigned max of two u64 words.
+/// Used on non-x86 targets and as the kernel's portable reference.
+/// Clarity over cleverness — this path never runs on the perf-critical
+/// (x86_64) workload, so a straightforward per-byte loop is preferred
+/// to a fragile bit-trick.
+///
+/// On x86_64 the production path is the SSE2 kernel, so this and its
+/// `word_byte_*` helpers are only reached from the unit tests there
+/// (which cross-check SIMD against SWAR) — hence the dead-code allow.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+pub(crate) fn packed_byte_max_swar(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for i in 0..4 {
+        out[i] = word_byte_max(a[i], b[i]);
+    }
+    out
+}
+
+/// Per-byte unsigned max of two u64 words.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+fn word_byte_max(a: u64, b: u64) -> u64 {
+    let mut out = 0u64;
+    for k in 0..8 {
+        let sh = k * 8;
+        let ba = (a >> sh) & 0xFF;
+        let bb = (b >> sh) & 0xFF;
+        out |= ba.max(bb) << sh;
+    }
+    out
+}
+
+/// Per-byte unsigned saturating subtract `a - b`: each byte is
+/// `max(a_byte - b_byte, 0)`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+fn word_byte_subs(a: u64, b: u64) -> u64 {
+    let mut out = 0u64;
+    for k in 0..8 {
+        let sh = k * 8;
+        let ba = (a >> sh) & 0xFF;
+        let bb = (b >> sh) & 0xFF;
+        out |= ba.saturating_sub(bb) << sh;
+    }
+    out
+}
+
+/// Per-byte unsigned saturating subtract over the whole packed block.
+#[inline]
+pub(crate) fn packed_byte_subs(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 guaranteed on x86_64.
+        return unsafe { packed_byte_subs_sse2(a, b) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut out = [0u64; 4];
+        for i in 0..4 {
+            out[i] = word_byte_subs(a[i], b[i]);
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn packed_byte_subs_sse2(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    use std::arch::x86_64::*;
+    // SAFETY: 16-byte loads over the 32-byte packed blocks; in-bounds.
+    unsafe {
+        let a0 = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+        let a1 = _mm_loadu_si128(a.as_ptr().add(2) as *const __m128i);
+        let b0 = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+        let b1 = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
+        let s0 = _mm_subs_epu8(a0, b0);
+        let s1 = _mm_subs_epu8(a1, b1);
+        let mut out = [0u64; 4];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, s0);
+        _mm_storeu_si128(out.as_mut_ptr().add(2) as *mut __m128i, s1);
+        out
+    }
+}
+
+/// Per-byte unsigned min over the whole packed block.
+#[inline]
+pub(crate) fn packed_byte_min(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 guaranteed on x86_64.
+        return unsafe { packed_byte_min_sse2(a, b) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // min(a,b) = a - subs(a, b) per byte (a - max(a-b,0)).
+        let mut out = [0u64; 4];
+        for i in 0..4 {
+            out[i] = a[i].wrapping_sub(word_byte_subs(a[i], b[i]));
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn packed_byte_min_sse2(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    use std::arch::x86_64::*;
+    // SAFETY: 16-byte loads over the 32-byte packed blocks; in-bounds.
+    unsafe {
+        let a0 = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+        let a1 = _mm_loadu_si128(a.as_ptr().add(2) as *const __m128i);
+        let b0 = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+        let b1 = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
+        let m0 = _mm_min_epu8(a0, b0);
+        let m1 = _mm_min_epu8(a1, b1);
+        let mut out = [0u64; 4];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, m0);
+        _mm_storeu_si128(out.as_mut_ptr().add(2) as *mut __m128i, m1);
+        out
+    }
+}
+
+/// Sum of all bytes of a packed block (used after masking to the
+/// variable bytes, to recompute the lcm's capped total degree). Uses
+/// `_mm_sad_epu8` against zero on x86 (two 8-byte-lane sums), or a
+/// SWAR byte sum on other targets. Caller must pre-mask the degree
+/// byte and any non-variable bytes to zero.
+#[inline]
+pub(crate) fn packed_byte_sum(p: &[u64; 4]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 guaranteed on x86_64.
+        return unsafe { packed_byte_sum_sse2(p) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut s: u32 = 0;
+        for &w in p.iter() {
+            for k in 0..8 {
+                s += ((w >> (k * 8)) & 0xFF) as u32;
+            }
+        }
+        s
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn packed_byte_sum_sse2(p: &[u64; 4]) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: two 16-byte loads over the 32-byte packed block.
+    unsafe {
+        let v0 = _mm_loadu_si128(p.as_ptr() as *const __m128i);
+        let v1 = _mm_loadu_si128(p.as_ptr().add(2) as *const __m128i);
+        let zero = _mm_setzero_si128();
+        // _mm_sad_epu8 sums the 8 absolute differences per 64-bit lane
+        // into the low 16 bits of that lane; against zero it is the
+        // byte-sum of each 8-byte lane.
+        let s0 = _mm_sad_epu8(v0, zero);
+        let s1 = _mm_sad_epu8(v1, zero);
+        let s = _mm_add_epi64(s0, s1);
+        // Two lane sums in bits [0..16) of each 64-bit half.
+        let lo = _mm_cvtsi128_si64(s) as u64 & 0xFFFF;
+        let hi = _mm_cvtsi128_si64(_mm_unpackhi_epi64(s, s)) as u64 & 0xFFFF;
+        (lo + hi) as u32
+    }
+}
+
+/// True iff `packed_byte_subs(a, b)` masked to the variable bytes is
+/// all-zero — i.e. every variable byte of `a` is ≤ the corresponding
+/// byte of `b`. `var_mask` selects the variable bytes (the ring's
+/// `cmp_flip_mask`: 0x7F on variable bytes, 0 elsewhere).
+#[inline]
+pub(crate) fn packed_divides(a: &[u64; 4], b: &[u64; 4], var_mask: &[u64; 4]) -> bool {
+    let d = packed_byte_subs(a, b);
+    // subs is ≤ 0x7F per variable byte (both inputs ≤ 0x7F there), so
+    // ANDing with the 0x7F var_mask keeps the whole difference on the
+    // variable bytes and discards the degree/low bytes.
+    (d[0] & var_mask[0])
+        | (d[1] & var_mask[1])
+        | (d[2] & var_mask[2])
+        | (d[3] & var_mask[3])
+        == 0
+}
+
+/// True iff no variable byte is positive in both `a` and `b` — the
+/// componentwise min over the variable bytes is all-zero. `var_mask`
+/// selects the variable bytes (degree bytes, generally nonzero in
+/// both, are masked out).
+#[inline]
+pub(crate) fn packed_coprime(a: &[u64; 4], b: &[u64; 4], var_mask: &[u64; 4]) -> bool {
+    let m = packed_byte_min(a, b);
+    (m[0] & var_mask[0])
+        | (m[1] & var_mask[1])
+        | (m[2] & var_mask[2])
+        | (m[3] & var_mask[3])
+        == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +860,75 @@ mod tests {
         assert_eq!(find_sev_superset_match(&[7u64, 5u64], 1u64, 0), 0); // 1 ⊆ 7
         assert_eq!(find_sev_superset_match(&[2u64, 5u64], 4u64, 0), 1); // 4 ⊄ 2; 4 ⊆ 5
         assert_eq!(find_sev_match(&[1u64, 2u64], 1u64, 0), 1); // 1&1≠0; 2&1==0
+    }
+
+    // ---- ADR-038 byte-parallel monomial kernels ----
+
+    /// Naive per-byte reference for the byte ops, independent of both
+    /// the SIMD and the SWAR production paths.
+    fn ref_byte_op(a: &[u64; 4], b: &[u64; 4], op: impl Fn(u8, u8) -> u8) -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for i in 0..4 {
+            for k in 0..8 {
+                let sh = k * 8;
+                let ba = ((a[i] >> sh) & 0xFF) as u8;
+                let bb = ((b[i] >> sh) & 0xFF) as u8;
+                out[i] |= (op(ba, bb) as u64) << sh;
+            }
+        }
+        out
+    }
+
+    fn sample_packed(seed: u64) -> [u64; 4] {
+        let mut s = seed;
+        let mut out = [0u64; 4];
+        for w in out.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *w = s;
+        }
+        out
+    }
+
+    #[test]
+    fn byte_ops_match_reference() {
+        for seed in 0u64..256 {
+            let a = sample_packed(seed);
+            let b = sample_packed(seed ^ 0xdead_beef);
+
+            let want_max = ref_byte_op(&a, &b, |x, y| x.max(y));
+            let want_min = ref_byte_op(&a, &b, |x, y| x.min(y));
+            let want_subs = ref_byte_op(&a, &b, |x, y| x.saturating_sub(y));
+
+            // SIMD / dispatched production path.
+            assert_eq!(packed_byte_max(&a, &b), want_max, "max seed={seed}");
+            assert_eq!(packed_byte_min(&a, &b), want_min, "min seed={seed}");
+            assert_eq!(packed_byte_subs(&a, &b), want_subs, "subs seed={seed}");
+
+            // SWAR reference path (also exercised on x86, where it is
+            // otherwise the non-default arm) — must agree byte-for-byte.
+            assert_eq!(packed_byte_max_swar(&a, &b), want_max, "swar-max seed={seed}");
+            assert_eq!(word_byte_max(a[0], b[0]), want_max[0], "word-max seed={seed}");
+            assert_eq!(
+                word_byte_subs(a[0], b[0]),
+                want_subs[0],
+                "word-subs seed={seed}"
+            );
+
+            // Byte-sum: sum every byte of `a`.
+            let want_sum: u32 = (0..4)
+                .flat_map(|i| (0..8).map(move |k| ((a[i] >> (k * 8)) & 0xFF) as u32))
+                .sum();
+            assert_eq!(packed_byte_sum(&a), want_sum, "sum seed={seed}");
+        }
+    }
+
+    #[test]
+    fn byte_sum_handles_max_bytes() {
+        // All bytes 0xFF: 32 * 255 = 8160, fits the two 16-bit SAD
+        // lane accumulators (each lane sums 8*255 = 2040).
+        let all = [!0u64; 4];
+        assert_eq!(packed_byte_sum(&all), 32 * 255);
     }
 }

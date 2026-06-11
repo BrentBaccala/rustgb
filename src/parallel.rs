@@ -638,15 +638,9 @@ fn build_pair(
 }
 
 fn monomials_are_coprime(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
-    let n = ring.nvars();
-    for i in 0..n {
-        let ea = a.exponent(ring, i).expect("i < nvars");
-        let eb = b.exponent(ring, i).expect("i < nvars");
-        if ea > 0 && eb > 0 {
-            return false;
-        }
-    }
-    true
+    // ADR-038: route the parallel path's coprime check through the
+    // shared byte-parallel kernel, same as the serial `gm` copy.
+    crate::gm::monomials_are_coprime(a, b, ring)
 }
 
 /// B-internal chain criterion: drop pairs whose LCM is divisible by

@@ -118,7 +118,25 @@ pub fn enter_one_pair_normal(
 
 /// Coprime check on monomials: no variable has nonzero exponent in
 /// both. Called *after* the sev pre-filter rejects obvious shares.
-fn monomials_are_coprime(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
+///
+/// ADR-038: byte-parallel `_mm_min_epu8` over the packed block — no
+/// variable byte is positive in both iff the componentwise min over
+/// the variable bytes is all-zero. The degree bytes (byte 31, nonzero
+/// in both in general) are masked out by the ring's `cmp_flip_mask`.
+/// The old scalar per-variable loop is retained as
+/// `monomials_are_coprime_scalar` for the proptest oracle.
+///
+/// `#[doc(hidden)] pub` so the integration proptests in `tests/` can
+/// call the SIMD path directly (ADR-038).
+#[doc(hidden)]
+pub fn monomials_are_coprime(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
+    crate::simd::packed_coprime(a.packed(), b.packed(), ring.cmp_flip_mask())
+}
+
+/// Scalar reference for [`monomials_are_coprime`] (ADR-038 proptest
+/// oracle); `#[doc(hidden)] pub` for the integration proptests.
+#[doc(hidden)]
+pub fn monomials_are_coprime_scalar(a: &Monomial, b: &Monomial, ring: &Ring) -> bool {
     let n = ring.nvars();
     for i in 0..n {
         let ea = a.exponent(ring, i).expect("i < nvars");

@@ -6252,6 +6252,175 @@ feature is gated on that A/B clearing the same bar ADR-032/035 used
 
 ---
 
+## ADR-038: Byte-parallel SWAR/SIMD monomial kernels (`lcm`, `divides`, `coprime`)
+
+**Status:** Implemented unconditionally (no feature gate — the three
+kernels are provably-exact drop-ins backed by proptests, matching how
+ADR-022's cmp specialisation shipped).
+**Date:** 2026-06-10
+
+### Context
+
+The post-ADR-035 divisor-scan probe
+(`~/project/reports/rustgb-divscan-probe-report.md`, Step-0 self-time
+table) flagged three hot scalar per-variable monomial loops over the
+packed `[u64; 4]` layout (ADR-005):
+
+* **`Monomial::lcm` — 11.52 % self (0.77 s)**, plus ~1.9 % `__calloc`
+  attributable to it. The old body heap-allocated `vec![0u32; n]`,
+  extracted every exponent scalar-wise, and round-tripped through
+  `from_exponents` (full repack + validation + degree recompute).
+* **`Monomial::divides`** — scalar per-variable byte `≤` loop;
+  inlined as ~3.8 % inside `gm::chain_crit_normal` + ~2 % inside
+  `find_divisor_idx`.
+* **`gm::monomials_are_coprime`** — scalar per-variable loop, ~2.5 %.
+
+With direct one-byte-per-variable storage (ADR-005), each of these is
+a byte-parallel operation over the 32-byte packed block.
+
+### Decision
+
+Three byte-parallel kernels in `src/simd.rs`, called from the three
+public bodies. Each has an SSE2 path (baseline x86-64 — no runtime
+dispatch: `_mm_max_epu8` / `_mm_subs_epu8` / `_mm_min_epu8` /
+`_mm_sad_epu8` are all SSE2) and a scalar-SWAR fallback for non-x86
+portability.
+
+* **`lcm`** — `packed_byte_max` (`_mm_max_epu8` × 2 over the 32 bytes)
+  gives the componentwise variable-byte max directly (guard bit is 0
+  in canonical form, so the byte *is* the exponent; low/unused bytes
+  are 0 in both, stay 0). The byte-max also writes `max(cap_a, cap_b)`
+  into byte 31 — which is **not** the lcm's degree, so it is
+  overwritten: mask the result to the variable bytes (the ring's
+  `cmp_flip_mask` = 0x7F on variable bytes, 0 on byte 31 and low
+  bytes), sum them with `packed_byte_sum` (`_mm_sad_epu8` against
+  zero → two 8-byte-lane sums), cap at 255 (ADR-020), insert into
+  byte 31. No allocation, no `from_exponents`. The SEV stays
+  `self.sev | other.sev` (componentwise-max support = union, ADR-029).
+* **`divides`** — `self | other` iff `_mm_subs_epu8(self, other)`
+  (saturating per-byte subtract) is all-zero across the variable
+  bytes. The degree byte is masked out by `cmp_flip_mask`, so the
+  kernel does not examine it and cannot false-negative on it (the
+  "componentwise ≤ ⇒ capped-sum ≤" argument is true but unused — the
+  cap is simply not consulted).
+* **`coprime`** — no variable positive in both iff
+  `_mm_min_epu8(a, b)` is all-zero across the variable bytes. The
+  degree bytes (generally nonzero in both) **must** be masked out by
+  `cmp_flip_mask`, else a naive min would always report not-coprime.
+
+The `cmp_flip_mask` does double duty as the variable-byte selector:
+it already exists per-ring (built in `compute_packing_masks`,
+`src/ring.rs:353`) with exactly 0x7F on every variable byte and 0x00
+on byte 31 and the unused low bytes.
+
+### Degree-cap exactness (the task's stop condition)
+
+The one subtlety was the lcm degree byte. The fixture/staging gate is
+`assert_eq!` on the full canonical packed block, so an approximate cap
+would have failed immediately. The recompute is exact: `packed_byte_sum`
+over the masked variable bytes is the true uncapped sum (max 31 × 127 =
+3937, well within the two 16-bit SAD accumulators), and `min(_, 255)`
+reproduces `from_exponents`'s cap byte-for-byte. The
+`lcm_simd_equals_scalar` proptest (8192 cases over the full 0..=127
+range, all three regimes) and the hand-picked `lcm_degree_cap_boundary`
+test (381→255 saturation; exactly-255; 254 just-under) confirm it.
+
+### Singular comparison
+
+Singular's `p_Lcm` (`~/Singular/libpolys/polys/monomials/p_polys.cc`)
+is a scalar per-variable loop; `p_LmShortDivisibleBy`
+(`p_polys.h`) is a SEV pre-filter + scalar per-variable confirm. This
+ADR goes *past* Singular (the same way ADR-035's divscan does):
+Singular vectorizes the *SEV scan* (`kSevScanAVX2`/`kSevScanSSE4`,
+which rust already mirrors in `find_sev_match`) but the per-variable
+*confirm/lcm* stays scalar in Singular. Here the confirm and the lcm
+themselves become byte-parallel.
+
+### FLINT comparison
+
+**Required (polynomial-layer decision) — checked.** FLINT's
+`mpoly_monomial_max` / `mpoly_monomial_min`
+(`~/flint/src/mpoly/misc.c:73-99`) vectorize *within a limb* using a
+masked-SWAR formula:
+
+```c
+s = mask + exp2[i] - exp3[i];   /* mask = high "overflow" bit per field */
+m = mask & s;
+m = m - (m >> (bits - 1));       /* full-field select mask */
+exp1[i] = exp3[i] + (s & m);
+```
+
+iterating `N` limbs scalar-ly with **no SIMD intrinsics**. It uses an
+explicit per-field overflow-bit `mask` precisely because FLINT packs
+**variable-width** fields (`bits` per variable, not fixed) into a limb,
+so fields can straddle and a byte-saturating CPU instruction would
+corrupt a neighbour. For `bits >= FLINT_BITS` it falls back to the
+`_mp` per-field comparison loop (`misc.c:101+`). Our **fixed
+one-byte-per-variable** layout (ADR-005) is exactly what lets us use
+`_mm_max_epu8` / `_mm_subs_epu8` / `_mm_min_epu8` directly — the byte
+boundary is the field boundary, so the saturating byte ops never cross
+fields. FLINT's variable bit-packing forecloses that; our layout
+chose the byte granularity (ADR-005) partly to keep these ops
+SIMD-able, and this ADR cashes that in. (FLINT has no GB engine, so
+there is no FLINT analog for the *call sites* — `chain_crit` /
+`find_divisor` — only for the monomial primitives themselves.)
+
+### Validation
+
+* **Proptests** (`tests/monomial_props.rs`, new
+  `regime_mono2_full_range` strategy over nvars ∈ {5, 25, 31},
+  per-var 0..=127, 8192 cases each):
+  `lcm_simd_equals_scalar` (vs the old `from_exponents` path, full
+  `Monomial` equality incl. degree cap), `divides_simd_equals_componentwise_le`
+  (vs `divides_scalar`, both directions), `coprime_simd_equals_scalar`
+  (vs `monomials_are_coprime_scalar`). Plus deterministic
+  `lcm_degree_cap_boundary` and `divides_ignores_degree_byte`.
+* **Kernel cross-check** (`src/simd.rs` unit tests):
+  `byte_ops_match_reference` checks `packed_byte_max` / `_min` / `_subs`
+  / `_sum` and the SWAR path against a naive per-byte reference over 256
+  seeds; `byte_sum_handles_max_bytes` checks the all-0xFF SAD edge.
+* **Full suite green**, default (**220 tests across 14 binaries**) and
+  heap backend (`--features heap_reducer`, 14 binaries green), no
+  warnings.
+* **Staging-5101449:** filtered `G[...]` md5
+  **`3f2adc5eb0160c9e0b357f20537ad037`** — equal to
+  `~/project/test-cases/staging-5101449-redsb.gb.txt` (empty diff, 2972
+  elements, `rgb fired`, 4 s wall on samsung). Bit-identical: all three
+  kernels are exact predicates/constructors.
+
+### Wall (deferred to interactive c200-1 A/B)
+
+No feature gate, so the A/B is **before vs after** these commits.
+Baseline commit `4f48e6f` (ADR-037); this ADR's commit is the "after".
+The probe motivation is −0.5 s or better on staging-5101449 (c200-1
+measured wall 6.70 s) from removing the 11.52 % lcm self-time + its
+`__calloc`. Not measured in the task-runner subagent (watchdog reason);
+the c200-1 same-campaign A/B is the wall confirmation.
+
+### References
+
+* `~/rustgb/src/simd.rs` — `packed_byte_max` / `packed_byte_min` /
+  `packed_byte_subs` / `packed_byte_sum` (SSE2 + SWAR), and the
+  predicate wrappers `packed_divides` / `packed_coprime`.
+* `~/rustgb/src/monomial.rs` — `lcm` (SIMD body + `lcm_scalar` oracle),
+  `divides` (+ `divides_scalar` oracle).
+* `~/rustgb/src/gm.rs` — `monomials_are_coprime` (SIMD) +
+  `monomials_are_coprime_scalar` oracle.
+* `~/rustgb/src/ring.rs:353` — `compute_packing_masks`, source of the
+  `cmp_flip_mask` reused as the variable-byte selector.
+* `~/flint/src/mpoly/misc.c:73-99` — FLINT's masked-SWAR
+  `mpoly_monomial_max` / `_min`, the variable-bit-packing contrast.
+* `~/Singular/libpolys/polys/monomials/p_polys.cc` — `p_Lcm`;
+  `p_polys.h` — `p_LmShortDivisibleBy` (SEV + scalar confirm).
+* `~/project/reports/rustgb-divscan-probe-report.md` — Step-0 self-time
+  table that motivated this ADR.
+* ADR-005 — the one-byte-per-variable packing this exploits; ADR-020 —
+  the degree-cap semantics the lcm recompute replicates; ADR-027 — the
+  runtime-dispatch discipline (here unneeded, SSE2 baseline); ADR-029 —
+  the SEV combinators (`lcm` keeps the OR).
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

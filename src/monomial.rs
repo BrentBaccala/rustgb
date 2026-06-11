@@ -437,16 +437,30 @@ impl Monomial {
     /// `true` iff `self | other` (each `e_i(self) ≤ e_i(other)`).
     ///
     /// With direct exponent storage (ADR-005), this is a per-byte
-    /// `≤` test. Implemented byte-by-byte over the variable bytes;
-    /// could be SIMD'd later if it shows up in a profile.
+    /// `≤` test. ADR-038 makes it a single byte-parallel
+    /// `_mm_subs_epu8` over the packed block: `self | other` iff the
+    /// saturating per-byte subtract `self - other` is all-zero across
+    /// the variable bytes. The degree byte (byte 31) is masked out by
+    /// `var_mask`, so the kernel does not rely on the (true but
+    /// not-needed-here) "componentwise ≤ implies capped-degree ≤"
+    /// argument — the cap byte cannot false-negative because it is not
+    /// examined. The `divides_simd == componentwise_le` proptest
+    /// confirms exactness including the degree-cap boundary.
     pub fn divides(&self, other: &Self, ring: &Ring) -> bool {
+        crate::simd::packed_divides(&self.packed, &other.packed, ring.cmp_flip_mask())
+    }
+
+    /// Scalar reference for [`Self::divides`]: per-variable `≤` over
+    /// the variable bytes. Retained as the proptest oracle for the
+    /// SIMD kernel (ADR-038); `#[doc(hidden)] pub` so the integration
+    /// proptests in `tests/` can call it.
+    #[doc(hidden)]
+    pub fn divides_scalar(&self, other: &Self, ring: &Ring) -> bool {
         let n = ring.nvars() as usize;
         let first_var_byte = (WORDS_PER_MONO * 8 - 1) - n; // = 31 - n
         let last_var_byte = WORDS_PER_MONO * 8 - 2; // 30
         for byte_idx in first_var_byte..=last_var_byte {
             let (word, shift) = split_byte_index(byte_idx);
-            // Mask to 0x7F to ignore the (always-zero in canonical
-            // form) guard bit. Direct storage: byte value == exponent.
             let ea = (self.packed[word] >> shift) & 0x7F;
             let eb = (other.packed[word] >> shift) & 0x7F;
             if ea > eb {
@@ -504,13 +518,77 @@ impl Monomial {
     }
 
     /// Componentwise maximum (least common multiple of monomials).
+    ///
+    /// ADR-038: byte-parallel `_mm_max_epu8` over the packed block,
+    /// then rewrite the degree byte (byte 31) from the capped sum of
+    /// the lcm's variable bytes. The old path heap-allocated a
+    /// `vec![0u32; n]`, extracted every exponent scalar-wise, and
+    /// round-tripped through `from_exponents` (full repack + validation
+    /// + degree recompute) — it showed as 11.52 % self + ~1.9 %
+    /// `__calloc` in the post-ADR-035 profile. This version allocates
+    /// nothing and does no per-variable scalar loop.
+    ///
+    /// Degree-byte handling: `max(byte31_a, byte31_b)` is **not** the
+    /// lcm's degree (the lcm of two monomials can have a larger total
+    /// degree than either factor). The byte-max leaves byte 31 as
+    /// `max(cap_a, cap_b)`, which we discard and replace with the
+    /// recomputed capped sum of the lcm's variable bytes (masked to
+    /// exclude byte 31 itself, then `min(_, 255)` per ADR-020). The
+    /// `var_mask` is the ring's `cmp_flip_mask` (0x7F on variable
+    /// bytes, 0 on byte 31 and the low bytes), so the sum sees exactly
+    /// the variable bytes.
     pub fn lcm(&self, other: &Self, ring: &Ring) -> Self {
+        let var_mask = ring.cmp_flip_mask();
+        // Componentwise byte-max over all 32 bytes. Variable bytes get
+        // the correct per-variable max (guard bit is 0, so the byte is
+        // the exponent); the low/unused bytes are 0 in both, so stay 0;
+        // byte 31 becomes max(cap_a, cap_b), which we overwrite below.
+        let mut packed = crate::simd::packed_byte_max(&self.packed, &other.packed);
+
+        // Recompute the capped total-degree byte from the variable
+        // bytes of the lcm. Mask byte 31 (and the unused low bytes) to
+        // zero so the byte-sum counts only the variable exponents.
+        let masked = [
+            packed[0] & var_mask[0],
+            packed[1] & var_mask[1],
+            packed[2] & var_mask[2],
+            packed[3] & var_mask[3],
+        ];
+        let total = crate::simd::packed_byte_sum(&masked);
+        let capped = (total as u64).min(u8::MAX as u64);
+        packed[WORDS_PER_MONO - 1] =
+            (packed[WORDS_PER_MONO - 1] & !(0xFFu64 << 56)) | (capped << 56);
+
+        // ADR-029: a componentwise-max support is the union of the two
+        // supports (a variable is nonzero in the lcm iff it is nonzero
+        // in either factor), so the SEV is the bitwise OR — exactly the
+        // combinator the old `from_exponents` path recomputed by scan.
+        let out = Self {
+            packed,
+            sev: self.sev | other.sev,
+            component: 0,
+        };
+        debug_assert!(
+            {
+                out.assert_canonical(ring);
+                true
+            },
+            "lcm result must be canonical"
+        );
+        out
+    }
+
+    /// Scalar reference for [`Self::lcm`]: per-variable max via the
+    /// `from_exponents` round-trip. Retained as the proptest oracle for
+    /// the SIMD kernel (ADR-038); `#[doc(hidden)] pub` so the
+    /// integration proptests in `tests/` can call it.
+    #[doc(hidden)]
+    pub fn lcm_scalar(&self, other: &Self, ring: &Ring) -> Self {
         let n = ring.nvars() as usize;
         let mut exps = vec![0u32; n];
         for (i, slot) in exps.iter_mut().enumerate() {
             *slot = self.exponent_raw(n, i).max(other.exponent_raw(n, i));
         }
-        // Each per-var exponent stays ≤ MAX_VAR_EXP (127); total fits u32.
         Self::from_exponents(ring, &exps).expect("lcm per-var exponents ≤ MAX_VAR_EXP")
     }
 
