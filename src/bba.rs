@@ -325,7 +325,7 @@ pub fn compute_gb_serial(ring: Arc<Ring>, input: Vec<Poly>) -> Vec<Poly> {
 /// reduction. See the comment in `compute_gb`'s main loop for why
 /// this is the right contract.
 fn insert_and_generate_pairs_with_sugar(
-    ring: &Ring,
+    ring: &Arc<Ring>,
     s_basis: &mut SBasis,
     l_set: &mut LSet,
     h: Poly,

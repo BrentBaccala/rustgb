@@ -125,6 +125,42 @@ impl LObject {
         Some(o)
     }
 
+    /// ADR-040 (`input_tiebreak`): compute the leading monomial of the
+    /// short S-polynomial `c_j·m_i·S[i] − c_i·m_j·S[j]` (the same poly
+    /// `from_spoly` builds), WITHOUT retaining the bucket. Used to key
+    /// the L-queue ordering on the S-polynomial's actual leading
+    /// monomial — exactly what Singular's `compareL15` does
+    /// (`pLmCmp(strat->P.p, …)` where `strat->P.p` is the
+    /// `ksCreateShortSpoly` result, whose leading monomial is strictly
+    /// below the LCM because the two LCM-leading terms cancel). rust's
+    /// `pairorder_lm` keys on the LCM instead; on the staging workload
+    /// the short-spoly LM differs from the LCM for **100 %** of pairs,
+    /// so the LCM key systematically mis-orders pairs relative to
+    /// Singular (task 394 diagnosis).
+    ///
+    /// Returns `None` iff the S-polynomial is identically zero (the two
+    /// scaled polys cancel completely) — caller treats that pair as a
+    /// zero reduction. `lcm` must be `lcm(lm(s_i), lm(s_j))`.
+    #[cfg(feature = "input_tiebreak")]
+    pub fn short_spoly_lm(
+        ring: &Arc<Ring>,
+        s_i: &Poly,
+        s_j: &Poly,
+        lcm: &Monomial,
+    ) -> Option<Monomial> {
+        let (_, lm_i) = s_i.leading()?;
+        let (_, lm_j) = s_j.leading()?;
+        let c_i = s_i.lm_coeff();
+        let c_j = s_j.lm_coeff();
+        let m_i = lcm.div(lm_i, ring)?;
+        let m_j = lcm.div(lm_j, ring)?;
+        let neg_c_j = ring.field().neg(c_j);
+        let mut bucket = KBucket::new(Arc::clone(ring));
+        bucket.minus_m_mult_p(&m_i, neg_c_j, s_i);
+        bucket.minus_m_mult_p(&m_j, c_i, s_j);
+        bucket.leading().map(|(_, m)| m.clone())
+    }
+
     /// Re-probe the bucket's leading term and populate the cache.
     /// Call after every `minus_m_mult_p` on the bucket.
     ///

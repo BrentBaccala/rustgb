@@ -99,8 +99,14 @@ use crate::pair::{Pair, PairKey};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SortedKey {
     sugar: u32,
-    #[cfg(feature = "pairorder_lm")]
+    // ADR-034 (`pairorder_lm`): the LCM key — used only when
+    // `input_tiebreak` is OFF.
+    #[cfg(all(feature = "pairorder_lm", not(feature = "input_tiebreak")))]
     lcm_ord_key: [u64; 4],
+    // ADR-040 (`input_tiebreak`): the short-spoly LM key — supersedes the
+    // LCM key, mirroring Singular's `compareL15` `pLmCmp(P.p)`.
+    #[cfg(feature = "input_tiebreak")]
+    spoly_ord_key: [u64; 4],
     arrival: u64,
     idx: usize,
 }
@@ -108,10 +114,22 @@ struct SortedKey {
 impl Ord for SortedKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let ord = self.sugar.cmp(&other.sugar);
-        #[cfg(feature = "pairorder_lm")]
+        // ADR-034 path (LCM key) — only when input_tiebreak is OFF.
+        #[cfg(all(feature = "pairorder_lm", not(feature = "input_tiebreak")))]
         let ord = ord.then_with(|| self.lcm_ord_key.cmp(&other.lcm_ord_key));
-        ord.then_with(|| self.arrival.cmp(&other.arrival))
-            .then_with(|| self.idx.cmp(&other.idx))
+        // ADR-040 path (short-spoly LM key).
+        #[cfg(feature = "input_tiebreak")]
+        let ord = ord.then_with(|| self.spoly_ord_key.cmp(&other.spoly_ord_key));
+        // ADR-040: arrival stabilizer is LIFO (descending) under
+        // `input_tiebreak` — mirrors Singular's multiset LIFO so a
+        // later-inserted entry pops before an earlier one at an exact
+        // `(sugar, monomial)` tie. FIFO (ascending) otherwise.
+        // `arrival` is globally unique, so `idx` never decides.
+        #[cfg(not(feature = "input_tiebreak"))]
+        let arrival_tie = self.arrival.cmp(&other.arrival);
+        #[cfg(feature = "input_tiebreak")]
+        let arrival_tie = other.arrival.cmp(&self.arrival);
+        ord.then(arrival_tie).then_with(|| self.idx.cmp(&other.idx))
     }
 }
 impl PartialOrd for SortedKey {
@@ -209,8 +227,10 @@ impl LSet {
         let idx = self.pairs.len();
         let sorted_key = SortedKey {
             sugar: pair.sugar,
-            #[cfg(feature = "pairorder_lm")]
+            #[cfg(all(feature = "pairorder_lm", not(feature = "input_tiebreak")))]
             lcm_ord_key: pair.lcm_ord_key,
+            #[cfg(feature = "input_tiebreak")]
+            spoly_ord_key: pair.spoly_ord_key,
             arrival: pair.arrival,
             idx,
         };

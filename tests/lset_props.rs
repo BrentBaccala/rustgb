@@ -99,9 +99,20 @@ proptest! {
             popped.push(p);
         }
         l.assert_canonical(&r);
+        // ADR-040: under `input_tiebreak` the equal-`(sugar, monomial)`
+        // stabilizer is arrival DESCENDING (LIFO, mirroring Singular's
+        // multiset). All pairs in this stream share `fixed_lcm`, so the
+        // ordering monomial is identical and the drain is
+        // `(sugar asc, arrival desc)`. Without the feature it is the
+        // historical `(sugar asc, arrival asc)`.
         for w in popped[drain_start..].windows(2) {
+            #[cfg(not(feature = "input_tiebreak"))]
+            let in_order = (w[0].sugar, w[0].arrival) <= (w[1].sugar, w[1].arrival);
+            #[cfg(feature = "input_tiebreak")]
+            let in_order = w[0].sugar < w[1].sugar
+                || (w[0].sugar == w[1].sugar && w[0].arrival >= w[1].arrival);
             prop_assert!(
-                (w[0].sugar, w[0].arrival) <= (w[1].sugar, w[1].arrival),
+                in_order,
                 "final drain out of order: {:?} before {:?}",
                 (w[0].sugar, w[0].arrival),
                 (w[1].sugar, w[1].arrival),

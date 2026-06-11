@@ -6704,6 +6704,130 @@ validation, matching its seeding to this model is a follow-up.
 
 ---
 
+## ADR-040: L-queue keyed on the S-polynomial's leading monomial, not the LCM (`input_tiebreak` feature)
+
+**Status:** Implemented behind a **default-OFF** `input_tiebreak` cargo
+feature (pulls in `seed_in_l`). Trace-validated: closes the *early*
+input-vs-pair ordering divergence ADR-039 left open (first-divergence
+index moved 11→16 on 5101449, 14→24 on 5106746); GB output
+bit-identical (all three staging md5s match the fixtures, all four
+feature-state test suites green). **The pop counts did NOT collapse to
+Singular's** — a *distinct* divergence (sugar-band composition) drives
+the residual +10/+21 % excess; characterized below, deliberately not
+fixed here. Promotion is joint with ADR-039. **Date:** 2026-06-11
+
+### Decision
+
+When `input_tiebreak` is on, the L-queue keys an S-pair on the
+**degrevlex key of the actual S-polynomial's leading monomial** (the
+`ksCreateShortSpoly` result), not on the LCM (ADR-034's `lcm_ord_key`).
+The equal-`(sugar, monomial)` stabilizer flips from `arrival` ascending
+(FIFO) to `arrival` descending (LIFO). Input L-entries are unchanged
+(their ordering monomial already IS their leading monomial = `lcm`
+field). Both LSet backends are gated identically (`Pair::cmp` for the
+heap backend, `SortedKey::cmp` for the flat backend).
+
+### Why (root cause, proven from ground-truth Singular traces)
+
+Singular's bba L-queue comparator is `compareL15`
+(`kernel/GBEngine/kutil.cc:5856-5863`):
+`(GetpFDeg()+ecart, then pLmCmp(P.p)*OrdSgn)`. The decisive term is
+`pLmCmp(strat->P.p, …)`, and **`strat->P.p` is the short spoly built by
+`ksCreateShortSpoly`** (`enterOnePairNormal`, `kutil.cc:~2160`), whose
+leading monomial is *strictly below* the LCM because the two
+LCM-leading terms cancel. ADR-034's rust path keyed pairs on the
+**LCM**. A patched `next-opt-steptrace` Singular build dumping
+`PKEY lcm=… pLM=…` per pop (task 394) proved the short-spoly LM differs
+from the LCM for **100 %** of S-pairs on staging-5101449, and that the
+two disagree on which of two equal-sugar entries is "smaller" — e.g.
+skeleton index 11: the S-pair's LCM is `v1*d2*m0*a2` (the *largest*
+sugar-4 monomial) but its short-spoly LM is `v1*v9*m0*a9` (which sorts
+*below* the next input `v1*v3*m0*a8`), so Singular pops the pair first
+while rust (keying on the LCM) popped it last. ADR-039's report
+misdiagnosed this as an `arrival`-fallback tie; it is a key-*definition*
+difference (the case ADR-039's report flagged as "could be either").
+The `arrival` LIFO flip is the secondary part: Singular's
+`writable_set` (a `std::multiset<LObject*, CompareLObject>`) stores
+equal-`compareL15` elements LIFO (`CompareLObject` returns
+`lhs.seq > rhs.seq` for the non-FIFO comparators;
+`kernel/GBEngine/kInline.h:986-988`).
+
+### What it fixed and what it did NOT
+
+| staging | seed_in_l POP gap | +input_tiebreak POP gap | first-div idx (was) |
+|---|---:|---:|---:|
+| 5101449 | +10.1 % | **+10.0 %** | 16 (was 11) |
+| 5104053 | +21.2 % | **+21.2 %** | 14 (was 14) |
+| 5106746 | +10.8 % | **+10.5 %** | 24 (was 14) |
+
+The early ordering divergence is fixed (first-divergence index moves
+later on 2/3; the byte-identical prefix lengthens). The bulk pop gap is
+**unchanged** — and ≈ the RES-zero gap (the +2947 extra pops on 5101449
+are essentially all zero-reductions), so it is a pair-*set* effect, not
+a pair-*order* effect: reordering pops the same pairs in a different
+order, but the chain criterion prunes ~the same set either way, so the
+pop *count* barely moves.
+
+### The residual divergence (distinct driver — characterized, not fixed)
+
+Singular's bba sets the pair's **queue sugar** to the short-spoly LM
+degree too (`initEcartPairBba`, `kutil.cc:1338-1343`:
+`FDeg = pFDeg(P.p)`, `ecart = 0`), which is *below* the LCM degree for
+**5.4 %** of pairs on 5101449. rust keeps the Giovini–Mora sugar (= LCM
+degree). On 5104053 the divergence is starkly visible: at skeleton
+index 14 Singular is still INSerting low-degree inputs while rust has
+already advanced into the sugar-5 pair band — Singular front-loads far
+more low-sugar work. A probe that ALSO lowered rust's pair sugar to the
+spoly-LM degree (the faithful-to-Singular choice) made the pop count
+**worse** (+24.9 % vs +10.0 % on 5101449): lowering a pair's sugar pops
+it *before* enough reducers exist, inflating zero-reductions and
+transient inserts. So the faithful sugar change is a net regression *in
+rust's pipeline*, entangled with rust's redundancy/chain-pruning timing.
+This residual is a genuinely distinct cause from the tie-break and is
+out of scope here; closing it needs a sugar/selection redesign, not an
+order tweak.
+
+### Singular
+
+- `compareL15` (`kutil.cc:5856-5863`) — `(GetpFDeg()+ecart, pLmCmp(P.p))`;
+  `P.p` is the short spoly, so the tie-break monomial is the
+  S-polynomial's LM, not the LCM.
+- `ksCreateShortSpoly` (called from `enterOnePairNormal`) — builds the
+  2-term short spoly whose leading monomial keys the queue.
+- `initEcartPairBba` (`kutil.cc:1338-1343`) — `FDeg = pFDeg(P.p)`,
+  `ecart = 0`: the pair's sugar IS the short-spoly LM degree (the
+  residual-driver source above).
+- `CompareLObject::operator()` (`kInline.h:959-990`) — equal-`compareL15`
+  entries stored LIFO (`lhs.seq > rhs.seq`), mirrored by the descending
+  `arrival` stabilizer.
+
+### FLINT
+
+**N/A — FLINT has no GB engine.** The pair-ordering key is a
+Buchberger-loop selection-strategy decision with no analog in FLINT's
+polynomial layer.
+
+### Parallel path disposition
+
+`parallel.rs` builds pairs directly (not via `gm::enter_one_pair_normal`),
+so its pairs keep the default `spoly_ord_key == lcm_ord_key` and the
+ascending-arrival order — i.e. the parallel path is unaffected by this
+feature and still orders by the LCM. The parallel path is not
+staging-validated (`RUSTGB_THREADS=1` only); matching its pair ordering
+to this model is a follow-up for when it reaches validation.
+
+### References
+
+- `~/project/reports/rustgb-input-tiebreak-report.md` — this task's
+  report: the index-11 code-path explanation, the PKEY ground-truth
+  evidence, per-case POP/first-div/LCS, the residual characterization.
+- `~/project/reports/rustgb-interleaved-seeding-report.md` — ADR-039,
+  which left this divergence open and (mis-)attributed it to `arrival`.
+- ADR-034 — keyed S-pairs on the LCM; this ADR corrects that key to the
+  short-spoly LM under the new feature.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

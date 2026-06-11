@@ -64,6 +64,20 @@ pub struct Pair {
     /// unconditionally (it's cheap and the ring is in hand here); the
     /// feature only chooses whether the L-queue *reads* it.
     pub lcm_ord_key: [u64; 4],
+    /// ADR-040 (`input_tiebreak`): order-preserving degrevlex key of the
+    /// **ordering monomial** — the leading monomial of the actual
+    /// S-polynomial (the `ksCreateShortSpoly` result), NOT the LCM. For
+    /// an input L-entry this is just the input's leading monomial (=
+    /// `lcm`, since `lcm` holds the input LM for inputs), so
+    /// `spoly_ord_key == lcm_ord_key` for inputs. For an S-pair it is the
+    /// short-spoly LM's key, which is strictly below the LCM. The L-queue
+    /// uses this instead of `lcm_ord_key` when `input_tiebreak` is on, so
+    /// the pop order matches Singular's `compareL15`
+    /// (`pLmCmp(strat->P.p)`, where `strat->P.p` is the short spoly).
+    /// Without the feature this field is absent and the queue keys on
+    /// `lcm_ord_key` (ADR-034) exactly as before.
+    #[cfg(feature = "input_tiebreak")]
+    pub spoly_ord_key: [u64; 4],
     /// Sugar degree of the pair: `max(sugar(S[i]) + deg(m_i),
     /// sugar(S[j]) + deg(m_j))`. For the bootstrap where inputs
     /// carry `sugar = lm_deg`, this is equivalent to the LCM's total
@@ -192,12 +206,30 @@ impl Pair {
             lcm_sev,
             lcm_divmask,
             lcm_ord_key,
+            // ADR-040: default the spoly ordering key to the LCM key.
+            // For S-pairs the pair-creation path overwrites this via
+            // `set_spoly_ord_key` with the short-spoly LM key; if it
+            // never does, the queue order falls back to the LCM key
+            // (the pre-ADR-040 behaviour), which is a safe, total order.
+            #[cfg(feature = "input_tiebreak")]
+            spoly_ord_key: lcm_ord_key,
             sugar,
             arrival,
             key: PairKey(0),
             #[cfg(feature = "seed_in_l")]
             input: None,
         }
+    }
+
+    /// ADR-040 (`input_tiebreak`): set the S-polynomial ordering key
+    /// (the short-spoly LM's degrevlex key). Called by the pair-creation
+    /// path after computing the short spoly's leading monomial via
+    /// [`crate::lobject::LObject::short_spoly_lm`]. Input L-entries keep
+    /// the default (their own LM key) and never call this.
+    #[cfg(feature = "input_tiebreak")]
+    #[inline]
+    pub fn set_spoly_ord_key(&mut self, key: [u64; 4]) {
+        self.spoly_ord_key = key;
     }
 
     /// ADR-039 (`seed_in_l`): build an **input L-entry** carrying the
@@ -240,6 +272,12 @@ impl Pair {
             lcm_sev,
             lcm_divmask,
             lcm_ord_key,
+            // ADR-040: an input L-entry's ordering monomial IS its own
+            // leading monomial (Singular keys `p1==NULL` entries on
+            // `pLmCmp(P.p)` = the input poly's LM), which is exactly
+            // `lcm` here. So the spoly key equals the LCM key for inputs.
+            #[cfg(feature = "input_tiebreak")]
+            spoly_ord_key: lcm_ord_key,
             sugar,
             arrival,
             key: PairKey(0),
@@ -273,6 +311,11 @@ impl Pair {
             assert_eq!(self.lcm_sev, self.lcm.compute_sev(ring), "input lcm_sev cache mismatch");
             assert_eq!(self.lcm_divmask, ring.divmask_of(&self.lcm), "input lcm_divmask cache mismatch");
             assert_eq!(self.lcm_ord_key, self.lcm.degrevlex_key(ring), "input lcm_ord_key cache mismatch");
+            // ADR-040: an input entry's spoly ordering key is its own LM
+            // key (Singular keys `p1==NULL` entries on the input poly's
+            // LM), which equals `lcm_ord_key` here.
+            #[cfg(feature = "input_tiebreak")]
+            assert_eq!(self.spoly_ord_key, self.lcm_ord_key, "input spoly_ord_key must equal lcm_ord_key");
             return;
         }
         assert!(self.i < self.j, "pair indices not ordered");
@@ -298,16 +341,29 @@ impl Pair {
 // Ordering: ascending on (sugar, <tie-break>, i, j). Wrap in `Reverse`
 // when using `BinaryHeap` so the smallest comes out first.
 //
-// The tie-break among equal-sugar pairs depends on the `pairorder_lm`
-// feature (ADR-034):
-// * OFF (default): `arrival` — insertion order, byte-for-byte the
-//   prior behaviour.
-// * ON: `lcm_ord_key` — the LCM's order-preserving degrevlex key, so
-//   `pop()` (the minimum) yields the smallest-degrevlex LCM, matching
-//   Singular's `compareL15`. `arrival` is folded in after `lcm_ord_key`
-//   as a final deterministic tie so two pairs with the same
-//   `(sugar, lcm)` still order stably (the LCM equality case the
-//   product/chain criteria allow).
+// The tie-break among equal-sugar pairs depends on the feature stack:
+//
+// * `pairorder_lm` OFF (default-of-defaults): `arrival` — insertion
+//   order, byte-for-byte the prior behaviour.
+// * `pairorder_lm` ON, `input_tiebreak` OFF (ADR-034): `lcm_ord_key` —
+//   the LCM's order-preserving degrevlex key; `pop()` (the minimum)
+//   yields the smallest-degrevlex LCM. `arrival` ascending is the final
+//   stabilizer. This approximates `compareL15` but keys on the LCM.
+// * `input_tiebreak` ON (ADR-040): `spoly_ord_key` — the degrevlex key
+//   of the **S-polynomial's actual leading monomial** (the
+//   `ksCreateShortSpoly` result for S-pairs; the input's own LM for
+//   input entries), with `arrival` DESCENDING (LIFO) as the final
+//   stabilizer. This mirrors Singular's `compareL15` EXACTLY:
+//   `compareL15` is `(GetpFDeg+ecart, then pLmCmp(P.p)*OrdSgn)` where
+//   `P.p` is the short spoly, NOT the LCM — and on the staging workload
+//   the short-spoly LM differs from the LCM for 100 % of pairs, so
+//   keying on the LCM (the `pairorder_lm`-only path) systematically
+//   mis-orders pairs relative to Singular (task 394 root-cause). The
+//   `std::multiset<LObject*>` Singular uses stores equal-`compareL15`
+//   elements LIFO (`CompareLObject` returns `lhs.seq > rhs.seq` for the
+//   non-FIFO comparators; `kInline.h:986-988`, next-opt), so descending
+//   arrival reproduces the seq-LIFO stabilizer. `arrival` is globally
+//   unique, so the `(i, j)` suffix never decides; it keeps `Ord` total.
 //
 // Both LSet backends must agree: `lset.rs`'s `HeapEntry` delegates here
 // via `Pair::cmp`, and `lset_flat.rs`'s `SortedKey` mirrors this exact
@@ -317,14 +373,20 @@ impl Pair {
 impl Ord for Pair {
     fn cmp(&self, other: &Self) -> Ordering {
         let by_sugar = self.sugar.cmp(&other.sugar);
+        // ADR-040: arrival stabilizer is LIFO (descending) under
+        // `input_tiebreak`, FIFO (ascending) otherwise.
+        #[cfg(not(feature = "input_tiebreak"))]
+        let arrival_tie = self.arrival.cmp(&other.arrival);
+        #[cfg(feature = "input_tiebreak")]
+        let arrival_tie = other.arrival.cmp(&self.arrival);
         #[cfg(not(feature = "pairorder_lm"))]
-        let tie = || self.arrival.cmp(&other.arrival);
-        #[cfg(feature = "pairorder_lm")]
-        let tie = || {
-            self.lcm_ord_key
-                .cmp(&other.lcm_ord_key)
-                .then_with(|| self.arrival.cmp(&other.arrival))
-        };
+        let tie = || arrival_tie;
+        // ADR-034 path (LCM key) — only when input_tiebreak is OFF.
+        #[cfg(all(feature = "pairorder_lm", not(feature = "input_tiebreak")))]
+        let tie = || self.lcm_ord_key.cmp(&other.lcm_ord_key).then(arrival_tie);
+        // ADR-040 path (short-spoly LM key).
+        #[cfg(feature = "input_tiebreak")]
+        let tie = || self.spoly_ord_key.cmp(&other.spoly_ord_key).then(arrival_tie);
         by_sugar
             .then_with(tie)
             .then_with(|| self.i.cmp(&other.i))
@@ -394,12 +456,21 @@ mod tests {
         h.push(Reverse(Pair::new(0, 3, l.clone(), &r, 5, 10)));
         h.push(Reverse(Pair::new(0, 2, l.clone(), &r, 5, 5)));
         h.push(Reverse(Pair::new(0, 4, l.clone(), &r, 5, 20)));
+        // All three share sugar 5 and the same LCM (hence the same
+        // lcm_ord_key / default spoly_ord_key), so the arrival
+        // stabilizer alone orders them.
+        // ADR-040: `input_tiebreak` flips the stabilizer to LIFO
+        // (descending arrival); otherwise it is FIFO (ascending).
+        #[cfg(not(feature = "input_tiebreak"))]
+        let expected = [5u64, 10, 20];
+        #[cfg(feature = "input_tiebreak")]
+        let expected = [20u64, 10, 5];
         let a = h.pop().unwrap().0;
-        assert_eq!(a.arrival, 5);
+        assert_eq!(a.arrival, expected[0]);
         let b = h.pop().unwrap().0;
-        assert_eq!(b.arrival, 10);
+        assert_eq!(b.arrival, expected[1]);
         let c = h.pop().unwrap().0;
-        assert_eq!(c.arrival, 20);
+        assert_eq!(c.arrival, expected[2]);
     }
 
     /// ADR-039: an input L-entry is recognised via `is_input`, uses the

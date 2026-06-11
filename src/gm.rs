@@ -22,6 +22,8 @@
 //! bootstrap is skipping signature / ecart-specific branches — we
 //! always use the straight "global ordering, no Mora ecart" path.
 
+use std::sync::Arc;
+
 use crate::bset::BSet;
 use crate::LSet;
 use crate::monomial::Monomial;
@@ -43,7 +45,7 @@ use crate::sbasis::SBasis;
 /// new to the basis.
 #[allow(clippy::too_many_arguments)]
 pub fn enter_one_pair_normal(
-    ring: &Ring,
+    ring: &Arc<Ring>,
     s_basis: &SBasis,
     s_idx: u32,
     h_idx: u32,
@@ -52,6 +54,11 @@ pub fn enter_one_pair_normal(
     h_lm_divmask: u64,
     h_sugar: u32,
     arrival: u64,
+    // ADR-040 (`input_tiebreak`): the full h-poly, needed to build the
+    // short S-polynomial whose leading monomial keys the L-queue. Only
+    // read under the feature; passed unconditionally to keep the
+    // signature stable.
+    h_poly: &Poly,
 ) -> Option<Pair> {
     debug_assert!(s_idx < h_idx);
     debug_assert!(!s_basis.is_redundant(s_idx as usize));
@@ -118,19 +125,60 @@ pub fn enter_one_pair_normal(
     // instead of recomputing from the LCM's exponents. The h-side masks
     // are passed in; the s-side comes from the SBasis caches.
     #[cfg(feature = "pair_mask_or")]
-    {
+    #[cfg_attr(not(feature = "input_tiebreak"), allow(unused_mut))]
+    let mut pair = {
         let s_lm_divmask = s_basis.divmasks()[s_idx as usize];
         let lcm_sev = h_lm_sev | s_lm_sev;
         let lcm_divmask = h_lm_divmask | s_lm_divmask;
-        Some(Pair::new_from_masks(
+        Pair::new_from_masks(
             s_idx, h_idx, lcm, ring, lcm_sev, lcm_divmask, sugar, arrival,
-        ))
-    }
+        )
+    };
     #[cfg(not(feature = "pair_mask_or"))]
-    {
+    #[cfg_attr(not(feature = "input_tiebreak"), allow(unused_mut))]
+    let mut pair = {
         let _ = h_lm_divmask;
-        Some(Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival))
+        Pair::new(s_idx, h_idx, lcm, ring, sugar, arrival)
+    };
+
+    // ADR-040 (`input_tiebreak`): key the L-queue on the S-polynomial's
+    // actual leading monomial — BOTH its degree (the queue sugar) and
+    // the monomial (the tie-break) — exactly as Singular's bba does.
+    // Singular's `initEcartPairBba` sets the pair's `FDeg = pFDeg(P.p)`
+    // and `ecart = 0`, where `P.p` is the `ksCreateShortSpoly` result,
+    // so the pair's `compareL15` key is `(deg(spolyLM), pLmCmp(spolyLM))`
+    // — NOT the LCM. The Giovini–Mora `sugar` rust computed above (=
+    // `deg(lcm)` in the homogeneous case) is the LCM degree, which
+    // exceeds the spoly-LM degree for 5.4 % of pairs on staging-5101449.
+    // Both differences (sugar AND tie-break) must be aligned for the pop
+    // order to match. The short spoly is built here (both operand polys
+    // in hand); if it fully cancels (`None`), the pair keeps its LCM-based
+    // sugar/key default — a safe total order.
+    #[cfg(feature = "input_tiebreak")]
+    {
+        let s_poly = s_basis.poly(s_idx as usize);
+        if let Some(spoly_lm) =
+            crate::lobject::LObject::short_spoly_lm(ring, s_poly, h_poly, &pair.lcm)
+        {
+            // NOTE: we deliberately key the *tie-break* on the spoly LM
+            // but KEEP the Giovini–Mora `sugar` (LCM degree) as the
+            // PRIMARY band. Singular's bba uses the spoly-LM degree for
+            // both; a probe (task 394) that also lowered rust's sugar to
+            // the spoly-LM degree made the pop count *worse* (+24.9 % vs
+            // +10.0 %) — lowering a pair's sugar pops it before enough
+            // reducers exist, inflating zero-reductions and transient
+            // inserts. So the faithful-to-Singular sugar change is a net
+            // regression *in rust's pipeline*; we mirror only the
+            // monomial tie-break, which is the part that closed the
+            // early-index ordering divergence. The residual gap has a
+            // distinct driver (see the ADR-040 report).
+            pair.set_spoly_ord_key(spoly_lm.degrevlex_key(ring));
+        }
     }
+    #[cfg(not(feature = "input_tiebreak"))]
+    let _ = h_poly;
+
+    Some(pair)
 }
 
 /// Coprime check on monomials: no variable has nonzero exponent in
@@ -324,7 +372,7 @@ pub fn chain_crit_normal(
 /// actually made it into L (after both phases of the chain crit).
 #[allow(clippy::too_many_arguments)]
 pub fn enterpairs(
-    ring: &Ring,
+    ring: &Arc<Ring>,
     s_basis: &SBasis,
     h_idx: u32,
     h_poly: &Poly,
@@ -344,7 +392,7 @@ pub fn enterpairs(
             continue;
         }
         if let Some(pair) = enter_one_pair_normal(
-            ring, s_basis, s_idx, h_idx, &h_lm, h_lm_sev, h_lm_divmask, h_sugar, arrival,
+            ring, s_basis, s_idx, h_idx, &h_lm, h_lm_sev, h_lm_divmask, h_sugar, arrival, h_poly,
         ) {
             arrival += 1;
             // step_trace: NEW — candidate pair created (survived product crit).
@@ -376,8 +424,8 @@ mod tests {
     use crate::field::Field;
     use crate::ordering::MonoOrder;
 
-    fn mk_ring(nvars: u32) -> Ring {
-        Ring::new(nvars, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap()
+    fn mk_ring(nvars: u32) -> Arc<Ring> {
+        Arc::new(Ring::new(nvars, MonoOrder::DegRevLex, Field::new(32003).unwrap()).unwrap())
     }
 
     fn mono(r: &Ring, e: &[u32]) -> Monomial {
@@ -392,7 +440,7 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 0, 0])));
         let h = Poly::monomial(&r, 1, mono(&r, &[0, 1, 0]));
         let h_lm = h.leading().unwrap().1.clone();
-        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 1, 0);
+        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 1, 0, &h);
         assert!(got.is_none(), "coprime LMs must be pruned by product crit");
     }
 
@@ -403,7 +451,7 @@ mod tests {
         s.insert(&r, Poly::monomial(&r, 1, mono(&r, &[1, 1, 0])));
         let h = Poly::monomial(&r, 1, mono(&r, &[0, 1, 1]));
         let h_lm = h.leading().unwrap().1.clone();
-        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 2, 0).unwrap();
+        let got = enter_one_pair_normal(&r, &s, 0, 1, &h_lm, h.lm_sev(), h.lm_divmask(), 2, 0, &h).unwrap();
         assert_eq!(got.i, 0);
         assert_eq!(got.j, 1);
         // LCM = xyz (exp [1,1,1]).

@@ -17,8 +17,10 @@ use rustgb::{Coeff, Field, LSet, MonoOrder, Monomial, Pair, Poly, Ring, SBasis};
 const P: u32 = 32003;
 const NVARS: u32 = 6;
 
-fn mk_ring() -> Ring {
-    Ring::new(NVARS, MonoOrder::DegRevLex, Field::new(P).unwrap()).unwrap()
+fn mk_ring() -> std::sync::Arc<Ring> {
+    // ADR-040: `gm::enterpairs` now takes `&Arc<Ring>`; an `Arc` ring
+    // deref-coerces to `&Ring` for the other calls in this example.
+    std::sync::Arc::new(Ring::new(NVARS, MonoOrder::DegRevLex, Field::new(P).unwrap()).unwrap())
 }
 
 /// A simple LCG so the example stays dependency-free.

@@ -122,6 +122,10 @@ proptest! {
     fn enterpairs_agrees_with_slow_reference(
         (r, basis_lms, h_lm) in scenario_strategy(),
     ) {
+        // ADR-040: enterpairs now takes `&Arc<Ring>` (it builds the
+        // short S-polynomial via KBucket, which needs an owned ring
+        // handle). Deref-coerces to `&Ring` for the other calls.
+        let r = std::sync::Arc::new(r);
         // Build the SBasis with single-term polys.
         let mut s = SBasis::new();
         for m in &basis_lms {

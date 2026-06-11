@@ -159,6 +159,32 @@ step_trace = []
 # ADR-039.
 seed_in_l = []
 
+# Input-vs-pair L tie-break alignment with compareL15 (ADR-040, task
+# 394). **Default-OFF.** Pulls in `seed_in_l` (no meaning without
+# interleaved seeding). When OFF, byte-for-byte `seed_in_l` +
+# `pairorder_lm`: the L-queue keys S-pairs on their LCM degrevlex key
+# (`lcm_ord_key`). When ON, it keys them on the **S-polynomial's actual
+# leading monomial** (`spoly_ord_key` — the `ksCreateShortSpoly` LM,
+# strictly below the LCM), with the equal-key stabilizer flipped to
+# `arrival` DESCENDING (LIFO). This mirrors Singular's `compareL15`
+# EXACTLY: `compareL15` = `(GetpFDeg+ecart, then pLmCmp(P.p)*OrdSgn)`
+# where `P.p` is the short spoly, and the `std::multiset` stores equal
+# entries LIFO (`kInline.h:986-988`, next-opt). Root cause (task 394):
+# rust's `pairorder_lm` keyed pairs on the LCM, but on the staging
+# workload the short-spoly LM differs from the LCM for 100 % of pairs,
+# so the LCM key systematically mis-orders pairs vs Singular — the
+# residual +10/+21 % pop excess ADR-039 left open. The short-spoly LM is
+# built at pair-creation time in `enter_one_pair_normal`
+# (`LObject::short_spoly_lm`, both operand polys in hand). The final
+# reduced GB is identical either way (canonical sort) — toggling must NOT
+# change fixture-match outcomes; only the pop order changes. Gated in
+# both LSet backends (`Pair::cmp` for the heap backend's `HeapEntry`,
+# `SortedKey::cmp` for the flat backend). Promotion is joint with ADR-039
+# (the {seed_in_l + input_tiebreak} combination is what the interactive
+# c200-1 A/B measures vs eager seeding). See
+# `~/project/reports/rustgb-input-tiebreak-report.md`.
+input_tiebreak = ["seed_in_l"]
+
 # Compacted divisor-scan arrays (ADR-037, task 390). **On by default**
 # since 2026-06-10: the c200-1 same-campaign A/B measured −2.5 / −1.3 /
 # −3.8 % wall on the three staging tests on top of ADR-038, Δwall ≈
