@@ -6060,6 +6060,198 @@ N/A — FLINT has no GB engine, hence no chain criterion and no
 
 ---
 
+## ADR-037: Compact the divisor-scan arrays (`compact_scan` feature)
+
+**Status:** Implemented behind a default-off feature; promotion deferred
+to the interactive c200-1 wall A/B.
+**Date:** 2026-06-10
+
+### Context
+
+The divisor-scan volume probe (task 389,
+`~/project/reports/rustgb-divscan-probe-report.md`) attributed the
+reduction-scan excess vs Singular `next-opt` to scan *volume*, 91 % of it
+at the head reduction. Decomposing the head excess, it isolated two
+mechanisms:
+
+* **H4 — scan-set size (this ADR's target):** rust's `find_divisor_idx`
+  sweeps the whole `SBasis` divmask/lm/length arrays, which carry
+  **redundant** slots (basis elements whose leading monomial a later
+  insert divided out). next-opt's `T` does not carry them. The probe
+  measured rust's head array at **1.11× longer** (2572 vs 2308 live slots
+  avg on staging-5101449), = **142 M swept elements = 23 % of the 617 M
+  head excess ≈ ~0.1 s of wall (~1.5 %)**.
+* The remaining 77 % is the `shortest_reducer` (ADR-032) scan *depth* —
+  a deliberate width-for-steps trade that **cannot** be closed without
+  giving ADR-032's −10 % step win back. Out of scope here (probe's
+  lever 2).
+
+This ADR implements **lever 1, the unconditional one**: scan only the
+live (T-equivalent) elements. It does not touch ADR-032's selection,
+only the array it scans over.
+
+### Decision
+
+`SBasis` maintains, behind the default-off `compact_scan` feature, a set
+of **compacted scan arrays** that hold only the non-redundant elements,
+in ascending basis-index (== arrival) order:
+
+```text
+scan_basis_idx: Vec<u32>      // back-map: live basis indices, ascending
+scan_divmasks:  Vec<u64>      // parallel to scan_basis_idx
+scan_lms:       Vec<Monomial>
+scan_lengths:   Vec<u32>
+```
+
+`find_divisor_idx` sweeps `scan_divmasks` / `scan_lms` /
+`scan_lengths` (no redundant-flag check — the arrays contain no
+redundant entries by construction) and maps a hit *sweep position* `k`
+back to its basis index via `scan_basis_idx[k]`, which its callers
+(`reduce_lobject_geobucket`, the heap reducer) index `poly()` /
+`lm_degs()` by. Feature-off, `find_divisor_idx` walks the full arrays +
+redundant flag exactly as before (an identity `map_idx`).
+
+**Tie-break preservation (the load-bearing constraint).** With
+`shortest_reducer`, `find_divisor_idx` keeps the FIRST-found among
+equal-length divisors; feature-off it returns the first divisor in
+arrival order outright. Both depend on the *relative arrival order* of
+the candidates being scanned. Therefore compaction uses **ordered
+removal (shift-down), NOT swap-remove**: the compacted arrays stay sorted
+by basis index, so the surviving live elements keep their relative
+arrival order and the first-found tie-break is byte-for-byte the
+uncompacted result. This is exactly what the fixture bit-identity check
+and the staging md5 verify.
+
+Maintenance is wired into every site that changes the live set
+(`src/sbasis.rs`):
+
+* **`insert_no_clear`** — the new element is live and has the largest
+  basis index so far, so it **appends** (no shift). O(1).
+* **`clear_redundant_for`** — when it marks element `i` redundant, it
+  calls `scan_remove(i)`: `binary_search` the slot, ordered `Vec::remove`
+  (O(n) shift-down). Removals are rare (one per redundancy marking, a few
+  hundred per staging run), so O(n) is fine.
+* **`set_redundant(idx, flag)`** — `tail_reduce_all` hides (`true`) an
+  element while reducing its own tail, then un-hides (`false`). On an
+  actual transition this calls `scan_remove` / `scan_reinsert`;
+  `scan_reinsert` re-derives the masks from the live caches and ordered-
+  inserts at the binary-search position, restoring arrival order.
+* **`replace_poly`** — tail reduction shortens a live element's term
+  count (leader preserved). If `idx` is live, its `scan_lengths` /
+  `scan_divmasks` / `scan_lms` entry is refreshed in place (the leader is
+  preserved so its ordered position cannot move); if hidden, the refresh
+  is a no-op and the value is re-derived on the next `scan_reinsert`.
+
+A debug `assert_canonical` invariant checks that the compacted arrays
+hold exactly the live basis indices in order, with masks/lengths
+agreeing with the full caches.
+
+### Audit of all scan-array users (constraint 3)
+
+Every caller of the `SBasis` scan accessors was checked to confirm none
+breaks when the *full* arrays remain index-by-basis while
+`find_divisor_idx` reads the *compacted* ones:
+
+* `bba.rs:444-446` — `find_divisor_idx` (THE compacted consumer; gated to
+  read `scan_arrays()` under the feature, full arrays + redundant flag
+  otherwise).
+* `bba.rs:330` (`s_basis.lm_degs()[idx]`) and `bba.rs:402`
+  (`.map(|idx| (s_basis.poly(idx), s_basis.lm_degs()[idx]))`) — both index
+  by the **basis index returned from `find_divisor_idx`**, i.e. the
+  back-mapped value. They read the FULL `lm_degs()` / `poly()`, which stay
+  index-by-basis. Correct.
+* `gm.rs:59/93/105` (`sevs()`, `lm_degs()[s_idx]`, `divmasks()[s_idx]`) —
+  the Gebauer–Möller pair machinery, indexed by a basis index it already
+  holds (`s_idx`), reading the full arrays. Untouched by compaction.
+* `tests/sbasis_props.rs:91-92` — proptests over the full `sevs()` /
+  `lm_degs()`. Untouched.
+
+The compacted arrays are therefore **separate** scan-arrays maintained
+alongside the full ones; the full arrays keep their index-by-basis
+contract for every other user. `parallel.rs` is unaffected: its
+`ParBasis` snapshot path reads its OWN `RwLock`-guarded `divmasks` /
+`lm_degs` fields, not the `SBasis` accessors, and its contract tests
+stayed green with the feature on.
+
+### Singular comparison
+
+next-opt's reducer scans `T` (`kFindDivisibleByInT` /
+`kFindDivisibleByInT_ecart`, `~/Singular/kernel/GBEngine/kstd2.cc`),
+the set of T-objects that are still live reducers; when an element is
+superseded it is removed from `T`, so the scan range never carries
+redundant elements. This ADR makes rust's scan range match that — the
+probe's H4 measurement (2572 → 2308 live slots) is precisely the
+`SBasis`-minus-redundant vs `T` gap, and the compacted array is the
+`T`-equivalent set.
+
+### FLINT comparison
+
+**N/A — FLINT has no Gröbner-basis engine.** The divisor-scan reducer
+selection is a GB-engine concern; FLINT's polynomial layer offers no
+analog.
+
+### Validation
+
+* `cargo test --release` green in all required configs:
+  default (**213/213**), `--features compact_scan` (**213/213**),
+  heap backend `--no-default-features --features
+  redtail,shortest_reducer,pairorder_lm,pair_mask_or` and the same
+  `+compact_scan` (both green; 113 lib tests in the heap config because
+  `flat_lset` selects the other `LSet` contract suite, unrelated to this
+  change).
+* **Fixture bit-identity (the tie-break check):** cyclic-3/4/5 and
+  katsura-3 `assert_eq!(got, expected)` against the committed Singular
+  reference output, with `shortest_reducer` active, pass **with
+  `compact_scan` on and off** — confirming ordered removal preserved the
+  first-found tie-break.
+* **Staging-5101449:** with `compact_scan` on, the filtered `G[...]` md5
+  is **`3f2adc5eb0160c9e0b357f20537ad037`**, equal to
+  `~/project/test-cases/staging-5101449-redsb.gb.txt` (empty diff, 2972
+  elements, `rgb fired`).
+
+### Measured scan-volume reduction (scan_stats + compact_scan)
+
+Re-dumping the finding-C counters with both features on, staging-5101449
+(output md5 still `3f2adc5e…`):
+
+| head counter | probe (full array) | compact_scan | Δ |
+|---|---:|---:|---:|
+| scans | 1.068 M | 1.068 M | flat (structure unchanged) |
+| `sum_len` (eligible) | 2747 M | **2391 M** | **−13.0 %** |
+| `sum_swept` | ~1690 M | 1397 M | −17 % |
+
+The head `sum_len` drops to **2391 M**, at or slightly below next-opt's
+2425 M level — the redundant padding (H4) is gone, while scan *count* is
+unchanged (we changed the array, not the scan structure). The remaining
+gap to next-opt is ADR-032's deliberate scan-depth trade, untouched.
+
+### Wall (deferred)
+
+Probe projection ~0.1 s / ~1.5 % wall. **Not measured here** — the wall
+A/B is the interactive c200-1 same-campaign run (out of scope for the
+task-runner subagent for the watchdog reason). Promotion to a default
+feature is gated on that A/B clearing the same bar ADR-032/035 used
+(measured same-campaign win, output-identical).
+
+### References
+
+* `~/project/reports/rustgb-divscan-probe-report.md` — findings C/H4, the
+  1.11× array-length / 142 M / 23 % measurement this ADR targets.
+* `~/project/reports/rustgb-scan-compact-report.md` — this task's report.
+* `~/rustgb/src/sbasis.rs` — `scan_basis_idx` / `scan_divmasks` /
+  `scan_lms` / `scan_lengths` fields, `scan_remove` / `scan_reinsert`,
+  `scan_arrays()`, and the wiring in `insert_no_clear` /
+  `clear_redundant_for` / `set_redundant` / `replace_poly`.
+* `~/rustgb/src/bba.rs` — `find_divisor_idx` compacted path + `map_idx`
+  back-map.
+* `~/Singular/kernel/GBEngine/kstd2.cc` — `kFindDivisibleByInT[_ecart]`,
+  the `T`-scan this matches.
+* ADR-032 — `shortest_reducer`, whose tie-break (first-found among
+  equal-length) this ADR must preserve; ADR-025/010 — the divmask/lms
+  caches the compacted arrays mirror.
+
+---
+
 ## How to add a new ADR
 
 1. Pick the next number. Don't reuse retired numbers.

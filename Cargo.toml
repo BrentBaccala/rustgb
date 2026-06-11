@@ -130,6 +130,23 @@ pair_mask_or = []
 # `~/project/reports/rustgb-divscan-probe-report.md`.
 scan_stats = []
 
+# Compacted divisor-scan arrays (ADR-037, task 390). OFF by default for
+# a clean A/B; feature-off is byte-for-byte the current behaviour. When
+# ON, `SBasis` maintains parallel scan arrays
+# (`scan_divmasks`/`scan_lms`/`scan_lengths` + a `scan_basis_idx`
+# back-map) that hold ONLY the live (non-redundant) elements, in
+# ascending arrival order. `bba::find_divisor_idx` then sweeps the live
+# set instead of the padded S-basis — the probe (finding H4,
+# `~/project/reports/rustgb-divscan-probe-report.md`) measured the
+# redundant padding at ~1.11× array length on staging-5101449, ~23 % of
+# the head-scan excess (~0.1 s / ~1.5 % wall). Removal is an ordered
+# shift-down (NOT swap-remove), so the relative arrival order of live
+# elements is preserved and `find_divisor_idx`'s first-found tie-break
+# stays bit-identical. The unconditional lever — does not touch ADR-032's
+# shortest-reducer selection, only the array it scans over. Promotion
+# deferred to the interactive c200-1 wall A/B.
+compact_scan = []
+
 [dev-dependencies]
 proptest = "1"
 

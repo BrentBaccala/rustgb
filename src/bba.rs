@@ -441,11 +441,31 @@ fn find_divisor_idx(
     ring: &Ring,
     #[cfg(feature = "scan_stats")] site: crate::scan_stats::ScanSite,
 ) -> Option<usize> {
+    // ADR-037: with `compact_scan`, the sweep walks the compacted scan
+    // arrays (live elements only, in arrival order) instead of the full
+    // padded S-basis, and maps a hit back to its basis index via the
+    // `scan_basis_idx` back-map. The compacted arrays contain no
+    // redundant entries by construction, so the per-element redundant
+    // check is unnecessary on this path. Feature-off behaviour is
+    // unchanged: walk the full arrays + redundant flag.
+    #[cfg(feature = "compact_scan")]
+    let (basis_idx, divmasks, lms, _scan_lengths) = s_basis.scan_arrays();
+    #[cfg(not(feature = "compact_scan"))]
     let divmasks = s_basis.divmasks();
+    #[cfg(not(feature = "compact_scan"))]
     let lms = s_basis.lms();
+    #[cfg(not(feature = "compact_scan"))]
     let redund = s_basis.redundant_flags();
     let len = divmasks.len();
     let not_lm_divmask = !lm_divmask;
+
+    // Map a sweep position to the basis index its callers index by. On
+    // the compacted path this dereferences the back-map; on the full
+    // path the sweep position IS the basis index (identity).
+    #[cfg(feature = "compact_scan")]
+    let map_idx = |pos: usize| basis_idx[pos] as usize;
+    #[cfg(not(feature = "compact_scan"))]
+    let map_idx = |pos: usize| pos;
 
     // ADR-032: with the `shortest_reducer` feature, the sweep scans
     // ALL divmask-passing non-redundant dividing candidates and keeps
@@ -455,8 +475,14 @@ fn find_divisor_idx(
     // when a candidate of length ≤2 is found. The feature is OFF by
     // default: with it off the loop returns the first match in arrival
     // order, byte-for-byte the pre-ADR-032 behaviour.
-    #[cfg(feature = "shortest_reducer")]
+    //
+    // ADR-037: when compacting, read the length from the compacted
+    // `_scan_lengths` (sweep-position-indexed) rather than the full
+    // `lengths` cache.
+    #[cfg(all(feature = "shortest_reducer", not(feature = "compact_scan")))]
     let lengths = s_basis.lengths();
+    #[cfg(all(feature = "shortest_reducer", feature = "compact_scan"))]
+    let lengths = _scan_lengths;
 
     #[cfg(feature = "shortest_reducer")]
     let mut best: Option<(usize, u32)> = None;
@@ -492,7 +518,14 @@ fn find_divisor_idx(
         // memory). Eliminates the L1/L2 miss that the v7 perf annotate
         // showed at 11 % of within-function cycles in
         // reduce_to_normal_form.
-        if !redund[idx] && lms[idx].divides(lm, ring) {
+        // ADR-037: on the compacted path there is no redundant entry to
+        // skip — the arrays hold only live elements. On the full path the
+        // redundant flag still gates the candidate.
+        #[cfg(feature = "compact_scan")]
+        let candidate_live = true;
+        #[cfg(not(feature = "compact_scan"))]
+        let candidate_live = !redund[idx];
+        if candidate_live && lms[idx].divides(lm, ring) {
             #[cfg(feature = "scan_stats")]
             {
                 divides_hits += 1;
@@ -508,7 +541,7 @@ fn find_divisor_idx(
                     divides_hits,
                     None,
                 );
-                return Some(idx);
+                return Some(map_idx(idx));
             }
             #[cfg(feature = "shortest_reducer")]
             {
@@ -525,7 +558,7 @@ fn find_divisor_idx(
                         divides_hits,
                         Some(idx),
                     );
-                    return Some(idx);
+                    return Some(map_idx(idx));
                 }
                 match best {
                     Some((_, blen)) if blen <= li => {}
@@ -542,7 +575,8 @@ fn find_divisor_idx(
 
     #[cfg(feature = "shortest_reducer")]
     {
-        return best.map(|(i, _)| i);
+        // `best.0` is a sweep position; map it to the basis index.
+        return best.map(|(i, _)| map_idx(i));
     }
     #[cfg(not(feature = "shortest_reducer"))]
     None

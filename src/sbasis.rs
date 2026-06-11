@@ -76,6 +76,40 @@ pub struct SBasis {
     arrival: Vec<u64>,
     /// Next arrival counter to hand out.
     next_arrival: u64,
+
+    /// ADR-037: compacted divisor-scan arrays (`compact_scan` feature).
+    ///
+    /// When the feature is on, these hold ONLY the live (non-redundant)
+    /// basis elements, in ascending basis-index order (which equals
+    /// arrival order — arrival IDs are stamped in insertion order). The
+    /// reduction divisor sweep in [`crate::bba::find_divisor_idx`] walks
+    /// `scan_divmasks` / `scan_lms` / `scan_lengths` instead of the full
+    /// padded arrays, skipping the redundant slots entirely, and maps a
+    /// hit back to its basis index via `scan_basis_idx`. The probe
+    /// (`~/project/reports/rustgb-divscan-probe-report.md`, finding H4)
+    /// measured the padding at ~1.11× array length on staging-5101449.
+    ///
+    /// Maintained in lockstep with the redundancy flag:
+    /// `insert_no_clear` appends (the new element is live), the
+    /// redundancy-marking sites remove (ordered shift-down preserving
+    /// arrival order — constraint 1), `set_redundant(false)` re-inserts
+    /// at the ordered position, and `replace_poly` updates the live
+    /// element's divmask/length in place. The relative arrival order of
+    /// live elements is preserved so the tie-break in `find_divisor_idx`
+    /// (first-found among equal-length divisors) is byte-for-byte the
+    /// uncompacted behaviour.
+    ///
+    /// These are entirely absent (zero-sized, no maintenance cost) when
+    /// the feature is off — the production sweep then walks the full
+    /// arrays exactly as before.
+    #[cfg(feature = "compact_scan")]
+    scan_basis_idx: Vec<u32>,
+    #[cfg(feature = "compact_scan")]
+    scan_divmasks: Vec<u64>,
+    #[cfg(feature = "compact_scan")]
+    scan_lms: Vec<Monomial>,
+    #[cfg(feature = "compact_scan")]
+    scan_lengths: Vec<u32>,
 }
 
 impl SBasis {
@@ -91,6 +125,14 @@ impl SBasis {
             redundant: Vec::new(),
             arrival: Vec::new(),
             next_arrival: 0,
+            #[cfg(feature = "compact_scan")]
+            scan_basis_idx: Vec::new(),
+            #[cfg(feature = "compact_scan")]
+            scan_divmasks: Vec::new(),
+            #[cfg(feature = "compact_scan")]
+            scan_lms: Vec::new(),
+            #[cfg(feature = "compact_scan")]
+            scan_lengths: Vec::new(),
         }
     }
 
@@ -165,6 +207,26 @@ impl SBasis {
         &self.arrival
     }
 
+    /// ADR-037: the compacted divisor-scan arrays (`compact_scan`
+    /// feature). Returns `(basis_idx, divmasks, lms, lengths)` where
+    /// every array has the same length (the live-element count) and is
+    /// indexed by *sweep position*, not basis index. `basis_idx[k]` is
+    /// the real basis index of the k-th live element — the back-map
+    /// [`crate::bba::find_divisor_idx`] uses to convert a sweep hit into
+    /// the basis index its callers index `poly()` / `lm_degs()` by. The
+    /// arrays are in ascending basis-index (== arrival) order, so a
+    /// first-found sweep hit reproduces the uncompacted tie-break.
+    #[cfg(feature = "compact_scan")]
+    #[inline]
+    pub fn scan_arrays(&self) -> (&[u32], &[u64], &[Monomial], &[u32]) {
+        (
+            &self.scan_basis_idx,
+            &self.scan_divmasks,
+            &self.scan_lms,
+            &self.scan_lengths,
+        )
+    }
+
     /// Iterate non-redundant `(idx, &Poly)` pairs.
     pub fn iter_active(&self) -> impl Iterator<Item = (usize, &Poly)> + '_ {
         self.polys
@@ -216,12 +278,57 @@ impl SBasis {
         self.polys.push(Box::new(h));
         self.sevs.push(lm_sev);
         self.divmasks.push(lm_divmask);
-        self.lms.push(lm);
+        self.lms.push(lm.clone());
         self.lm_degs.push(lm_deg);
         self.lengths.push(length);
         self.redundant.push(false);
         self.arrival.push(arrival);
+
+        // ADR-037: the new element is live, and its basis index is the
+        // largest so far (insertion order == arrival order), so it
+        // appends to the compacted scan arrays — no shift needed. This
+        // preserves the ascending-basis-index invariant.
+        #[cfg(feature = "compact_scan")]
+        {
+            self.scan_basis_idx.push(idx as u32);
+            self.scan_divmasks.push(lm_divmask);
+            self.scan_lms.push(lm);
+            self.scan_lengths.push(length);
+        }
         idx
+    }
+
+    /// ADR-037: remove `basis_idx` from the compacted scan arrays via
+    /// an ordered shift-down (NOT swap-remove), preserving the relative
+    /// arrival order of the remaining live elements (constraint 1). The
+    /// scan arrays are kept in ascending basis-index order, so the slot
+    /// is located by binary search. No-op if `basis_idx` is not present
+    /// (already removed / never live).
+    #[cfg(feature = "compact_scan")]
+    fn scan_remove(&mut self, basis_idx: usize) {
+        let key = basis_idx as u32;
+        if let Ok(pos) = self.scan_basis_idx.binary_search(&key) {
+            self.scan_basis_idx.remove(pos);
+            self.scan_divmasks.remove(pos);
+            self.scan_lms.remove(pos);
+            self.scan_lengths.remove(pos);
+        }
+    }
+
+    /// ADR-037: insert `basis_idx` back into the compacted scan arrays
+    /// at its ordered position (ascending basis-index = arrival order),
+    /// re-deriving its divmask/lm/length from the live caches. Used by
+    /// `set_redundant(idx, false)` to un-hide an element during the
+    /// tail-reduction pass. No-op if `basis_idx` is already present.
+    #[cfg(feature = "compact_scan")]
+    fn scan_reinsert(&mut self, basis_idx: usize) {
+        let key = basis_idx as u32;
+        if let Err(pos) = self.scan_basis_idx.binary_search(&key) {
+            self.scan_basis_idx.insert(pos, key);
+            self.scan_divmasks.insert(pos, self.divmasks[basis_idx]);
+            self.scan_lms.insert(pos, self.lms[basis_idx].clone());
+            self.scan_lengths.insert(pos, self.lengths[basis_idx]);
+        }
     }
 
     /// Mark every older element (`i < idx`) whose leading monomial is
@@ -251,6 +358,10 @@ impl SBasis {
             let s_i_lm = &self.lms[i];
             if h_lm.divides(s_i_lm, ring) {
                 self.redundant[i] = true;
+                // ADR-037: drop the now-redundant element from the
+                // compacted scan arrays (ordered shift-down).
+                #[cfg(feature = "compact_scan")]
+                self.scan_remove(i);
             }
         }
     }
@@ -268,6 +379,23 @@ impl SBasis {
     /// redundant via an `insert` of a dividing new element.
     #[inline]
     pub fn set_redundant(&mut self, idx: usize, flag: bool) {
+        // ADR-037: keep the compacted scan arrays in sync with the
+        // redundancy flag. `tail_reduce_all` hides (`true`) an element
+        // while reducing its own tail and un-hides (`false`) afterward;
+        // the scan arrays must drop it then re-insert it at its ordered
+        // arrival position so subsequent scans see it again. Only act
+        // on an actual flag transition.
+        #[cfg(feature = "compact_scan")]
+        {
+            let was = self.redundant[idx];
+            if was != flag {
+                if flag {
+                    self.scan_remove(idx);
+                } else {
+                    self.scan_reinsert(idx);
+                }
+            }
+        }
         self.redundant[idx] = flag;
     }
 
@@ -313,6 +441,27 @@ impl SBasis {
         // caller relaxes the invariant.
         self.lms[idx] = new_poly.leading().expect("non-zero").1.clone();
         *self.polys[idx] = new_poly;
+
+        // ADR-037: if `idx` is live (present in the scan arrays), refresh
+        // its compacted divmask/length/lm in place. The leading monomial
+        // is preserved by precondition (so its ordered position cannot
+        // move), but the term count — and thus `scan_lengths`, which
+        // ADR-032's shortest-reducer selection reads — does change. The
+        // divmask is recomputed from the same (preserved) leader, so it
+        // is unchanged in practice; we refresh it anyway to stay truthful
+        // if a future caller relaxes the leader-preservation invariant.
+        // If `idx` is currently hidden (redundant), it isn't in the scan
+        // arrays and `binary_search` misses — the refresh is a no-op and
+        // the up-to-date value is re-derived on the next `scan_reinsert`.
+        #[cfg(feature = "compact_scan")]
+        {
+            let key = idx as u32;
+            if let Ok(pos) = self.scan_basis_idx.binary_search(&key) {
+                self.scan_divmasks[pos] = self.divmasks[idx];
+                self.scan_lengths[pos] = self.lengths[idx];
+                self.scan_lms[pos] = self.lms[idx].clone();
+            }
+        }
     }
 
     /// Next arrival ID the next `insert` will stamp. Exposed so
@@ -386,6 +535,39 @@ impl SBasis {
             }
         }
         assert!(self.next_arrival >= self.arrival.last().copied().unwrap_or(0));
+
+        // ADR-037: the compacted scan arrays must hold exactly the live
+        // (non-redundant) elements, in ascending basis-index order, with
+        // divmask/lm/length agreeing with the full caches.
+        #[cfg(feature = "compact_scan")]
+        {
+            let live: Vec<u32> = (0..n)
+                .filter(|&i| !self.redundant[i])
+                .map(|i| i as u32)
+                .collect();
+            assert_eq!(
+                self.scan_basis_idx, live,
+                "scan_basis_idx must equal the live-element basis indices (ADR-037)"
+            );
+            assert_eq!(self.scan_divmasks.len(), live.len());
+            assert_eq!(self.scan_lms.len(), live.len());
+            assert_eq!(self.scan_lengths.len(), live.len());
+            for (k, &bi) in self.scan_basis_idx.iter().enumerate() {
+                let bi = bi as usize;
+                assert_eq!(
+                    self.scan_divmasks[k], self.divmasks[bi],
+                    "scan_divmasks mismatch at sweep pos {k} (basis {bi})"
+                );
+                assert_eq!(
+                    self.scan_lengths[k], self.lengths[bi],
+                    "scan_lengths mismatch at sweep pos {k} (basis {bi})"
+                );
+                assert!(
+                    self.scan_lms[k].cmp(&self.lms[bi], ring).is_eq(),
+                    "scan_lms mismatch at sweep pos {k} (basis {bi})"
+                );
+            }
+        }
     }
 }
 
