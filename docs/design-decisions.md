@@ -6486,13 +6486,53 @@ the c200-1 same-campaign A/B is the wall confirmation.
 ## ADR-039: Interleaved input seeding through the L-queue (`seed_in_l` feature)
 
 **Status:** Implemented behind a **default-OFF** `seed_in_l` cargo
-feature. Trace-validated (closes the top step-trace divergence; INS
-excess collapses to ~0 on all three staging cases); GB output
-bit-identical with the feature on (all three staging md5s match the
-fixtures, all four feature-state test suites green). **Promotion to a
-default feature is deferred to the interactive c200-1 wall A/B** — this
-is an intermediate-trajectory change with no wall measured here.
+feature; **promotion DECLINED after the c200-1 wall A/B (2026-06-10)**
+— the feature stays available as the required base for the
+input-vs-pair tie-break follow-up, and the promotion decision will be
+re-taken for the *combination*. Trace-validated (closes the top
+step-trace divergence; INS excess collapses to ~0 on all three staging
+cases); GB output bit-identical with the feature on (all three staging
+md5s match the fixtures, all four feature-state test suites green).
 **Date:** 2026-06-10
+
+### Measured result (wall, c200-1 same-campaign A/B) — REGRESSION on 2/3
+
+5 runs per arm interleaved, isolated core 11, `taskset -c 11 numactl
+--membind=1`, performance governor, on top of the shipped
+ADR-037/038 defaults. Raw:
+`~/project/profile-data/rustgb-seed-in-l-ab-c200-1.csv`.
+
+| staging test | OFF wall | ON wall | Δ wall | Δ instr | GB |
+|---|---:|---:|---:|---:|:--:|
+| 5101449 | 5.232 s | 5.172 s | −1.1 % | −0.9 % | identical |
+| 5104053 | 8.805 s | 9.174 s | **+4.2 %** | +4.5 % | identical |
+| 5106746 | 8.912 s | 9.059 s | **+1.6 %** | +2.8 % | identical |
+
+**Why the regression despite the INS-excess collapse:** the
+instruction count *rises* on 5104053/5106746 — the interleaved
+trajectory makes the surviving reductions more expensive. The 345
+"wasted" transient insertions of the eager path were also *extra
+reducers* that shortened downstream reductions (the same mechanism as
+the redtail-OFF 29× lesson: more early basis elements can pay for
+themselves). Partial alignment with Singular's order — seeding
+without the equal-sugar input-vs-pair tie-break (rust's `arrival`
+fallback still lets tied inputs always pop first; Singular's
+`compareL15` compares LM-vs-LCM) — lands in a worse middle ground:
+rust keeps ~+10–21 % pair pops vs Singular *and* loses the eager
+path's reducer-richness. Third instance of the
+match-the-rule-without-the-surrounding-state trap (faithful-ecart
+experiment +10 %, ADR-036 null, now this).
+
+**Disposition:** keep `seed_in_l` default-OFF. The tie-break
+follow-up builds ON it (with eager seeding there is no input-vs-pair
+tie to break); the A/B that matters is
+{eager} vs {seed_in_l + tie-break aligned}, which finally matches
+Singular's pop counts (~29.3 K/40.9 K/43.1 K vs rust's current
+36.3 K/49.7 K/47.8 K-class counts). If THAT combination still loses,
+the conclusion flips: eager seeding is simply better for this
+engine, the remaining pop excess is a whitelisted divergence, and
+"same ops, same order" closes as *deliberately not* — with the
+trace harness as the proof either way.
 
 ### Context — the divergence this closes
 
